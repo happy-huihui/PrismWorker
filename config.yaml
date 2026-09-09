@@ -1,0 +1,84 @@
+
+agent_name: LeadAgent
+
+log_level: INFO
+
+active_model: deepseek-default
+
+models:
+  - name: openai-default
+    provider: openai
+    model: ${OPENAI_MODEL:gpt-4o-mini}
+    base_url: ${OPENAI_BASE_URL:}
+    api_key: ${OPENAI_API_KEY:}
+    supports_vision: true
+    supports_thinking: false
+    context_window: 128000
+    max_tokens: 4096
+  - name: deepseek-default
+    provider: deepseek
+    model: ${DEEPSEEK_MODEL:deepseek-chat}
+    api_key: ${DEEPSEEK_API_KEY:}
+    supports_vision: false
+    supports_thinking: true
+    context_window: 65536
+    max_tokens: 4096
+
+database:
+  postgres_url: ${DATABASE_URL:postgresql://postgres:root@localhost:5432/prismworker}
+  postgres_schema: public
+  pool_size: 5
+  pool_recycle: 300
+  command_timeout: 30
+  echo_sql: false
+
+sandbox:
+  use: aio
+  lifecycle: auto
+  image: enterprise-public-cn-beijing.cr.volces.com/vefaas-public/all-in-one-sandbox:1.11.0
+  port: 8080
+  container_prefix: prism-sandbox
+  base_url: null
+  idle_timeout: 600
+  replicas: 1
+  docker_command: []
+  mounts: []
+  environment: {}
+  allow_host_bash: true
+  bash_command_timeout: 600
+  bash_output_max_chars: 30000
+  read_file_output_max_chars: 50000
+  ls_output_max_chars: 30000
+
+memory:
+  enabled: true
+  mode: tool
+  backend: sqlite
+  root_dir: null
+  memory_db_file: memory.db
+  checkpoints_db_file: checkpoints.db
+  table_name: memory_entries
+  max_results: 5
+  max_memory_chars: 2000
+
+tools:
+  web_search:
+    enabled: true
+    api_key: ${TAVILY_API_KEY:}
+    max_results: 5
+  web_fetch:
+    enabled: true
+    max_chars: 20000
+    timeout_seconds: 20
+  enabled_tools: []
+
+subagents:
+  timeout_seconds: 600
+  max_turns: 30
+  max_total_per_run: 10
+  agents:
+    general_purpose:
+      name: general_purpose
+      timeout_seconds: 600
+      max_turns: 30
+      token_budget: null

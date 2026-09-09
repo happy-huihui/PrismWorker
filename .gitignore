@@ -1,0 +1,49 @@
+# ══════════════════ 环境与依赖 ══════════════════
+.venv/
+venv/
+node_modules/
+__pycache__/
+*.py[cod]
+*.egg-info/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+frontend/dist/
+frontend/.vite/
+
+# ══════════════════ 运行时数据与日志 ══════════════════
+.prism-worker/
+*.log
+
+# ══════════════════ 敏感配置 ══════════════════
+.env
+!.env.example
+
+# ══════════════════ IDE / 编辑器 ══════════════════
+.idea/
+.vscode/
+*.swp
+*.swo
+
+# ══════════════════ 本地工具 / 参考 ══════════════════
+.meituan-catpaw/
+.agent-browser/
+_ref_deerflow/
+
+# ══════════════════ 本地测试 / 杂项 ══════════════════
+_tmp_*.py
+_tmp_env.ps1
+_stage*.py
+_e2e_*.py
+_test_*.py
+__stage*_out.txt
+_stage*.txt
+_manifest.txt
+_pip_install.txt
+_r10a.txt
+test_main.http
+
+# ══════════════════ Markdown 计划/文档（仅保留根 README.md） ══════════════════
+**/*.md
+harness/**/*.md
+!/README.md

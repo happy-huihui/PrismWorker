@@ -1,0 +1,28 @@
+<!doctype html>
+<html lang="zh-CN">
+  <head>
+    <meta charset="UTF-8" />
+    <link rel="icon" type="image/svg+xml" href="/favicon.svg" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>PrismWorker</title>
+    <script>
+      // 防主题闪烁：页面脚本执行前按 localStorage 解析暗色（与 ThemeProvider 同键名）
+      ;(function () {
+        try {
+          var t = localStorage.getItem('prism-theme')
+          var dark =
+            t === 'dark' ||
+            ((t === null || t === '' || t === 'system') &&
+              window.matchMedia('(prefers-color-scheme: dark)').matches)
+          if (dark) document.documentElement.classList.add('dark')
+        } catch (e) {
+          /* localStorage 不可用时忽略 */
+        }
+      })()
+    </script>
+  </head>
+  <body>
+    <div id="root"></div>
+    <script type="module" src="/src/main.tsx"></script>
+  </body>
+</html>
