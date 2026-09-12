@@ -1,11 +1,13 @@
 """长期记忆工具：让模型自主保存 / 检索 / 删除跨会话记忆。
 
 三个工具（仅 mode=tool 时注册）：
-    - save_memory   存一条记忆（同 key 自动更新）
-    - search_memory 按关键词 / 主题标签检索
-    - delete_memory 删一条记忆
+    - save_memory   存一条记忆（同 key 自动更新；底层为事实 CRUD）
+    - search_memory 按关键词 / 主题标签检索（底层走记忆管理器检索）
+    - delete_memory 删一条记忆（按 key 定位后删除）
 
 user_id 统一从 runtime 解析（见 runtime/user_content.py），消息统一中文。
+工具签名与旧版保持一致（模型侧零改动），内部实现从 SQLite 直读写
+切换为记忆管理器的 fact CRUD。
 """
 
 from __future__ import annotations
@@ -17,7 +19,7 @@ from langchain.tools import InjectedToolCallId, tool
 from langchain_core.messages import ToolMessage
 from langgraph.types import Command
 
-from harness.memory.manager import get_memory_store
+from harness.memory.manager import get_memory_manager
 from harness.runtime.user_content import resolve_runtime_user_id
 from harness.tools.types import Runtime
 
@@ -67,11 +69,21 @@ def save_memory_tool(
     """
     user_id = resolve_runtime_user_id(runtime)
     try:
-        created = get_memory_store().save(user_id, key, content, kind=kind)
+        _document, fact_id = get_memory_manager().create_fact(
+            content,
+            category=kind,
+            confidence=1.0,
+            user_id=user_id,
+            source="manual",
+            key=key,
+        )
     except Exception as exc:  # noqa: BLE001 —— 存储异常转成可读消息
         logger.exception("save_memory 失败")
         return _error_message(tool_call_id, exc)
-    action = "已新建" if created else "已更新"
+    if fact_id is None:
+        action = "记忆已达上限，本条未保存"
+    else:
+        action = "已保存/更新"
     return Command(
         update={
             "messages": [
@@ -106,11 +118,16 @@ def search_memory_tool(
     """
     user_id = resolve_runtime_user_id(runtime)
     try:
-        entries = get_memory_store().search(user_id, query, kind=kind, limit=limit)
+        facts = get_memory_manager().search(
+            query,
+            top_k=limit,
+            user_id=user_id,
+            category=kind,
+        )
     except Exception as exc:  # noqa: BLE001
         logger.exception("search_memory 失败")
         return _error_message(tool_call_id, exc)
-    if not entries:
+    if not facts:
         return Command(
             update={
                 "messages": [
@@ -121,8 +138,11 @@ def search_memory_tool(
                 ]
             }
         )
-    lines = [f"- [{entry.key}]（{entry.kind}）{entry.content}" for entry in entries]
-    body = f"找到 {len(entries)} 条记忆：\n" + "\n".join(lines)
+    lines = []
+    for fact in facts:
+        key_part = f"[{fact.get('key')}] " if fact.get("key") else ""
+        lines.append(f"- {key_part}（{fact.get('category', 'general')}）{fact.get('content', '')}")
+    body = f"找到 {len(facts)} 条记忆：\n" + "\n".join(lines)
     return Command(
         update={
             "messages": [
@@ -149,14 +169,22 @@ def delete_memory_tool(
     """
     user_id = resolve_runtime_user_id(runtime)
     try:
-        removed = get_memory_store().delete(user_id, key)
+        manager = get_memory_manager()
+        document = manager.get_memory(user_id=user_id)
+        target_id = None
+        stripped_key = (key or "").strip()
+        for fact in document.get("facts", []):
+            if isinstance(fact, dict) and str(fact.get("key", "")).strip() == stripped_key:
+                target_id = fact.get("id")
+                break
+        if target_id is None:
+            content = f"没有找到要删除的记忆 [{key}]"
+        else:
+            manager.delete_fact(target_id, user_id=user_id)
+            content = f"已删除记忆 [{key}]"
     except Exception as exc:  # noqa: BLE001
         logger.exception("delete_memory 失败")
         return _error_message(tool_call_id, exc)
-    if removed:
-        content = f"已删除记忆 [{key}]"
-    else:
-        content = f"没有找到要删除的记忆 [{key}]"
     return Command(
         update={
             "messages": [ToolMessage(content=content, tool_call_id=tool_call_id)]

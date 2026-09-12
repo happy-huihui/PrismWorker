@@ -1,7 +1,7 @@
 """实时 Agent 中间件包。
 
 按职责分层（完整清单见 build_middlewares.py 的组装顺序）：
-  - 输入与上下文：InputSanitization / ThreadContext / DynamicContext / Uploads / MemoryInjection
+  - 输入与上下文：InputSanitization / ThreadContext / DynamicContext / Uploads / Memory（记忆中间件）
   - 技能与视界：SkillActivation / SkillToolPolicy / ViewImage
   - 规划与护栏：Title / Todo / Clarification / TokenBudget / Summarization /
     DeferredToolFilter / ToolProgress / LoopDetection / DanglingToolCall /
@@ -29,7 +29,6 @@ from harness.agents.middlewares.input_sanitization_middleware import (
     InputSanitizationMiddleware,
     neutralize_untrusted_tags,
 )
-from harness.agents.middlewares.memory_injection import MemoryInjectionMiddleware
 from harness.agents.middlewares.sandbox_protection import (
     ReadBeforeWriteMiddleware,
     SandboxAuditMiddleware,
@@ -62,7 +61,6 @@ __all__ = [
     "ThreadContextMiddleware",
     "DynamicContextMiddleware",
     "UploadsMiddleware",
-    "MemoryInjectionMiddleware",
     "SkillActivationMiddleware",
     "SkillToolPolicyMiddleware",
     "ViewImageMiddleware",

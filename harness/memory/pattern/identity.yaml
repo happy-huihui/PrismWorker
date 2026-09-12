@@ -1,0 +1,18 @@
+# 身份信号模式（detect_signals 的 identity 类）。
+#
+# 命中含义：用户陈述了「我是谁」（角色、职业、背景）——跨会话记忆的
+# 高价值信号。在最近 6 条用户消息上用 search 匹配。
+
+- pattern: '\bI am (?:a |an )?[a-z][a-z -]{2,}\b'
+  flags: [ignorecase]
+- pattern: '\bI work as\b'
+  flags: [ignorecase]
+- pattern: '\bI.m (?:a |an )?[a-z][a-z -]{2,}\b'
+  flags: [ignorecase]
+- pattern: '\bmy job is\b'
+  flags: [ignorecase]
+- '我是'
+- '我的职业是'
+- '我的工作是'
+- '我担任'
+- '我是一名'

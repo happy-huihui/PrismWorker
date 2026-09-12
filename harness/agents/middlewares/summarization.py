@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import logging
 import uuid
-from typing import Any
+from typing import Any, Callable
 
 from langchain.agents.middleware import AgentMiddleware
 from langchain_core.messages import (
@@ -24,6 +24,11 @@ from langgraph.graph.message import REMOVE_ALL_MESSAGES
     那部分消息」交给模型生成一段中文摘要；被压缩的消息用 RemoveMessage
     清空，保留最近 keep_messages（默认 20）条；摘要正文同时写入
     state.summary_text（拼接式，保留历史摘要链），并写一条进度消息。
+
+    记忆联动：压缩前通过 flush_hook（见 harness/memory/middleware.py 的
+    memory_flush_hook）把将被压缩的消息紧急冲刷进长期记忆队列，保证
+    「先入记忆、再被压缩」，压缩不丢信息。flush_hook 缺省为 None，
+    未注入时行为与改造前完全一致。
 
     安全边界：
       - 保留段不拆散 AI/Tool 消息对（ToolMessage 必须与发起它的 AI 消息一起保留）；
@@ -69,13 +74,26 @@ class SummarizationMiddleware(AgentMiddleware):
         max_messages: int = _DEFAULT_MAX_MESSAGES,
         max_tokens: int = _DEFAULT_MAX_TOKENS,
         keep_messages: int = _DEFAULT_KEEP_MESSAGES,
+        flush_hook: Callable[..., None] | None = None,
+        agent_name: str | None = None,
     ) -> None:
-        """初始化；model 为可复用的主模型实例（model_name 二选一）。"""
+        """初始化；model 为可复用的主模型实例（model_name 二选一）。
+
+        Args:
+            model: 复用主模型实例；None 时按 model_name 懒加载。
+            model_name: 摘要模型名（与主模型同一配置表）。
+            max_messages / max_tokens / keep_messages: 压缩触发与保留参数。
+            flush_hook: 压缩前的记忆冲刷回调（thread_id / messages_to_summarize /
+                agent_name / runtime 关键字传参）；None 不冲刷（原行为）。
+            agent_name: 冲刷时携带的 agent 归属（记忆桶语义）。
+        """
         self._model = model
         self._model_name = model_name
         self._max_messages = max_messages
         self._max_tokens = max_tokens
         self._keep_messages = keep_messages
+        self._flush_hook = flush_hook
+        self._agent_name = agent_name
 
     async def abefore_model(
         self, state: Any, runtime: Any  # type: ignore[override]
@@ -102,6 +120,10 @@ class SummarizationMiddleware(AgentMiddleware):
         to_summarize = messages[:target]
         preserved = messages[target:]
 
+        # 记忆联动：压缩前先把将被移除的消息冲刷进长期记忆队列
+        #（紧急路径 add_nowait，立即后台提取；失败仅告警不阻断压缩）
+        self._fire_flush_hook(to_summarize, runtime)
+
         summary = await self._summarize(to_summarize)
         combined_summary = _append_summary((state or {}).get("summary_text"), summary)
 
@@ -122,6 +144,38 @@ class SummarizationMiddleware(AgentMiddleware):
             ],
         }
 
+
+    def _fire_flush_hook(self, messages_to_summarize: list[AnyMessage], runtime: Any) -> None:
+        """触发记忆紧急冲刷（无 hook 或缺 thread_id 时静默跳过）。"""
+        if self._flush_hook is None:
+            return
+        thread_id = self._resolve_thread_id(runtime)
+        if not thread_id:
+            return
+        try:
+            self._flush_hook(
+                thread_id=thread_id,
+                messages_to_summarize=messages_to_summarize,
+                agent_name=self._agent_name,
+                runtime=runtime,
+            )
+        except Exception as exc:  # noqa: BLE001 —— 冲刷失败绝不能阻断压缩
+            logger.warning("记忆冲刷钩子执行失败（thread=%s）: %s", thread_id, exc)
+
+    @staticmethod
+    def _resolve_thread_id(runtime: Any) -> str | None:
+        """从 runtime 上下文取 thread_id（与记忆中间件的解析方式一致）。"""
+        runtime_context = getattr(runtime, "context", None) or {}
+        thread_id = runtime_context.get("thread_id") if isinstance(runtime_context, dict) else None
+        if thread_id is None:
+            try:
+                from langgraph.config import get_config
+
+                config_data = get_config()
+                thread_id = (config_data.get("configurable") or {}).get("thread_id")
+            except RuntimeError:
+                thread_id = None
+        return str(thread_id) if thread_id else None
 
     async def _summarize(self, messages: list[AnyMessage]) -> str:
         """把待压缩消息交给模型生成摘要；失败时回退为规则式截断。"""

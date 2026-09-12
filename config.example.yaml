@@ -52,14 +52,19 @@ sandbox:
 
 memory:
   enabled: true
-  mode: tool
-  backend: sqlite
+  mode: middleware
+  injection_enabled: true
   root_dir: null
-  memory_db_file: memory.db
   checkpoints_db_file: checkpoints.db
-  table_name: memory_entries
   max_results: 5
-  max_memory_chars: 2000
+  backend_config:
+    debounce_seconds: 30
+    queue_max_depth: 1000
+    max_facts: 100
+    fact_confidence_threshold: 0.7
+    max_injection_tokens: 2000
+    watermark_max_keys: 4096
+    model: null
 
 tools:
   web_search:

@@ -49,6 +49,25 @@ def create_app(
         await svc.start()
         yield
         await svc.close()
+        # 优雅关闭：排空记忆防抖队列（避免重启丢失防抖缓冲中的待提取更新）
+        try:
+            from harness.config.memory_config import get_memory_config
+
+            if get_memory_config().enabled:
+                from harness.memory.manager import get_memory_manager
+
+                manager = get_memory_manager()
+                if not manager.shutdown_flush(timeout=10.0):
+                    import logging
+
+                    logging.getLogger(__name__).warning(
+                        "记忆队列未在超时内排空，尾部更新可能丢失"
+                    )
+                manager.close()
+        except Exception:
+            import logging
+
+            logging.getLogger(__name__).exception("记忆队列关闭排空异常（忽略）")
 
     from fastapi import Depends
 

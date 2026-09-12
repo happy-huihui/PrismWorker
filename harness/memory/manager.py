@@ -1,275 +1,453 @@
-"""长期记忆存储：基于标准库 sqlite3 的 MemoryStore。
+"""记忆管理器：后端无关契约 + PrismMem 实现 + 单例工厂。
 
-单一文件 memory.db、一张表 memory_entries：
-    - 复合主键 (user_id, key)：同一用户同一 key 重复保存 = 更新（upsert）
-    - kind 是开放主题标签（preference / project / fact / episodic …），
-      仅用于按类别过滤检索，代码不校验枚举
-路径解析统一走 resolve_memory_paths()，manager 与 checkpointer 共用，
-保证「记忆与 checkpoint 落在同一个 root_dir」。
+模块职责（对应参考实现 manager 模块，去掉插件扫描与 tier-3 可选钩子）：
+    - ``MemoryManager``：后端无关抽象契约，主链路（中间件 / 工具 /
+      注入 / 生命周期）只依赖该接口；
+    - ``PrismMemoryManager``：本项目唯一实现，装配 storage / updater /
+      queue 三件套，并在写入口统一做「消息过滤 → trivial 过滤 → 双方
+      校验 → 信号检测 → 入队」；
+    - ``get_memory_manager``：线程安全单例工厂（首次调用时从全局配置
+      构建，并顺手执行旧 SQLite 库迁移）；
+    - ``resolve_memory_paths``：从 paths.py 转导出，保持旧调用方
+      （checkpointer / app 层）import 路径不变。
+
+写入口的异常契约：队列背压（QueueFull）、存储异常全部在内部消化为
+日志，绝不向 Agent 主链路扩散（记忆是 best-effort）。
 """
 
 from __future__ import annotations
 
 import logging
-import re
-import sqlite3
 import threading
-from contextlib import contextmanager
-from dataclasses import dataclass
-from datetime import datetime, timezone
-from pathlib import Path
-from typing import Any
+from abc import ABC, abstractmethod
+from typing import Any, ClassVar, Literal
 
-from harness.config.memory_config import MemoryConfig
-from harness.config.paths import get_paths
+from harness.memory.config import PrismMemConfig
+from harness.memory.message_processing import (
+    detect_signals,
+    filter_messages_for_memory,
+    filter_trivial,
+    load_patterns,
+)
+from harness.memory.paths import DEFAULT_AGENT_BUCKET, resolve_memory_paths  # noqa: F401 —— 兼容转导出
+from harness.memory.prompt import format_memory_for_injection
+from harness.memory.queue import MemoryUpdateQueue, QueueFull
+from harness.memory.storage import MemoryStorage, migrate_legacy_sqlite
+from harness.memory.updater import MemoryUpdater
 
 logger = logging.getLogger(__name__)
 
-_TABLE_NAME_RE = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*$")
+# 单例与构造锁
+_manager: MemoryManager | None = None
+_manager_lock = threading.Lock()
 
 
-@dataclass
-class MemoryEntry:
-    """一条长期记忆（结构化的行数据）。"""
-
-    user_id: str
-    key: str
-    content: str
-    kind: str
-    created_at: str
-    updated_at: str
+def _resolve_agent_name(agent_name: str | None) -> str:
+    """规范化 agent_name（本项目单 Agent，保留桶语义便于未来扩展）。"""
+    return agent_name.lower() if agent_name is not None else DEFAULT_AGENT_BUCKET
 
 
-def _now_iso() -> str:
-    """当前 UTC 时间的 ISO8601 字符串（同格式保证按字典序即按时间序）。"""
-    return datetime.now(timezone.utc).isoformat(timespec="seconds")
+class MemoryManager(ABC):
+    """记忆管理器契约（tier-1 必须实现，tier-2 带默认实现）。"""
 
+    # 分类标签（保留 ClassVar 语义：后续接入检索后端时声明能力用）
+    supports_search: ClassVar[bool] = True
+    mode: Literal["middleware", "tool"] = "middleware"
 
-def resolve_memory_paths(config: MemoryConfig | None = None) -> tuple[Path, Path]:
-    """解析记忆库与 checkpoint 库两个文件的完整路径。
-
-    Args:
-        config: 记忆配置；缺省用全局配置。
-
-    Returns:
-        (memory.db 路径, checkpoints.db 路径)；父目录不存在时自动创建。
-    """
-    if config is None:
-        from harness.config.app_config import get_app_config
-
-        config = get_app_config().memory
-    if config.root_dir:
-        root = Path(config.root_dir).resolve()
-    else:
-        root = get_paths().base_dir / "data"
-    root.mkdir(parents=True, exist_ok=True)
-    return root / config.memory_db_file, root / config.checkpoints_db_file
-
-
-class MemoryStore:
-    """长期记忆存取（SQLite）。
-
-    线程安全策略：每次操作开独立短连接——sqlite3 连接不被跨线程共享，
-    短连接天然规避；记忆是低频读写，连接开销可忽略。
-    """
-
-    def __init__(
+    # ── Tier 1：写 / 读注入 ────────────────────────────────────────────
+    @abstractmethod
+    def add(
         self,
-        db_path: str | Path,
+        thread_id: str,
+        messages: list[Any],
         *,
-        table_name: str = "memory_entries",
-        max_memory_chars: int = 2000,
-    ):
-        """初始化存储并确保表结构存在。
+        agent_name: str | None = None,
+        user_id: str | None = None,
+        trace_id: str | None = None,
+    ) -> None:
+        """把一轮对话入队，防抖异步更新记忆（实现内部完成过滤与信号检测）。"""
 
-        Args:
-            db_path: memory.db 文件路径。
-            table_name: 记忆表名。
-            max_memory_chars: 单条记忆内容上限（超长截断）。
-        """
-        if _TABLE_NAME_RE.fullmatch(table_name) is None:
-            raise ValueError(f"非法的记忆表名: {table_name!r}")
-        self._db_path = Path(db_path)
-        self._table_name = table_name
-        self._max_memory_chars = max_memory_chars
-        self._initialize()
-
-
-    def _initialize(self) -> None:
-        """建表与索引（CREATE IF NOT EXISTS，幂等）。"""
-        with self._connect() as conn:
-            conn.execute(
-                f"""
-                CREATE TABLE IF NOT EXISTS {self._table_name} (
-                    user_id    TEXT NOT NULL,
-                    key        TEXT NOT NULL,
-                    content    TEXT NOT NULL,
-                    kind       TEXT NOT NULL DEFAULT 'general',
-                    created_at TEXT NOT NULL,
-                    updated_at TEXT NOT NULL,
-                    PRIMARY KEY (user_id, key)
-                )
-                """
-            )
-            conn.execute(
-                f"CREATE INDEX IF NOT EXISTS idx_{self._table_name}_updated "
-                f"ON {self._table_name} (user_id, updated_at DESC)"
-            )
-
-    @contextmanager
-    def _connect(self) -> Any:
-        """打开独立连接（WAL 提升读写并发，行工厂返回字典式行）。
-
-        with 块退出时自动 commit + close——注意 Python 的
-        ``with sqlite3.connect()`` 本身只管理事务不关连接，这里是
-        显式管理生命周期，避免 Windows 上句柄未释放文件被占用。
-        """
-        conn = sqlite3.connect(self._db_path, check_same_thread=False)
-        try:
-            conn.row_factory = sqlite3.Row
-            conn.execute("PRAGMA journal_mode=WAL")
-            yield conn
-            conn.commit()
-        except Exception:
-            conn.rollback()
-            raise
-        finally:
-            conn.close()
-
-
-    def save(
+    @abstractmethod
+    def add_nowait(
         self,
-        user_id: str,
-        key: str,
+        thread_id: str,
+        messages: list[Any],
+        *,
+        agent_name: str | None = None,
+        user_id: str | None = None,
+        trace_id: str | None = None,
+    ) -> None:
+        """紧急入队立即处理（摘要压缩前调用，bypass 水位线）。"""
+
+    @abstractmethod
+    def get_context(
+        self,
+        user_id: str | None,
+        *,
+        agent_name: str | None = None,
+        thread_id: str | None = None,
+    ) -> str:
+        """返回可直接注入系统提示的记忆文本（空串 = 无可注入内容）。"""
+
+    # ── Tier 2：检索与管理 ─────────────────────────────────────────────
+    @abstractmethod
+    def search(
+        self,
+        query: str,
+        top_k: int = 5,
+        *,
+        user_id: str | None = None,
+        agent_name: str | None = None,
+        category: str | None = None,
+    ) -> list[dict[str, Any]]:
+        """检索匹配事实（按置信度降序；空 query 返回空列表）。"""
+
+    @abstractmethod
+    def get_memory(
+        self,
+        *,
+        user_id: str | None = None,
+        agent_name: str | None = None,
+    ) -> dict[str, Any]:
+        """返回用户记忆完整文档。"""
+
+    def import_memory(
+        self,
+        memory_data: dict[str, Any],
+        *,
+        user_id: str | None = None,
+        agent_name: str | None = None,
+    ) -> dict[str, Any]:
+        """导入记忆文档（默认不支持，PrismMem 覆盖）。"""
+        raise NotImplementedError(f"import_memory not supported by {type(self).__name__}")
+
+    @abstractmethod
+    def clear_memory(
+        self,
+        *,
+        user_id: str | None = None,
+        agent_name: str | None = None,
+    ) -> dict[str, Any]:
+        """清空用户记忆文档。"""
+
+    def create_fact(
+        self,
         content: str,
+        category: str = "context",
+        confidence: float = 0.5,
         *,
-        kind: str = "general",
-    ) -> bool:
-        """保存一条记忆；同 user_id+key 已存在则更新内容与分类。
+        user_id: str | None = None,
+        agent_name: str | None = None,
+    ) -> tuple[dict[str, Any], str | None]:
+        """手动新增事实（默认不支持，PrismMem 覆盖）。"""
+        raise NotImplementedError(f"create_fact not supported by {type(self).__name__}")
 
-        Args:
-            user_id: 记忆归属用户。
-            key: 记忆唯一键。
-            content: 记忆正文（超过上限自动截断）。
-            kind: 主题标签，默认 general。
+    def delete_fact(
+        self,
+        fact_id: str,
+        *,
+        user_id: str | None = None,
+        agent_name: str | None = None,
+    ) -> dict[str, Any]:
+        """删除事实（默认不支持，PrismMem 覆盖）。"""
+        raise NotImplementedError(f"delete_fact not supported by {type(self).__name__}")
 
-        Returns:
-            True 表示新建，False 表示覆盖了已有记忆。
-        """
-        now = _now_iso()
-        content = content[: self._max_memory_chars] if content else ""
-        user_id = user_id or "default"
-        key = (key or "").strip()
-        if not key:
-            raise ValueError("记忆 key 不能为空")
-        with self._connect() as conn:
-            existed = (
-                conn.execute(
-                    f"SELECT 1 FROM {self._table_name} WHERE user_id=? AND key=?",
-                    (user_id, key),
-                ).fetchone()
-                is not None
+    def update_fact(
+        self,
+        fact_id: str,
+        content: str | None = None,
+        category: str | None = None,
+        confidence: float | None = None,
+        *,
+        user_id: str | None = None,
+        agent_name: str | None = None,
+    ) -> dict[str, Any]:
+        """更新事实（默认不支持，PrismMem 覆盖）。"""
+        raise NotImplementedError(f"update_fact not supported by {type(self).__name__}")
+
+    def shutdown_flush(self, timeout: float) -> bool:
+        """优雅关闭时排空待处理更新（默认无缓冲直接 True，PrismMem 覆盖）。"""
+        return True
+
+    def close(self) -> None:
+        """释放资源（默认无操作）。"""
+
+
+class PrismMemoryManager(MemoryManager):
+    """项目默认记忆后端：JSON 文档存储 + LLM 防抖提取（PrismMem）。"""
+
+    supports_search: ClassVar[bool] = True
+
+    def __init__(self, mem_config: PrismMemConfig, *, mode: Literal["middleware", "tool"] = "middleware"):
+        """装配存储 / 更新器 / 队列（DI，全部实例私有）。"""
+        self.mode = mode
+        self._config = mem_config
+        self._storage = MemoryStorage(mem_config)
+        self._updater = MemoryUpdater(mem_config, self._storage)
+        self._queue = MemoryUpdateQueue(mem_config, self._updater)
+        self._trivial_patterns = load_patterns("trivial", patterns_dir=mem_config.patterns_dir)
+        self._patterns_dir = mem_config.patterns_dir
+
+    # ── 写 ──────────────────────────────────────────────────────────────
+    def _prepare_update(
+        self,
+        messages: list[Any],
+    ) -> tuple[list[Any], frozenset[str]] | None:
+        """过滤 + trivial + 双方校验 + 信号检测；无有效对话返回 None。"""
+        filtered = filter_messages_for_memory(messages)
+        filtered = filter_trivial(filtered, patterns=self._trivial_patterns)
+        user_messages = [m for m in filtered if getattr(m, "type", None) == "human"]
+        assistant_messages = [m for m in filtered if getattr(m, "type", None) == "ai"]
+        if not user_messages or not assistant_messages:
+            return None
+        signals = detect_signals(filtered, patterns_dir=self._patterns_dir)
+        return filtered, frozenset(signals)
+
+    def add(
+        self,
+        thread_id: str,
+        messages: list[Any],
+        *,
+        agent_name: str | None = None,
+        user_id: str | None = None,
+        trace_id: str | None = None,
+    ) -> None:
+        prepared = self._prepare_update(messages)
+        if prepared is None:
+            return
+        filtered, signals = prepared
+        try:
+            self._queue.add(
+                thread_id=thread_id,
+                messages=filtered,
+                agent_name=_resolve_agent_name(agent_name),
+                user_id=user_id,
+                trace_id=trace_id,
+                signals=signals,
             )
-            conn.execute(
-                f"INSERT INTO {self._table_name} (user_id, key, content, kind, created_at, updated_at) "
-                f"VALUES (?, ?, ?, ?, ?, ?) "
-                f"ON CONFLICT(user_id, key) DO UPDATE SET "
-                f"content=excluded.content, kind=excluded.kind, updated_at=excluded.updated_at",
-                (user_id, key, content, kind, now, now),
+        except QueueFull as exc:
+            logger.warning("记忆更新被背压拒绝（thread=%s）: %s", thread_id, exc)
+
+    def add_nowait(
+        self,
+        thread_id: str,
+        messages: list[Any],
+        *,
+        agent_name: str | None = None,
+        user_id: str | None = None,
+        trace_id: str | None = None,
+    ) -> None:
+        prepared = self._prepare_update(messages)
+        if prepared is None:
+            return
+        filtered, signals = prepared
+        try:
+            self._queue.add_nowait(
+                thread_id=thread_id,
+                messages=filtered,
+                agent_name=_resolve_agent_name(agent_name),
+                user_id=user_id,
+                trace_id=trace_id,
+                signals=signals,
             )
-        return not existed
+        except QueueFull as exc:
+            logger.warning("记忆紧急冲刷被背压拒绝（thread=%s）: %s", thread_id, exc)
+
+    # ── 读 / 注入 ───────────────────────────────────────────────────────
+    def get_context(
+        self,
+        user_id: str | None,
+        *,
+        agent_name: str | None = None,
+        thread_id: str | None = None,
+    ) -> str:
+        try:
+            memory_data = self._updater.get_memory_data(user_id)
+        except Exception as exc:  # noqa: BLE001 —— 记忆异常静默降级，不阻断对话
+            logger.warning("记忆读取失败，本次不注入: %s", exc)
+            return ""
+        return format_memory_for_injection(
+            memory_data,
+            max_tokens=self._config.max_injection_tokens,
+            guaranteed_categories=self._config.guaranteed_categories,
+            guaranteed_token_budget=self._config.guaranteed_token_budget,
+        )
 
     def search(
         self,
-        user_id: str,
-        query: str | None = None,
+        query: str,
+        top_k: int = 5,
         *,
-        kind: str | None = None,
-        limit: int = 5,
-    ) -> list[MemoryEntry]:
-        """按关键词检索长期记忆（content/key 的 LIKE 匹配）。
+        user_id: str | None = None,
+        agent_name: str | None = None,
+        category: str | None = None,
+    ) -> list[dict[str, Any]]:
+        """子串检索（大小写不敏感）+ 置信度降序；空 query 返回空。"""
+        if not query or not query.strip() or top_k <= 0:
+            return []
+        query_lower = query.strip().lower()
+        try:
+            memory_data = self._updater.get_memory_data(user_id)
+        except Exception as exc:  # noqa: BLE001
+            logger.warning("记忆检索读取失败: %s", exc)
+            return []
+        matched = [
+            fact
+            for fact in memory_data.get("facts", [])
+            if isinstance(fact, dict)
+            and (
+                (
+                    isinstance(fact.get("content"), str)
+                    and query_lower in fact["content"].lower()
+                )
+                or (
+                    isinstance(fact.get("key"), str)
+                    and query_lower in fact["key"].lower()
+                )
+            )
+            and (category is None or fact.get("category") == category)
+        ]
+        matched.sort(key=lambda f: _fact_confidence(f), reverse=True)
+        return matched[: max(1, int(top_k))]
 
-        Args:
-            user_id: 归属用户。
-            query: 关键词；None 表示不限关键词（列出该用户全部记忆）。
-            kind: 只取该标签下的记忆；None 表示不限。
-            limit: 最多返回条数（至少 1）。
+    # ── 管理 ────────────────────────────────────────────────────────────
+    def get_memory(
+        self,
+        *,
+        user_id: str | None = None,
+        agent_name: str | None = None,
+    ) -> dict[str, Any]:
+        return self._updater.get_memory_data(user_id)
 
-        Returns:
-            匹配的记忆列表，按最近更新倒序。
-        """
-        clauses = ["user_id = ?"]
-        params: list[Any] = [user_id or "default"]
-        if query:
-            like = f"%{query}%"
-            clauses.append("(content LIKE ? OR key LIKE ?)")
-            params += [like, like]
-        if kind:
-            clauses.append("kind = ?")
-            params.append(kind)
-        params.append(max(1, int(limit)))
-        sql = (
-            f"SELECT user_id, key, content, kind, created_at, updated_at "
-            f"FROM {self._table_name} "
-            f"WHERE {' AND '.join(clauses)} ORDER BY updated_at DESC LIMIT ?"
+    def import_memory(
+        self,
+        memory_data: dict[str, Any],
+        *,
+        user_id: str | None = None,
+        agent_name: str | None = None,
+    ) -> dict[str, Any]:
+        return self._updater.import_memory_data(memory_data, user_id=user_id)
+
+    def clear_memory(
+        self,
+        *,
+        user_id: str | None = None,
+        agent_name: str | None = None,
+    ) -> dict[str, Any]:
+        return self._updater.clear_memory_data(user_id)
+
+    def create_fact(
+        self,
+        content: str,
+        category: str = "context",
+        confidence: float = 1.0,
+        *,
+        user_id: str | None = None,
+        agent_name: str | None = None,
+        key: str | None = None,
+    ) -> tuple[dict[str, Any], str | None]:
+        return self._updater.create_fact(
+            content,
+            category=category,
+            confidence=confidence,
+            user_id=user_id,
+            key=key,
         )
-        with self._connect() as conn:
-            rows = conn.execute(sql, params).fetchall()
-        return [MemoryEntry(**dict(row)) for row in rows]
 
-    def get(self, user_id: str, key: str) -> MemoryEntry | None:
-        """按 (user_id, key) 精确取一条记忆；不存在返回 None。"""
-        with self._connect() as conn:
-            row = conn.execute(
-                f"SELECT user_id, key, content, kind, created_at, updated_at "
-                f"FROM {self._table_name} WHERE user_id=? AND key=?",
-                (user_id, key),
-            ).fetchone()
-        return MemoryEntry(**dict(row)) if row is not None else None
+    def delete_fact(
+        self,
+        fact_id: str,
+        *,
+        user_id: str | None = None,
+        agent_name: str | None = None,
+    ) -> dict[str, Any]:
+        return self._updater.delete_fact(fact_id, user_id=user_id)
 
-    def delete(self, user_id: str, key: str) -> bool:
-        """删除一条长期记忆。
+    def update_fact(
+        self,
+        fact_id: str,
+        content: str | None = None,
+        category: str | None = None,
+        confidence: float | None = None,
+        *,
+        user_id: str | None = None,
+        agent_name: str | None = None,
+    ) -> dict[str, Any]:
+        return self._updater.update_fact(
+            fact_id,
+            content=content,
+            category=category,
+            confidence=confidence,
+            user_id=user_id,
+        )
 
-        Args:
-            user_id: 归属用户。
-            key: 要删除的记忆键。
+    # ── 生命周期 ────────────────────────────────────────────────────────
+    def shutdown_flush(self, timeout: float) -> bool:
+        """优雅关闭：有界排空防抖队列（超时未完成返回 False 由调用方告警）。"""
+        return self._queue.flush_sync(timeout)
 
-        Returns:
-            True 表示真的删掉了，False 表示不存在。
-        """
-        with self._connect() as conn:
-            cursor = conn.execute(
-                f"DELETE FROM {self._table_name} WHERE user_id=? AND key=?",
-                (user_id, key),
-            )
-        return cursor.rowcount > 0
+    def close(self) -> None:
+        """释放存储资源（当前实现无外部连接，保持接口）。"""
+        self._storage.close()
 
 
+def _fact_confidence(fact: dict[str, Any]) -> float:
+    """安全取事实置信度（检索排序用）。"""
+    raw = fact.get("confidence")
+    if raw is None or isinstance(raw, bool):
+        return 0.5
+    try:
+        value = float(raw)
+    except (TypeError, ValueError):
+        return 0.5
+    return max(0.0, min(value, 1.0))
 
-_store_lock: threading.Lock = threading.Lock()
-_default_store: MemoryStore | None = None
 
+# ── 单例工厂 ─────────────────────────────────────────────────────────────
+def get_memory_manager() -> MemoryManager:
+    """返回进程级记忆管理器单例（线程安全；首次构建时顺带执行旧库迁移）。
 
-def get_memory_store(config: MemoryConfig | None = None) -> MemoryStore:
-    """返回进程级长期记忆存储单例（懒初始化 + 幂等建表）。
-
-    Args:
-        config: 记忆配置；缺省用全局配置。
+    Returns:
+        MemoryManager 实例。记忆未启用（memory.enabled=false）时返回
+        ``None``？——不：为保持调用方简单，本实现始终可构建；禁用开关
+        由调用方（中间件 / 工具）自行判断。
     """
-    global _default_store
-    if _default_store is not None:
-        return _default_store
-    with _store_lock:
-        if _default_store is None:
-            if config is None:
-                from harness.config.app_config import get_app_config
+    global _manager
+    if _manager is not None:
+        return _manager
+    with _manager_lock:
+        if _manager is not None:
+            return _manager
 
-                config = get_app_config().memory
-            db_path, _ = resolve_memory_paths(config)
-            _default_store = MemoryStore(
-                db_path,
-                table_name=config.table_name,
-                max_memory_chars=config.max_memory_chars,
-            )
-            logger.info("长期记忆库就绪: %s", db_path)
-    return _default_store
+        from harness.config.memory_config import get_memory_config
+
+        host_config = get_memory_config()
+        mem_config = PrismMemConfig.from_backend_config(host_config.backend_config)
+        # 旧 SQLite 库一次性迁移（幂等：无旧库 / 已备份则直接跳过）
+        try:
+            migrated = migrate_legacy_sqlite(mem_config)
+            if migrated:
+                logger.info("旧长期记忆库迁移完成：%d 个用户文档", migrated)
+        except Exception as exc:  # noqa: BLE001 —— 迁移失败不阻断记忆启动
+            logger.warning("旧长期记忆库迁移失败（已跳过，不影响新记忆）: %s", exc)
+
+        _manager = PrismMemoryManager(mem_config, mode=host_config.mode)
+        logger.info(
+            "记忆管理器就绪: mode=%s storage_path=%s",
+            host_config.mode,
+            mem_config.storage_path or "(默认数据目录)",
+        )
+        return _manager
+
+
+def reset_memory_manager() -> None:
+    """清空单例（测试 / 运行时重建用）。"""
+    global _manager
+    with _manager_lock:
+        current = _manager
+        _manager = None
+        if current is not None:
+            try:
+                current.close()
+            except Exception:  # noqa: BLE001
+                logger.debug("记忆管理器关闭异常（忽略）", exc_info=True)

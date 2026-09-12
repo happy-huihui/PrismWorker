@@ -1,0 +1,27 @@
+# 纠错信号模式（detect_signals 的 correction 类）。
+#
+# 列表项可以是：
+#   - 字符串                       -> 直接编译（无 flag）
+#   - 映射 {pattern, flags}        -> flags 为 "ignorecase" 列表
+#
+# 命中含义：用户明确纠正了助手的方向/理解/输出——高价值「值得记住」信号，
+# 提取提示词会因此要求模型以高置信度记录 durable 用户级纠错偏好。
+# 保持克制，避免把任务内的一次性纠正误判为用户级偏好。
+
+- pattern: '\bthat(?:''s| is) (?:wrong|incorrect)\b'
+  flags: [ignorecase]
+- pattern: '\byou misunderstood\b'
+  flags: [ignorecase]
+- pattern: '\btry again\b'
+  flags: [ignorecase]
+- pattern: '\bredo\b'
+  flags: [ignorecase]
+- '不对'
+- '你理解错了'
+- '你理解有误'
+- '你搞错了'
+- '重试'
+- '重新来'
+- '换一种'
+- '改用'
+- '不是这样'

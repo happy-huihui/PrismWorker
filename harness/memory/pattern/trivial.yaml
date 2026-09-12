@@ -1,0 +1,26 @@
+# 纯应声模式（filter_trivial 用）。
+#
+# 用 fullmatch 对「剥离尾随标点后的整条用户消息」匹配——只有整句都是
+# 应声才算 trivial，包含实质内容的句子永远不会被误删。保持窄：误删一条
+# 真实用户轮次意味着那轮内容永远进不了记忆。
+
+- pattern: '嗯+'
+- pattern: 'ok(?:ay)?'
+  flags: [ignorecase]
+- pattern: '好的[呢]?'
+- pattern: '好[的呀]?'
+- pattern: '谢谢'
+- pattern: '感谢'
+- pattern: '多谢'
+- pattern: '对'
+- pattern: '是的'
+- pattern: '收到'
+- pattern: '明白'
+- pattern: '了解'
+- pattern: '知道了'
+- pattern: 'got it'
+  flags: [ignorecase]
+- pattern: 'thanks'
+  flags: [ignorecase]
+- pattern: 'thank you'
+  flags: [ignorecase]

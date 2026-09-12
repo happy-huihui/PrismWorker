@@ -1,0 +1,19 @@
+# 决策信号模式（detect_signals 的 decision 类）。
+#
+# 命中含义：用户做了选择/决定——若为 durable 用户级决策则值得入记忆；
+# 任务内的技术选型由 scope=project 门控挡住，不会污染用户记忆。
+
+- pattern: '\blet.s (?:go with|use|pick|choose)\b'
+  flags: [ignorecase]
+- pattern: '\bI.ll (?:go with|use|pick|choose)\b'
+  flags: [ignorecase]
+- pattern: '\bwe (?:should|will) (?:go with|use|pick|choose)\b'
+  flags: [ignorecase]
+- pattern: '\bI (?:decide|chose|selected) to\b'
+  flags: [ignorecase]
+- '就用'
+- '决定用'
+- '决定采用'
+- '我们选'
+- '我选'
+- '就采用'

@@ -1,0 +1,19 @@
+# 目标信号模式（detect_signals 的 goal 类）。
+#
+# 命中含义：用户陈述了目标/意图/计划——跨会话记忆的高价值信号
+# （注意与「当前任务目标」区分，后者由 scope=thread 门控挡住）。
+
+- pattern: '\bI (?:plan to|want to|am going to|aim to|intend to)\b'
+  flags: [ignorecase]
+- pattern: '\bmy goal is\b'
+  flags: [ignorecase]
+- pattern: '\bI.m going to\b'
+  flags: [ignorecase]
+- pattern: '\bnext I.ll\b'
+  flags: [ignorecase]
+- '我的目标是'
+- '我打算'
+- '我准备'
+- '接下来我要'
+- '接下来我打算'
+- '我想做'

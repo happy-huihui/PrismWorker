@@ -1,0 +1,21 @@
+# 偏好信号模式（detect_signals 的 preference 类）。
+#
+# 命中含义：用户陈述了偏好/喜好/厌恶——跨会话记忆的高价值信号。
+# 在最近 6 条用户消息上用 search 匹配。保持窄匹配避免误报。
+
+- pattern: '\bI (?:really )?(?:prefer|like|love|enjoy|favor)\b'
+  flags: [ignorecase]
+- pattern: '\bI (?:really )?(?:hate|dislike|don.t like|cannot stand)\b'
+  flags: [ignorecase]
+- pattern: '\bmy favorite\b'
+  flags: [ignorecase]
+- pattern: '\bI.d rather\b'
+  flags: [ignorecase]
+- '我喜欢'
+- '我偏好'
+- '我更喜欢'
+- '我偏爱'
+- '我讨厌'
+- '我不喜欢'
+- '我最喜欢'
+- '习惯于'

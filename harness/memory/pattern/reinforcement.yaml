@@ -1,0 +1,24 @@
+# 正向强化信号模式（detect_signals 的 reinforcement 类）。
+#
+# 命中含义：用户认可了助手的方式/风格/结果——值得确认该方式是否为
+# durable 用户级偏好。注意：裸确认（你说的对/没错）故意不收录，避免
+# 「对不起/对方/对啊」等误报。
+
+- pattern: '\byes[,.]?\s+(?:exactly|perfect|that(?:''s| is) (?:right|correct|it))\b'
+  flags: [ignorecase]
+- pattern: '\bperfect(?:[.!?]|$)'
+  flags: [ignorecase]
+- pattern: '\bexactly\s+(?:right|correct)\b'
+  flags: [ignorecase]
+- pattern: '\bthat(?:''s| is)\s+(?:exactly\s+)?(?:right|correct|what i (?:wanted|needed|meant))\b'
+  flags: [ignorecase]
+- pattern: '\bkeep\s+(?:doing\s+)?that\b'
+  flags: [ignorecase]
+- pattern: '\bthis is (?:great|helpful)\b(?:[.!?]|$)'
+  flags: [ignorecase]
+- '对[，,]?\s*就是这样(?:[。！？!?.]|$)'
+- '完全正确(?:[。！？!?.]|$)'
+- '(?:对[，,]?\s*)?就是这个意思(?:[。！？!?.]|$)'
+- '正是我想要的(?:[。！？!?.]|$)'
+- '继续保持(?:[。！？!?.]|$)'
+- '很好(?:[。！？!?.]|$)'

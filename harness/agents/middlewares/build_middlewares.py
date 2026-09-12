@@ -17,7 +17,6 @@ from harness.agents.middlewares.flow_control import (
 from harness.agents.middlewares.input_sanitization_middleware import (
     InputSanitizationMiddleware,
 )
-from harness.agents.middlewares.memory_injection import MemoryInjectionMiddleware
 from harness.agents.middlewares.sandbox_protection import (
     ReadBeforeWriteMiddleware,
     SandboxAuditMiddleware,
@@ -83,11 +82,15 @@ def build_middlewares(
         DynamicContextMiddleware(),
         UploadsMiddleware(),
     ]
-    if memory.mode == "middleware":
+    # 记忆中间件：注入长期记忆 + （middleware 模式）每轮自动提取入队。
+    # tool 模式只注入不自动提取，写入由模型记忆工具负责（行为与旧版一致）。
+    if memory.enabled:
+        from harness.memory.middleware import MemoryMiddleware, memory_flush_hook
+
         middlewares.append(
-            MemoryInjectionMiddleware(
-                auto_save=False,
-                max_results=memory.max_results,
+            MemoryMiddleware(
+                agent_name=app_config.agent_name,
+                auto_extract=(memory.mode == "middleware"),
             )
         )
     middlewares += [
@@ -97,10 +100,21 @@ def build_middlewares(
         TitleMiddleware(model_name=active_name),
         TodoMiddleware(),
     ]
+    # 摘要中间件：超长压缩；压缩前记忆冲刷钩子由记忆子系统注入（无记忆时不冲刷）。
+    if memory.enabled:
+        from harness.memory.middleware import memory_flush_hook
+
+        summarization = SummarizationMiddleware(
+            model_name=active_name,
+            flush_hook=memory_flush_hook,
+            agent_name=app_config.agent_name,
+        )
+    else:
+        summarization = SummarizationMiddleware(model_name=active_name)
     middlewares += [
         ClarificationMiddleware(),
         TokenBudgetMiddleware(),
-        SummarizationMiddleware(model_name=active_name),
+        summarization,
         DeferredToolFilterMiddleware(),
         ToolProgressMiddleware(event_sink=event_sink),
         LoopDetectionMiddleware(),
