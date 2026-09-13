@@ -22,6 +22,38 @@ from harness.config.model_config import ModelConfig
 logger = logging.getLogger(__name__)
 
 
+class DeepSeekFlashChatModel(ChatDeepSeek):
+    """DeepSeek Flash 级模型（快速对话，无思考链）。
+
+    对应 deepseek-chat / deepseek-v3 等快速对话模型：低延迟、不输出
+    reasoning_content，适合日常问答与轻任务。与 Patched 相比不需要
+    reasoning 还原（Flash 模型不产生思考链），构造/序列化行为与父类
+    一致，仅统一密钥解析约定（DEEPSEEK_API_KEY）。
+    """
+
+    @classmethod
+    def is_lc_serializable(cls) -> bool:
+        """LangChain 序列化兼容开关（保持与父类一致的默认行为）。"""
+        return True
+
+    @property
+    def lc_secrets(self) -> dict[str, str]:
+        """序列化时把密钥字段统一映射到 DEEPSEEK_API_KEY。"""
+        return {"api_key": "DEEPSEEK_API_KEY", "openai_api_key": "DEEPSEEK_API_KEY"}
+
+
+# DeepSeek 推理型模型标识（Pro 级）；其余标识归 Flash 级
+_DEEPSEEK_REASONER_MARKERS = ("reasoner", "deepseek-r1", "r1-")
+
+
+def is_deepseek_pro_model(model_id: str | None) -> bool:
+    """按模型标识判断是否 Pro 级（推理型）DeepSeek 模型。"""
+    if not model_id:
+        return False
+    lowered = model_id.lower()
+    return any(marker in lowered for marker in _DEEPSEEK_REASONER_MARKERS)
+
+
 class PatchedChatDeepSeek(ChatDeepSeek):
     """修复 reasoning_content 多轮丢失问题的 ChatDeepSeek。
 
@@ -65,6 +97,15 @@ class PatchedChatDeepSeek(ChatDeepSeek):
 
         payload["messages"] = restored
         return payload
+
+
+class DeepSeekProChatModel(PatchedChatDeepSeek):
+    """DeepSeek Pro 级模型（深度推理，带 reasoning_content 修复）。
+
+    对应 deepseek-reasoner / deepseek-r1 等推理模型：输出思考链
+    （reasoning_content），多轮对话必须携带历史思考链——本实现继承
+    已修复该问题的 PatchedChatDeepSeek，保证多轮链路稳定。
+    """
 
 
 def restore_reasoning_content(
@@ -206,7 +247,10 @@ def _build_model(
 
     if provider == "deepseek":
         settings.pop("base_url", None)
-        return PatchedChatDeepSeek(**settings, **kwargs)
+        model_id = settings.get("model")
+        if is_deepseek_pro_model(str(model_id) if model_id is not None else None):
+            return DeepSeekProChatModel(**settings, **kwargs)
+        return DeepSeekFlashChatModel(**settings, **kwargs)
 
     raise ValueError(f"不支持的模型提供方: {provider!r}（仅支持 openai / deepseek）") from None
 

@@ -229,10 +229,10 @@ def _default_model_from_env() -> ModelConfig:
         return ModelConfig(
             name="default",
             provider="deepseek",
-            model=os.getenv("DEEPSEEK_MODEL", "deepseek-chat"),
+            model=os.getenv("DEEPSEEK_FLASH_MODEL", "deepseek-chat"),
             api_key=os.getenv("DEEPSEEK_API_KEY"),
             supports_vision=False,
-            supports_thinking=True,
+            supports_thinking=False,
             context_window=65536,
         )
     return ModelConfig(

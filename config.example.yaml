@@ -3,7 +3,7 @@ agent_name: LeadAgent
 
 log_level: INFO
 
-active_model: openai-default
+active_model: deepseek-flash
 
 models:
   - name: openai-default
@@ -15,14 +15,22 @@ models:
     supports_thinking: false
     context_window: 128000
     max_tokens: 4096
-  - name: deepseek-default
+  - name: deepseek-flash
     provider: deepseek
-    model: ${DEEPSEEK_MODEL:deepseek-chat}
+    model: ${DEEPSEEK_FLASH_MODEL:deepseek-chat}
+    api_key: ${DEEPSEEK_API_KEY:}
+    supports_vision: false
+    supports_thinking: false
+    context_window: 65536
+    max_tokens: 4096
+  - name: deepseek-pro
+    provider: deepseek
+    model: ${DEEPSEEK_PRO_MODEL:deepseek-reasoner}
     api_key: ${DEEPSEEK_API_KEY:}
     supports_vision: false
     supports_thinking: true
     context_window: 65536
-    max_tokens: 4096
+    max_tokens: 8192
 
 database:
   postgres_url: ${DATABASE_URL:postgresql://postgres:root@localhost:5432/prismworker}
