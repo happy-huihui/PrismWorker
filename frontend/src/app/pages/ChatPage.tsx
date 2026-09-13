@@ -1,6 +1,7 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react'
 import { ArrowLeft, Sparkles } from 'lucide-react'
 import { useNavigate, useParams } from 'react-router-dom'
+import { useQueryClient } from '@tanstack/react-query'
 import { toast } from 'sonner'
 
 import { ChatInput } from '@/components/chat/ChatInput'
@@ -15,10 +16,10 @@ import { Button } from '@/components/ui/button'
 import { Skeleton } from '@/components/ui/skeleton'
 import { useModels } from '@/core/models'
 import { useMessages } from '@/core/messages'
-import { useCreateThread, useThreads } from '@/core/threads'
+import { threadListKey, useCreateThread, useThreads } from '@/core/threads'
 import { useRunStream, useThreadRuns } from '@/core/runs'
 import { uploadFile } from '@/core/uploads'
-import { type MessageOut } from '@/core/api/types'
+import { type MessageOut, type ThreadOut } from '@/core/api/types'
 
 export function ChatPage() {
   const { threadId } = useParams()
@@ -38,6 +39,28 @@ function saveLocal(key: string, v: string) {
   } catch {
   }
 }
+
+const USER_INPUT_BEGIN = '--- BEGIN USER INPUT ---'
+const USER_INPUT_END = '--- END USER INPUT ---'
+const NEUTRALIZED_BOUNDARY_LINE_RE = /^\s*\[(?:BEGIN|END) USER INPUT\]\s*$/gm
+
+/** 归一化 user 历史消息内容（剥离会话包裹标记），用于与待发文本比较 */
+function normalizeUserContent(text: string): string {
+  let cur = text
+  for (let i = 0; i < 16; i++) {
+    const b = cur.indexOf(USER_INPUT_BEGIN)
+    const e = cur.lastIndexOf(USER_INPUT_END)
+    if (b < 0 || e <= b) break
+    cur = cur.slice(b + USER_INPUT_BEGIN.length, e)
+  }
+  return cur.replace(NEUTRALIZED_BOUNDARY_LINE_RE, '').replace(/\n{3,}/g, '\n\n').trim()
+}
+
+const WELCOME_SUGGESTIONS = [
+  '用通俗易懂的方式给我讲解堆排序',
+  '帮我写一份项目周报的结构大纲',
+  '如何理解 React 的 useMemo 与 useCallback？',
+]
 
 function WelcomeView() {
   const navigate = useNavigate()
@@ -65,15 +88,18 @@ function WelcomeView() {
   }
 
   return (
-    <div className="flex h-full flex-col items-center justify-center gap-5 px-6">
-      <div className="flex flex-col items-center gap-4 text-center">
-        <div className="flex size-14 items-center justify-center rounded-2xl bg-primary text-primary-foreground shadow-lg">
-          <Sparkles className="size-7" />
+    <div className="flex h-full flex-col items-center justify-center gap-6 px-6">
+      <div className="flex flex-col items-center gap-4 text-center animate-message-in">
+        <div className="relative">
+          <div className="absolute -inset-3 rounded-[1.6rem] bg-primary/10 blur-xl" aria-hidden />
+          <div className="relative flex size-14 items-center justify-center rounded-2xl bg-primary text-primary-foreground shadow-lg">
+            <Sparkles className="size-7" />
+          </div>
         </div>
         <div className="space-y-1.5">
           <h1 className="text-2xl font-semibold tracking-tight">欢迎使用 PrismWorker</h1>
           <p className="text-sm text-muted-foreground">
-            多智能体工作流引擎 · 输入问题即可开始对话
+            多智能体工作流引擎 · 提问、思考、交付，一气呵成
           </p>
         </div>
       </div>
@@ -88,7 +114,22 @@ function WelcomeView() {
         />
       </div>
 
-      <p className="max-w-md text-center text-xs text-muted-foreground/80">
+      <div className="flex w-full max-w-xl flex-wrap items-center justify-center gap-2">
+        {WELCOME_SUGGESTIONS.map((s) => (
+          <button
+            key={s}
+            type="button"
+            onClick={() => handleWelcomeSend(s)}
+            disabled={createThread.isPending}
+            className="max-w-full truncate rounded-full border bg-card px-3.5 py-1.5 text-xs text-muted-foreground transition-all hover:border-primary/30 hover:bg-accent hover:text-foreground disabled:opacity-50"
+            title={s}
+          >
+            {s}
+          </button>
+        ))}
+      </div>
+
+      <p className="max-w-md text-center text-xs text-muted-foreground/70">
         也可以从左侧选择一个已有会话继续，或点击「新建会话」。
       </p>
     </div>
@@ -97,6 +138,7 @@ function WelcomeView() {
 
 function ThreadView({ threadId }: { threadId: string }) {
   const navigate = useNavigate()
+  const qc = useQueryClient()
 
   const { data: threads, isLoading } = useThreads()
   const thread = threads?.find((t) => t.thread_id === threadId)
@@ -248,11 +290,53 @@ function ThreadView({ threadId }: { threadId: string }) {
   })
   const [pendingUser, setPendingUser] = useState<string | null>(null)
 
+  // 思考链打印「会话标题已生成：X」时，立即乐观更新线程列表缓存（侧边栏/顶栏标题即时刷新；
+  // 后端 run 收尾也会把标题持久化，invalidate 重拉后二者一致）
+  useEffect(() => {
+    const line = streamState.prints.find((p) => p.startsWith('会话标题已生成：'))
+    if (!line) return
+    const generated = line.slice('会话标题已生成：'.length).trim()
+    if (!generated) return
+    qc.setQueriesData<ThreadOut[]>({ queryKey: threadListKey }, (old) =>
+      old?.map((t) => (t.thread_id === threadId ? { ...t, title: generated } : t)),
+    )
+  }, [streamState.prints, threadId, qc])
+
+  // 历史一旦已包含该用户消息（流结束重拉完成），立即清理本地待发消息，避免重复展示
+  useEffect(() => {
+    if (
+      pendingUser &&
+      messages.some((m) => m.role === 'user' && normalizeUserContent(m.content) === pendingUser)
+    ) {
+      setPendingUser(null)
+    }
+  }, [messages, pendingUser])
+
   const liveMessages = useMemo<MessageOut[]>(() => {
-    const list: MessageOut[] = [...messages]
-    if (pendingUser) list.push({ role: 'user', content: pendingUser })
-    if ((runActive && streamState.aiText) || (!runActive && streamState.aiText && streamState.status === 'finished')) {
-      list.push({ role: 'assistant', content: streamState.aiText })
+    const history = messages
+    const list: MessageOut[] = [...history]
+
+    // 用户消息：历史已持久化同内容则不再追加（流结束后由重拉结果承担展示）
+    if (
+      pendingUser &&
+      !history.some((m) => m.role === 'user' && normalizeUserContent(m.content) === pendingUser)
+    ) {
+      list.push({ role: 'user', content: pendingUser })
+    }
+
+    // 助手回复：仅当历史尚未包含同内容回复时才叠加 aiText，
+    // 运行中负责流式展示，结束后作为「重拉完成前」的过渡兜底；
+    // 若历史最后一条 assistant 与 aiText 一致，交给历史渲染，避免重复。
+    const aiText = streamState.aiText
+    if (aiText) {
+      if (runActive) {
+        list.push({ role: 'assistant', content: aiText })
+      } else if (streamState.status === 'finished') {
+        const lastAssistant = [...history].reverse().find((m) => m.role === 'assistant')
+        if (!lastAssistant || lastAssistant.content !== aiText) {
+          list.push({ role: 'assistant', content: aiText })
+        }
+      }
     }
     return list
   }, [messages, pendingUser, runActive, streamState.aiText, streamState.status])
@@ -296,7 +380,7 @@ function ThreadView({ threadId }: { threadId: string }) {
         if (e.dataTransfer?.files?.length) uploadFiles(Array.from(e.dataTransfer.files))
       }}
     >
-      <header className="flex h-14 shrink-0 items-center gap-2 border-b px-3">
+      <header className="flex h-14 shrink-0 items-center gap-2 border-b bg-background/80 px-3 backdrop-blur-sm">
         <Button
           variant="ghost"
           size="icon"

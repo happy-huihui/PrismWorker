@@ -2,7 +2,7 @@
 
 面向多步骤复杂任务的 Harness Agent。基于 LangGraph 实现 ReAct 编排，提供子代理协作、跨会话持久记忆、沙盒隔离执行、Skill/Tool 装配与 Middleware 链式上下文治理。拥有文件、代码、图片产物生成能力。
 
-![PrismWorker 工作台界面](assets/cover.png)
+![PrismWorker 工作台界面](assets/example.png)
 
 ## 核心特性
 

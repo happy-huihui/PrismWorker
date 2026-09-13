@@ -53,7 +53,7 @@ export function ChatInput({
   }
 
   return (
-    <div className="flex items-end gap-1.5 rounded-xl border bg-card p-2 shadow-sm">
+    <div className="flex items-end gap-1.5 rounded-2xl border bg-card p-2 shadow-sm transition-shadow focus-within:ring-2 focus-within:ring-ring/40 focus-within:shadow-md">
       <input
         ref={fileRef}
         type="file"

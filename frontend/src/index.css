@@ -96,6 +96,8 @@
 
 @theme {
   --animate-step-in: step-in 0.15s ease-out;
+  --animate-message-in: message-in 0.28s cubic-bezier(0.16, 1, 0.3, 1);
+  --animate-fade-in: fade-in 0.2s ease-out;
 }
 
 @keyframes step-in {
@@ -109,11 +111,63 @@
   }
 }
 
+@keyframes message-in {
+  from {
+    opacity: 0;
+    transform: translateY(6px);
+  }
+  to {
+    opacity: 1;
+    transform: translateY(0);
+  }
+}
+
+@keyframes fade-in {
+  from {
+    opacity: 0;
+  }
+  to {
+    opacity: 1;
+  }
+}
+
+/* 细滚动条：全局统一，视觉更干净 */
+* {
+  scrollbar-width: thin;
+  scrollbar-color: color-mix(in oklch, var(--border) 80%, transparent) transparent;
+}
+*::-webkit-scrollbar {
+  width: 8px;
+  height: 8px;
+}
+*::-webkit-scrollbar-track {
+  background: transparent;
+}
+*::-webkit-scrollbar-thumb {
+  background: color-mix(in oklch, var(--border) 90%, transparent);
+  border-radius: 9999px;
+}
+*::-webkit-scrollbar-thumb:hover {
+  background: color-mix(in oklch, var(--ring) 60%, var(--border));
+}
+
+/* 选中文本：与主题更统一的强调色 */
+::selection {
+  background: color-mix(in oklch, var(--ring) 25%, transparent);
+}
+
 @layer base {
   * {
     @apply border-border outline-ring/50;
   }
   body {
     @apply bg-background text-foreground antialiased;
+    /* 顶部一抹极淡的氛围光，让大面积纯色不再生硬 */
+    background-image: radial-gradient(
+      900px 420px at 50% -80px,
+      color-mix(in oklch, var(--primary) 4%, transparent),
+      transparent 70%
+    );
+    background-repeat: no-repeat;
   }
 }

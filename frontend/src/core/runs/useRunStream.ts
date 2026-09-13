@@ -78,6 +78,7 @@ export const initialRunStreamState: RunStreamState = {
 
 type StreamAction =
   | { type: 'connect'; runId: string }
+  | { type: 'reset' }
   | { type: 'started' }
   | { type: 'meta'; modelName: string | null; thinkingEnabled: boolean | null }
   | { type: 'tool_start'; item: ToolCallItem }
@@ -100,6 +101,8 @@ function streamReducer(state: RunStreamState, action: StreamAction): RunStreamSt
         runId: action.runId,
         startedAt: Date.now() / 1000,
       }
+    case 'reset':
+      return { ...initialRunStreamState }
     case 'started':
       return { ...state, status: 'running' }
     case 'meta':
@@ -181,6 +184,9 @@ export function useRunStream(threadId: string, options?: UseRunStreamOptions) {
   stateRef.current = state
   const threadIdRef = useRef(threadId)
   threadIdRef.current = threadId
+  const prevThreadIdRef = useRef(threadId)
+  /** 当前 SSE 连接所属线程（收尾 invalidate 用，切换线程后不得串线程刷新） */
+  const connThreadRef = useRef<string | null>(null)
   const abortRef = useRef<AbortController | null>(null)
   const runningRef = useRef(false)
 
@@ -265,6 +271,7 @@ export function useRunStream(threadId: string, options?: UseRunStreamOptions) {
     async (runId: string) => {
       if (runningRef.current) return
       runningRef.current = true
+      connThreadRef.current = threadIdRef.current
       abortRef.current = new AbortController()
       const signal = abortRef.current.signal
       dispatch({ type: 'connect', runId })
@@ -293,8 +300,12 @@ export function useRunStream(threadId: string, options?: UseRunStreamOptions) {
       } finally {
         runningRef.current = false
         abortRef.current = null
-        qc.invalidateQueries({ queryKey: messageListKey(threadIdRef.current) })
-        qc.invalidateQueries({ queryKey: threadListKey })
+        const tid = connThreadRef.current
+        connThreadRef.current = null
+        if (tid) {
+          qc.invalidateQueries({ queryKey: messageListKey(tid) })
+          qc.invalidateQueries({ queryKey: threadListKey })
+        }
       }
     },
     [handleFrame, qc],
@@ -340,6 +351,18 @@ export function useRunStream(threadId: string, options?: UseRunStreamOptions) {
       void connect(resumeRun.run_id)
     }
   }, [resumeRun, connect])
+
+  // 线程切换：中止旧流、清空本地流式状态，避免上一轮内容串到新线程
+  useEffect(() => {
+    if (prevThreadIdRef.current === threadId) return
+    prevThreadIdRef.current = threadId
+    threadIdRef.current = threadId
+    abortRef.current?.abort()
+    abortRef.current = null
+    runningRef.current = false
+    connThreadRef.current = null
+    dispatch({ type: 'reset' })
+  }, [threadId])
 
   useEffect(() => {
     return () => abortRef.current?.abort()

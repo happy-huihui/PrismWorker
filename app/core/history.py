@@ -8,6 +8,7 @@
 from __future__ import annotations
 
 import asyncio
+import re
 from pathlib import Path
 from typing import Any
 
@@ -18,6 +19,33 @@ _ROLE_MAP = {
     "system": "system",
     "function": "message",
 }
+
+# harness 输入防注入中间件会给 user 消息包上边界标记，
+# 该标记属于内部安全机制、不是对话内容，历史读取时剥离，避免 UI 展示内部噪音。
+# 兼容两类残留：外层真实 BEGIN/END 包裹，与 neutralize 后遗留的惰性标记行。
+_USER_INPUT_WRAP_RE = re.compile(
+    r"^\s*---\s*BEGIN USER INPUT\s*---[\r\n]+(.*?)[\r\n]+\s*---\s*END USER INPUT\s*---\s*$",
+    re.DOTALL,
+)
+_NEUTRALIZED_BOUNDARY_LINE_RE = re.compile(
+    r"^\s*\[(?:BEGIN|END) USER INPUT\]\s*$", re.MULTILINE
+)
+
+
+def _strip_user_input_wrapper(text: str) -> str:
+    """去除 input_sanitization 的会话包裹标记，还原纯用户文本。
+
+    先剥外层真实 BEGIN/END 包裹（可能多层嵌套）；再移除 neutralize
+    遗留的惰性标记行（[BEGIN/END USER INPUT]），并折叠多余空行。
+    """
+    while True:
+        stripped = text.strip()
+        m = _USER_INPUT_WRAP_RE.match(stripped)
+        if not m:
+            break
+        text = m.group(1)
+    cleaned = _NEUTRALIZED_BOUNDARY_LINE_RE.sub("", text)
+    return re.sub(r"\n{3,}", "\n\n", cleaned).strip()
 
 
 async def get_message_history(
@@ -83,7 +111,10 @@ async def get_message_history(
                     elif isinstance(piece, dict) and piece.get("type") == "text":
                         texts.append(str(piece.get("text", "")))
                 content = "\n".join(t for t in texts if t)
-            result.append({"role": mtype, "content": str(content)})
+            content = str(content)
+            if mtype == "user":
+                content = _strip_user_input_wrapper(content)
+            result.append({"role": mtype, "content": content})
         return result
     finally:
         await conn.close()

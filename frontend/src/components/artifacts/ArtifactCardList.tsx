@@ -8,6 +8,7 @@ import {
   FileSpreadsheet,
   FileText,
   Loader2,
+  PackageOpen,
   type LucideIcon,
 } from 'lucide-react'
 import { toast } from 'sonner'
@@ -50,11 +51,14 @@ export function ArtifactCardList({ threadId, paths, onPreview }: ArtifactCardLis
   }
 
   return (
-    <div className="my-1 flex flex-col gap-1.5">
-      <p className="px-0.5 text-xs font-medium text-muted-foreground">
-        交付产物
-        <span className="ml-1.5 text-muted-foreground/60">{paths.length} 个文件</span>
-      </p>
+    <div className="my-1.5 flex flex-col gap-1.5 animate-message-in">
+      <div className="flex items-center gap-1.5 px-0.5">
+        <PackageOpen className="size-3.5 text-muted-foreground" />
+        <p className="text-xs font-medium text-muted-foreground">交付产物</p>
+        <span className="rounded-full bg-muted px-1.5 py-0.5 text-[10px] text-muted-foreground/70">
+          {paths.length} 个文件
+        </span>
+      </div>
 
       <div className="flex flex-col gap-1.5">
         {paths.map((path, i) => {
@@ -63,9 +67,11 @@ export function ArtifactCardList({ threadId, paths, onPreview }: ArtifactCardLis
           return (
             <div
               key={`${path}-${i}`}
-              className="flex items-center gap-2 rounded-lg border bg-card/60 px-3 py-2"
+              className="group flex items-center gap-2 rounded-xl border bg-card/60 px-3 py-2 transition-colors hover:bg-muted/50"
             >
-              <Icon className="size-4 shrink-0 text-muted-foreground" />
+              <span className="flex size-7 shrink-0 items-center justify-center rounded-lg bg-muted text-muted-foreground transition-colors group-hover:bg-background">
+                <Icon className="size-3.5" />
+              </span>
               <span className="min-w-0 flex-1 truncate text-sm" title={path}>
                 {name}
               </span>

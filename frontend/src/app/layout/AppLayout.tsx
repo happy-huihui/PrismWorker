@@ -29,7 +29,14 @@ export function AppLayout() {
     <div className="flex h-screen w-full overflow-hidden bg-background text-foreground">
       <ThreadSidebar collapsed={collapsed} onToggle={handleToggle} />
       <main className="relative flex min-w-0 flex-1 flex-col">
-        <Outlet />
+        {/* 顶部极淡的氛围光晕，与 body 背景呼应，避免页面生硬 */}
+        <div
+          aria-hidden
+          className="pointer-events-none absolute inset-x-0 top-0 h-64 bg-gradient-to-b from-primary/[0.03] to-transparent"
+        />
+        <div className="relative flex min-h-0 min-w-0 flex-1 flex-col">
+          <Outlet />
+        </div>
       </main>
       <Toaster position="top-center" richColors />
     </div>

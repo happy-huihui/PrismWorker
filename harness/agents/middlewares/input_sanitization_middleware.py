@@ -96,6 +96,33 @@ def _neutralize_boundary_tokens(text: str) -> str:
     )
 
 
+_NEUTRALIZED_BOUNDARY_LINE_RE: re.Pattern[str] = re.compile(
+    r"^\s*\[BEGIN USER INPUT\]\s*$|^\s*\[END USER INPUT\]\s*$",
+    re.MULTILINE,
+)
+
+
+def _unwrap_wrapped_input(text: str) -> str:
+    """剥离历史残留的输入包裹层，还原为纯用户文本。
+
+    场景：中间件每轮模型调用都会对同一条 HumanMessage 再包裹一次，
+    早期版本未做幂等，导致历史数据出现多层嵌套：外层是真实
+    BEGIN/END 包裹，内层是 neutralize 后的惰性标记（[BEGIN/END USER
+    INPUT]）残留。这里从外到内逐层剥离：真实包裹剥掉后，再把惰性
+    标记行移除，直到拿到纯文本。
+    """
+    while True:
+        stripped = text.strip()
+        if stripped.startswith(_USER_INPUT_BEGIN) and stripped.endswith(_USER_INPUT_END):
+            stripped = stripped[len(_USER_INPUT_BEGIN):].strip()
+            stripped = stripped[:-len(_USER_INPUT_END)].strip()
+            text = stripped
+            continue
+        break
+    cleaned = _NEUTRALIZED_BOUNDARY_LINE_RE.sub("", text)
+    return re.sub(r"\n{3,}", "\n\n", cleaned).strip()
+
+
 def neutralize_untrusted_tags(text: str) -> str:
     """净化不可信文本中的控制 token。
 
@@ -193,9 +220,12 @@ class InputSanitizationMiddleware(AgentMiddleware):
 
     @staticmethod
     def _sanitize_string_content(text: str) -> str:
-        """对单个字符串：净化 + 包裹 BEGIN/END。"""
+        """对单个字符串：先还原再净化 + 包裹 BEGIN/END（幂等）。
 
-        sanitized = neutralize_untrusted_tags(text)
+        同一消息会被多次模型调用重复处理（多轮工具调用时），必须幂等：
+        先剥掉自身历史包裹层，再 neutralize 用户文本，最后包一层新的。
+        """
+        sanitized = neutralize_untrusted_tags(_unwrap_wrapped_input(text))
         return f"{_USER_INPUT_BEGIN}\n{sanitized}\n{_USER_INPUT_END}"
 
     @staticmethod

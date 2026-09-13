@@ -530,10 +530,15 @@ class RunService:
 
         message_count = 0
         artifacts: list[str] = []
+        title: str | None = None
         if final_values:
             messages = _as_list(final_values.get("messages"))
             message_count = len(messages)
             artifacts = [str(a) for a in _as_list(final_values.get("artifacts"))]
+            # 会话标题中间件生成的标题（graph state.title），收尾时回填线程元数据
+            generated = final_values.get("title")
+            if isinstance(generated, str) and generated.strip():
+                title = generated.strip()
         ai_text = "".join(handle._ai_chunks)
         preview = ai_text[:_MAX_MESSAGE_PREVIEW] or handle.input_preview
         await self._update_run(
@@ -549,12 +554,21 @@ class RunService:
         try:
             meta = self._threads.get(user_id=handle.user_id, thread_id=thread_id)
             if meta is not None:
+                update_fields: dict[str, Any] = {
+                    "message_count": meta.message_count + message_count,
+                    "last_message_preview": preview,
+                    "status": "idle",
+                }
+                # 仅当线程仍是默认标题时才回填自动生成的标题，避免覆盖用户手动重命名
+                if (
+                    title
+                    and (not meta.title or meta.title.strip() in ("", "新会话", "新对话"))
+                ):
+                    update_fields["title"] = title
                 self._threads.update(
                     user_id=handle.user_id,
                     thread_id=thread_id,
-                    message_count=meta.message_count + message_count,
-                    last_message_preview=preview,
-                    status="idle",
+                    **update_fields,
                 )
         except Exception as exc:  # noqa: BLE001 —— 线程元数据回填失败不阻断收尾
             logger.warning("run %s 线程元数据回填失败: %s", run_id, exc)

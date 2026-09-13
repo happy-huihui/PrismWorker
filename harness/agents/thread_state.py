@@ -51,8 +51,10 @@ def merge_sandbox(
       - new 为 None（本轮没写）→ 保留 existing
       - existing 为 None（首次写）→ 直接采用 new
       - 两者 sandbox_id 相同 → 幂等写入，返回 existing
-      - 两者 sandbox_id 不同 → 说明沙箱生命周期/隔离出 bug，宁可报错也不要
-        偷偷二选一（fail-closed）
+      - 两者 sandbox_id 不同且旧沙箱仍在当前进程存活（并发隔离出问题）→
+        宁可报错也不要偷偷二选一（fail-closed）
+      - 两者 sandbox_id 不同但旧沙箱已不在当前进程（后端重启后容器重建、
+        或容器被回收）→ 旧状态已失效，允许迁移到新沙箱（fail-open for stale）
     """
     if new is None:
         return existing
@@ -63,6 +65,18 @@ def merge_sandbox(
     new_id = new.get("sandbox_id")
     if existing_id == new_id:
         return existing
+    if existing_id is None:
+        return new
+
+    # 旧沙箱若已不在当前进程沙箱管理器（重启/回收），视为失效状态，
+    # 允许覆盖到新沙箱；查询失败或旧沙箱仍存活则保守报错。
+    try:
+        from harness.sandbox.lifecycle import get_sandbox_manager
+
+        if get_sandbox_manager().get(existing_id) is None:
+            return new
+    except Exception:  # noqa: BLE001 —— 查询失败保守 fail-closed
+        pass
     raise ValueError(
         f"Conflicting sandbox state updates: {existing_id!r} != {new_id!r}"
     )

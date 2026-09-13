@@ -1,6 +1,7 @@
 import { useEffect, useMemo, useRef, useState } from 'react'
 import {
   Bot,
+  Brain,
   Check,
   ChevronDown,
   FileText,
@@ -161,24 +162,14 @@ export function ThinkingPanel({
   finishedAt,
 }: ThinkingPanelProps) {
   const [open, setOpen] = useState(false)
+  /** 用户是否手动操作过折叠（手动后不再自动收起，尊重用户意图） */
+  const userTouchedRef = useRef(false)
   const tailRef = useRef<HTMLDivElement>(null)
 
   const timeline = useMemo(
     () => buildTimeline(prints, toolCalls, thinkingText ?? ''),
     [prints, toolCalls, thinkingText],
   )
-
-  useEffect(() => {
-    if (active) {
-      setOpen(true)
-    }
-  }, [active])
-
-  useEffect(() => {
-    if (open && active) {
-      tailRef.current?.scrollIntoView({ behavior: 'smooth', block: 'end' })
-    }
-  }, [timeline.length, open, active])
 
   const doneDuration = useMemo(() => {
     if (finishedAt != null && startedAt != null) {
@@ -187,22 +178,48 @@ export function ThinkingPanel({
     return undefined
   }, [finishedAt, startedAt])
 
+  // 进行中自动展开；结束后若用户未手动操作过，先保持展示几秒再收起，
+  // 让「思考过程 → 回答」的衔接自然不突兀
+  useEffect(() => {
+    if (active) {
+      setOpen(true)
+      return
+    }
+    if (userTouchedRef.current) return
+    const t = window.setTimeout(() => setOpen(false), 3500)
+    return () => window.clearTimeout(t)
+  }, [active])
+
+  useEffect(() => {
+    if (open && active) {
+      tailRef.current?.scrollIntoView({ behavior: 'smooth', block: 'end' })
+    }
+  }, [timeline.length, open, active])
+
   const liveElapsed = useLiveElapsed(startedAt ?? null, active)
+
+  const handleToggle = () => {
+    userTouchedRef.current = true
+    setOpen((v) => !v)
+  }
 
   if (timeline.length === 0) return null
 
   return (
-    <div className="my-1 overflow-hidden rounded-lg border bg-muted/40">
+    <div className="my-1 overflow-hidden rounded-xl border bg-muted/40 transition-colors">
       <button
         type="button"
-        onClick={() => setOpen((v) => !v)}
-        className="flex w-full items-center gap-2 px-3 py-2 text-left text-xs text-muted-foreground hover:bg-muted/60"
+        onClick={handleToggle}
+        className="flex w-full items-center gap-2 px-3 py-2 text-left text-xs text-muted-foreground transition-colors hover:bg-muted/60"
       >
         <ChevronDown
           className={cn('size-3.5 shrink-0 transition-transform', !open && '-rotate-90')}
         />
-        <span className="font-medium">隐藏步骤</span>
-        <span className="text-muted-foreground/70">{timeline.length} 条</span>
+        <Brain className="size-3.5 shrink-0" />
+        <span className="font-medium">思考过程</span>
+        {timeline.length > 0 && (
+          <span className="text-muted-foreground/60">{timeline.length} 步</span>
+        )}
         <span className="ml-auto flex shrink-0 items-center gap-1.5">
           {active ? (
             <>
@@ -210,10 +227,8 @@ export function ThinkingPanel({
               <span className="text-sky-500">思考中… ({liveElapsed}s)</span>
             </>
           ) : doneDuration != null ? (
-            <span className="text-muted-foreground/70">思考 {doneDuration} 秒</span>
-          ) : (
-            <span className="text-muted-foreground/70">已结束</span>
-          )}
+            <span className="text-muted-foreground/60">耗时 {doneDuration}s</span>
+          ) : null}
         </span>
       </button>
 
