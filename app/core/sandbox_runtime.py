@@ -1,92 +1,152 @@
-"""app 层真实沙箱运行时（sandbox_runtime）——懒启动 + 显式回收一个复用容器。
+"""app 层真实沙箱运行时（sandbox_runtime）——热池化的懒启动 + 回源复用。
 
-阶段14 目标：把 harness 进程级 SandboxManager 接入 app 层 run 装配链，让
-build_lead_agent 拿到真实 AioSandbox（注册 6 个沙箱工具），并在初始 state
-注入 sandbox_id 供子代理 / 中间件按 id 取回同一容器。
+阶段目标（热池版）：
+    把 harness 进程级 SandboxManager（含 Warm Pool）接入 app 层 run 装配链：
+    - 首用懒启动：首个 run 才启动容器，进程空闲不占资源；
+    - 确定性沙箱 id：按 thread_id 派生（t-{hash}），同线程后续 run 直接
+      复用同一容器（活跃缓存或热池提升，零冷启动）；
+    - 回源热池：run 结束调用 release_app_sandbox 把容器保活回源，
+      idle_timeout 后由守护线程自动销毁（热池小容量时共享回退，行为与
+      旧版进程级共享容器一致）；
+    - 显式 stop 回收：服务关闭（run_service.close）时统一销毁全部容器。
 
-生命周期策略（用户确认）：
-    - 首用懒启动：第一个 run 才启动容器，进程空闲不占资源
-    - 复用一个容器：进程内仅一台，主代理与子代理共享（本期不做池）
-    - 显式 stop 回收：服务关闭（run_service.close）时统一回收
+线程上下文：run 是独立 asyncio.Task，用 ContextVar 传递当前 thread_id，
+装配链（agent_registry → sandbox provider）无需改签名即可取到线程归属，
+并保证并发 run 各自拿到自己的容器（容量闸门内）。
 
 与 harness 的协作点：
-    - get_sandbox_manager(config) 是 harness 进程级单例；本模块首次启动时
-      用 get_app_config().sandbox 构造，之后子代理 / view_image 中间件按
-      sandbox_id 从同一个管理器取回容器，保证全链路同一个实例。
-    - 启动失败（无 docker / 镜像缺失 / 端口异常）→ 安全降级：返回 None，
-      进程内不再重试（保持沙箱关闭语义，与阶段12 之前一致），并记日志。
+    - get_sandbox_manager(config) 是 harness 进程级单例；本模块只做
+      「thread_id → 确定性 sandbox_id → manager.start/release」的薄封装；
+    - 子代理 / view_image 中间件按 sandbox_id 从同一个管理器取回容器，
+      保证全链路同一个实例。
 
 对外 API：
-    get_app_sandbox()   -> AioSandbox | None   进程级懒启动单例
-    stop_app_sandbox()  -> None                显式回收容器（幂等）
+    set_runtime_thread_id / get_runtime_thread_id  线程上下文（run 装配前设置）
+    get_app_sandbox()          -> AioSandbox | None  按线程取用沙箱（懒启动）
+    release_app_sandbox([id])  -> None                run 结束回源热池（幂等）
+    stop_app_sandbox()         -> None                销毁全部容器（幂等）
+    push_uploads_to_sandbox(...) -> int               上传目录推送（不变）
 """
 
 from __future__ import annotations
 
+import hashlib
 import logging
 import threading
+from contextvars import ContextVar
 from typing import Any
 
 logger = logging.getLogger(__name__)
 
-_live_sandbox: Any | None = None
+# 当前 run 的线程归属（asyncio.create_task 自动复制 context，天然隔离并发）
+_THREAD_ID_CONTEXT: ContextVar[str | None] = ContextVar(
+    "runtime_thread_id", default=None
+)
+
 _sandbox_failed: bool = False
 _sandbox_lock = threading.Lock()
 
+# 未指定线程时的共享沙箱 id（旧版「进程级单容器」语义的兜底）
+_SHARED_SANDBOX_ID = "app-shared"
+
+
+def set_runtime_thread_id(thread_id: str | None) -> None:
+    """设置当前任务上下文中的线程归属（run 装配前调用）。"""
+    _THREAD_ID_CONTEXT.set(thread_id)
+
+
+def get_runtime_thread_id() -> str | None:
+    """读取当前任务上下文的线程归属。"""
+    return _THREAD_ID_CONTEXT.get()
+
+
+def derive_sandbox_id(thread_id: str | None) -> str:
+    """把线程 id 派生为确定性沙箱 id（t-{sha256 摘要 12 位}）。
+
+    同线程永远命中同 id → 活跃/热池复用；不同线程不同 id → 各自容器。
+    """
+    if not thread_id:
+        return _SHARED_SANDBOX_ID
+    digest = hashlib.sha256(thread_id.encode("utf-8")).hexdigest()[:12]
+    return f"t-{digest}"
+
 
 def get_app_sandbox() -> Any | None:
-    """返回进程级真实沙箱实例（首用懒启动；失败/未配置返回 None）。"""
-    global _live_sandbox, _sandbox_failed
-    if _live_sandbox is not None:
-        return _live_sandbox
+    """返回当前线程所属的真实沙箱实例（懒启动；复用优先）。
+
+    - 未配置 sandbox / 启动失败 → 返回 None（进程内不再重试）；
+    - 同线程重复调用 → 活跃缓存直接命中；
+    - 热池中有同 id 容器 → 提升复用（零冷启动）。
+    """
+    global _sandbox_failed
     if _sandbox_failed:
         return None
-    with _sandbox_lock:
-        if _live_sandbox is not None:
-            return _live_sandbox
-        if _sandbox_failed:
-            return None
-        try:
-            from harness.sandbox.lifecycle import get_sandbox_manager
+    try:
+        from harness.sandbox.lifecycle import get_sandbox_manager
 
-            from app.core.config import get_app_config
+        from app.core.config import get_app_config
 
-            config = get_app_config().sandbox
-            if config is None:
-                logger.info("未配置 sandbox，app 层运行不带沙箱工具")
-                _sandbox_failed = True
-                return None
-            manager = get_sandbox_manager(config)
-            sbx = manager.start()
-            _live_sandbox = sbx
-            logger.info(
-                "app 层真实沙箱已就绪: sandbox_id=%s base_url=%s",
-                sbx.id,
-                sbx.base_url,
-            )
-        except Exception as exc:  # noqa: BLE001 —— 启动失败安全降级
+        config = get_app_config().sandbox
+        if config is None:
+            logger.info("未配置 sandbox，app 层运行不带沙箱工具")
             _sandbox_failed = True
-            logger.warning("真实沙箱启动失败，本次进程不带沙箱工具: %s", exc)
-        return _live_sandbox
+            return None
+        manager = get_sandbox_manager(config)
+        sandbox_id = derive_sandbox_id(get_runtime_thread_id())
+        sbx = manager.start(sandbox_id=sandbox_id)
+        if get_runtime_thread_id():
+            logger.debug(
+                "thread=%s 取用沙箱 %s（active=%d warm=%d）",
+                get_runtime_thread_id()[:12],
+                sbx.id,
+                len(manager.available()),
+                manager.warm_count,
+            )
+        return sbx
+    except Exception as exc:  # noqa: BLE001 —— 启动失败安全降级
+        _sandbox_failed = True
+        logger.warning("真实沙箱启动失败，本次进程不带沙箱工具: %s", exc)
+        return None
+
+
+def release_app_sandbox(sandbox_id: str | None = None) -> None:
+    """run 结束后把沙箱回源热池（容器保活待复用；幂等）。
+
+    Args:
+        sandbox_id: 实际使用的沙箱实例 id（共享回退时以实际容器 id 为准）；
+            None 时按当前线程归属推导。
+    """
+    if _sandbox_failed:
+        return
+    try:
+        from harness.sandbox.lifecycle import get_sandbox_manager
+
+        from app.core.config import get_app_config
+
+        config = get_app_config().sandbox
+        if config is None:
+            return
+        manager = get_sandbox_manager(config)
+        if sandbox_id is None:
+            sandbox_id = derive_sandbox_id(get_runtime_thread_id())
+        manager.release(sandbox_id)
+    except Exception as exc:  # noqa: BLE001 —— 回源失败不阻断收尾
+        logger.warning("沙箱回源热池失败（忽略）: %s", exc)
 
 
 def stop_app_sandbox() -> None:
-    """显式回收当前沙箱容器（幂等；服务关闭时调用）。"""
-    global _live_sandbox
-    if _live_sandbox is None:
-        return
-    with _sandbox_lock:
-        if _live_sandbox is None:
-            return
-        try:
-            from harness.sandbox.lifecycle import get_sandbox_manager
+    """销毁当前进程管理的全部沙箱容器（幂等；服务关闭时调用）。"""
+    try:
+        from harness.sandbox.lifecycle import get_sandbox_manager
 
-            get_sandbox_manager().stop(sandbox_id=_live_sandbox)
-            logger.info("app 层真实沙箱已回收: %s", _live_sandbox.id)
-        except Exception as exc:  # noqa: BLE001 —— 回收失败不阻断关闭流程
-            logger.warning("真实沙箱回收失败（忽略）: %s", exc)
-        finally:
-            _live_sandbox = None
+        from app.core.config import get_app_config
+
+        config = get_app_config().sandbox
+        if config is None:
+            return
+        get_sandbox_manager(config).stop()
+    except Exception as exc:  # noqa: BLE001 —— 回收失败不阻断关闭流程
+        logger.warning("真实沙箱回收失败（忽略）: %s", exc)
 
 
 def push_uploads_to_sandbox(sandbox: Any, *, user_id: str, thread_id: str) -> int:

@@ -281,6 +281,11 @@ class RunService:
         run_id = handle.run_id
         thread_id = handle.thread_id
 
+        # 热池上下文：装配链（sandbox provider）按线程归属取用确定性沙箱
+        from app.core.sandbox_runtime import set_runtime_thread_id
+
+        set_runtime_thread_id(thread_id)
+
         converted = _convert_messages(messages)
 
         handle.status = RUN_STATUS_RUNNING
@@ -388,6 +393,21 @@ class RunService:
                         logger.info("run %s 容器产物已回传 %d 个文件到宿主", run_id, pulled)
             except Exception:  # noqa: BLE001 —— 回传失败不阻断收尾
                 logger.warning("run %s 容器产物回传失败（忽略）", run_id, exc_info=True)
+
+            # 热池回源：run 结束把沙箱保活入池（同线程下轮零冷启动复用；
+            # 借用场景用实际实例 id——共享回退时以真实容器为准，保证
+            # 最后一个结束的 run 负责回源，绝不误伤仍在使用的容器）
+            try:
+                from app.core.sandbox_runtime import release_app_sandbox
+
+                live_final = getattr(self._registry, "sandbox", None)
+                release_app_sandbox(
+                    sandbox_id=(
+                        str(live_final.id) if live_final is not None else None
+                    )
+                )
+            except Exception:  # noqa: BLE001 —— 回源失败不阻断收尾
+                logger.warning("run %s 沙箱回源热池失败（忽略）", run_id, exc_info=True)
 
     async def _handle_values(self, handle: RunHandle, values: dict[str, Any]) -> None:
         """解析一个 values 帧：对 prints / todos / artifacts 发增量事件。"""
