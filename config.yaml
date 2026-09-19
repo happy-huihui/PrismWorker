@@ -17,7 +17,7 @@ models:
     max_tokens: 4096
   - name: deepseek-flash
     provider: deepseek
-    model: ${DEEPSEEK_FLASH_MODEL:deepseek-chat}
+    model: ${DEEPSEEK_FLASH_MODEL:deepseek-v4-flash}
     api_key: ${DEEPSEEK_API_KEY:}
     supports_vision: false
     supports_thinking: false
@@ -25,7 +25,7 @@ models:
     max_tokens: 4096
   - name: deepseek-pro
     provider: deepseek
-    model: ${DEEPSEEK_PRO_MODEL:deepseek-reasoner}
+    model: ${DEEPSEEK_PRO_MODEL:deepseek-v4-pro}
     api_key: ${DEEPSEEK_API_KEY:}
     supports_vision: false
     supports_thinking: true
