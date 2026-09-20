@@ -1,6 +1,6 @@
 """线程路由（threads）——线程会话的 CRUD 网关。
 
-全部委托 app.core.thread_store.ThreadStore：本层只做参数解析 / 异常映射 /
+全部委托 harness.runtime.threads_data.ThreadStore：本层只做参数解析 / 异常映射 /
 响应序列化，不含业务逻辑。用户身份来自 X-User-Id 请求头（deps.get_user_id）。
 """
 

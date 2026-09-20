@@ -11,7 +11,7 @@ from langgraph.config import get_config
 
 from harness.agents.middlewares.input_sanitization_middleware import neutralize_untrusted_tags
 from harness.config.paths import get_paths
-from harness.runtime.user_content import resolve_runtime_user_id
+from harness.runtime.user_context import resolve_runtime_user_id
 from harness.tools.types import Runtime
 from harness.uploads.manager import is_upload_staging_file
 from harness.utils.file_outline import extract_outline_for_file

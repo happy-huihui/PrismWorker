@@ -51,21 +51,21 @@ def verify_internal_token(
 
 def get_thread_store() -> Any:
     """线程元数据仓库单例。"""
-    from app.core.thread_store import get_thread_store as _get
+    from harness.runtime.threads_data import get_thread_store as _get
 
     return _get()
 
 
 def get_run_service() -> Any:
     """run 编排服务单例。"""
-    from app.core.run_service import get_run_service as _get
+    from harness.runtime.assembly import get_run_service as _get
 
     return _get()
 
 
 def get_event_bus() -> Any:
     """事件总线单例。"""
-    from app.core.event_bus import get_event_bus as _get
+    from harness.runtime.sse_stream import get_event_bus as _get
 
     return _get()
 

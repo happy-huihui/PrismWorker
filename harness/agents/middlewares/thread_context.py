@@ -8,7 +8,7 @@ from langchain.agents.middleware import AgentMiddleware
 from langchain.agents.middleware.types import ContextT
 
 from harness.config.paths import get_paths
-from harness.runtime.user_content import resolve_runtime_user_id
+from harness.runtime.user_context import resolve_runtime_user_id
 
 
 """

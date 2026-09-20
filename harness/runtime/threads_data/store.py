@@ -12,19 +12,24 @@ from typing import Any
 
 from harness.config.paths import _validate_thread_id, get_paths
 
+"""线程元数据仓库（threads_data.store）
+
+    职责：只管线程的元数据（标题/时间/消息数/状态），不创建也不删除磁盘目录。
+    背景：线程的 user-data 目录由 harness 在首次 run 时经 ThreadContextMiddleware
+         自动创建；删除时做「目录 + 元数据」联动——先异步删 user-data 目录
+         （失败则中止、保留元数据，保证「有 meta 必有目录可用」），成功后再删
+         元数据行。
+    存储：{base_dir}/users/{user_id}/threads/meta.json，单文件 JSON + 原子改写
+         （临时文件 + os.replace），进程内缓存 + 写时落盘。
+
+    对外暴露：
+        - ThreadMeta       一条线程元数据
+        - ThreadStore      仓库本体（create/get/list/rename/update/exists/delete）
+        - get_thread_store 进程级单例
+        - reset_thread_store 重置单例（测试隔离）
 """
-    线程仓库（thread_store）——app 层线程会话的元数据仓库。
 
-    只管理线程的元数据（标题/时间/消息数/状态），不创建也不删除磁盘目录：
-    线程的 user-data 目录由 harness 在首次 run 时经 ThreadContextMiddleware
-    自动创建。删除时做好「目录 + 元数据」联动：先异步删 user-data 目录
-    （失败则中止，保留元数据，保证「有 meta 必有目录可用」），成功后再删
-    元数据行。
-
-    存储：{base_dir}/users/{user_id}/threads/meta.json，单文件 JSON +
-    原子改写（临时文件 + os.replace），进程内缓存 + 写时落盘。
-"""
-
+# 元数据文件名
 _THREAD_META_FILE = "meta.json"
 
 
@@ -43,11 +48,20 @@ class ThreadMeta:
 
     def to_dict(self) -> dict[str, Any]:
         """序列化为字典（落盘用）。"""
+        # 直接把 dataclass 字段摊平成 dict
         return asdict(self)
 
     @classmethod
     def from_dict(cls, data: dict[str, Any]) -> ThreadMeta:
-        """从字典还原（忽略未知/缺省字段，向前兼容）。"""
+        """从字典还原（忽略未知/缺省字段，向前兼容）。
+
+        参数：
+            data: 落盘的字典数据
+
+        返回：
+            ThreadMeta 实例（只取已知字段，缺省走默认值）
+        """
+        # 只挑 dataclass 认识的键，未知键忽略，保证老数据可读
         return cls(**{key: data[key] for key in cls.__dataclass_fields__ if key in data})
 
 
@@ -55,7 +69,12 @@ class ThreadStore:
     """线程元数据仓库（进程内缓存 + JSON 原子落盘）。"""
 
     def __init__(self, *, force_user_dir: Path | None = None) -> None:
-        """初始化；force_user_dir 指定用户目录根（默认用 harness paths）。""" 
+        """初始化；force_user_dir 指定用户目录根（默认用 harness paths）。
+
+        参数：
+            force_user_dir: 覆盖用户目录根（测试注入临时目录用）
+        """
+        # user_id -> {thread_id -> 元数据 dict} 的两级缓存
         self._cache: dict[str, dict[str, dict[str, Any]]] = {}
         self._force_user_dir = force_user_dir
         self._lock = threading.RLock()
@@ -63,6 +82,7 @@ class ThreadStore:
 
     def _user_dir(self, user_id: str) -> Path:
         """用户目录根。"""
+        # 显式指定优先，否则走 harness 全局路径
         if self._force_user_dir is not None:
             return self._force_user_dir / user_id
         return get_paths().user_dir(user_id)
@@ -78,11 +98,13 @@ class ThreadStore:
 
     def _load(self, user_id: str) -> dict[str, dict[str, Any]]:
         """加载用户线程表（读磁盘，未缓存时）。"""
+        # 命中缓存直接返回
         cached = self._cache.get(user_id)
         if cached is not None:
             return cached
         meta_file = self._meta_file(user_id)
         data: dict[str, dict[str, Any]] = {}
+        # 读文件：不存在/读失败都当空表（不抛）
         try:
             raw = meta_file.read_text(encoding="utf-8")
         except FileNotFoundError:
@@ -90,6 +112,7 @@ class ThreadStore:
         except OSError:
             pass
         else:
+            # 解析 JSON，格式坏也当空表处理
             try:
                 parsed = json.loads(raw)
                 if isinstance(parsed, dict):
@@ -102,10 +125,11 @@ class ThreadStore:
         return data
 
     def _save(self, user_id: str, data: dict[str, dict[str, Any]]) -> None:
-        """原子落盘用户线程表。"""
+        """原子落盘用户线程表（临时文件 + os.replace）。"""
         users_dir = self._users_dir(user_id)
         users_dir.mkdir(parents=True, exist_ok=True)
         meta_file = self._meta_file(user_id)
+        # 先写临时文件再原子替换，避免半截写入
         tmp_file = meta_file.with_suffix(".json.tmp")
         body = json.dumps({"threads": data}, ensure_ascii=False, indent=2)
         tmp_file.write_text(body, encoding="utf-8")
@@ -138,13 +162,19 @@ class ThreadStore:
     ) -> ThreadMeta:
         """创建线程元数据（不建磁盘目录）。
 
-        指定 thread_id 且已存在 → 幂等返回已有；否则新建；thread_id 缺省
-        用 uuid4().hex。
+        参数：
+            user_id: 用户
+            thread_id: 指定线程 id；缺省用 uuid4().hex
+            title: 初始标题
+
+        返回：
+            新建或已存在的 ThreadMeta（指定 thread_id 且已存在则幂等返回）
         """
         tid = thread_id or uuid.uuid4().hex
         _validate_thread_id(tid)
         with self._lock:
             data = self._load(user_id)
+            # 已存在则幂等返回
             existing = data.get(tid)
             if existing is not None:
                 return ThreadMeta.from_dict(existing)
@@ -154,7 +184,15 @@ class ThreadStore:
             return meta
 
     def get(self, user_id: str, thread_id: str) -> ThreadMeta | None:
-        """查询线程元数据。"""
+        """查询线程元数据。
+
+        参数：
+            user_id: 用户
+            thread_id: 线程 id
+
+        返回：
+            ThreadMeta；不存在返回 None
+        """
         _validate_thread_id(thread_id)
         with self._lock:
             data = self._load(user_id)
@@ -170,9 +208,22 @@ class ThreadStore:
         return metas
 
     def rename(self, user_id: str, thread_id: str, new_title: str) -> ThreadMeta:
-        """重命名线程。"""
+        """重命名线程。
+
+        参数：
+            user_id: 用户
+            thread_id: 线程 id
+            new_title: 新标题（非空）
+
+        返回：
+            更新后的 ThreadMeta
+
+        异常：
+            标题为空抛 ValueError；线程不存在抛 KeyError
+        """
         _validate_thread_id(thread_id)
         title = (new_title or "").strip()
+        # 标题不允许为空
         if not title:
             raise ValueError("标题不能为空")
         with self._lock:
@@ -195,8 +246,19 @@ class ThreadStore:
         status: str | None = None,
         title: str | None = None,
     ) -> ThreadMeta | None:
-        """通用更新（run 结束回填消息数/预览/状态等）。"""
+        """通用更新（run 结束回填消息数/预览/状态等）。
+
+        参数：
+            user_id: 用户
+            thread_id: 线程 id
+            message_count / last_message_preview / status / title: 需更新的字段，
+                None 表示不改动该项
+
+        返回：
+            更新后的 ThreadMeta；线程不存在返回 None
+        """
         _validate_thread_id(thread_id)
+        # 只把显式传入（非 None）的字段纳入更新
         fields: dict[str, Any] = {}
         if message_count is not None:
             fields["message_count"] = message_count
@@ -215,12 +277,21 @@ class ThreadStore:
         return self.get(user_id, thread_id) is not None
 
     async def delete(self, user_id: str, thread_id: str) -> bool:
-        """删除线程：先异步删 user-data 目录（失败中止保留 meta），再删元数据。"""
+        """删除线程：先异步删 user-data 目录（失败中止保留 meta），再删元数据。
+
+        参数：
+            user_id: 用户
+            thread_id: 线程 id
+
+        返回：
+            删除成功返回 True；线程本就不存在返回 False
+        """
         _validate_thread_id(thread_id)
         with self._lock:
             data = self._load(user_id)
             if thread_id not in data:
                 return False
+        # 目录删除失败直接向上抛，元数据保留（保证「有 meta 必有目录」）
         try:
             await asyncio.to_thread(
                 self._remove_thread_dir,
@@ -229,6 +300,7 @@ class ThreadStore:
             )
         except OSError:
             raise
+        # 目录删除成功后再摘元数据
         with self._lock:
             data = self._load(user_id)
             if thread_id in data:
@@ -247,7 +319,14 @@ _thread_store_lock = threading.Lock()
 
 
 def get_thread_store(*, force_user_dir: Path | None = None) -> ThreadStore:
-    """返回进程级 ThreadStore 单例（懒构造，线程安全）。"""
+    """返回进程级 ThreadStore 单例（懒构造，线程安全）。
+
+    参数：
+        force_user_dir: 指定用户目录根；按其作为单例键区分实例
+
+    返回：
+        对应键的 ThreadStore 单例
+    """
     key = str(force_user_dir) if force_user_dir is not None else "default"
     with _thread_store_lock:
         store = _thread_stores.get(key)

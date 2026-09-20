@@ -8,7 +8,7 @@ from fastapi import APIRouter, Depends
 
 from app.api.deps import get_checkpoint_db_path, get_user_id
 from app.api.schemas import MessageOut
-from app.core.history import get_message_history
+from harness.runtime.history import get_message_history
 
 router = APIRouter(tags=["messages"])
 

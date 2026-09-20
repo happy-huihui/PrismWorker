@@ -1,6 +1,6 @@
 """run 路由（runs）——run 生命周期网关 + SSE 思考链流。
 
-全部委托 app.core.run_service.RunService / app.core.event_bus.EventBus。
+全部委托 harness.runtime.runs.RunManager / harness.runtime.sse_stream.EventBus。
 SSE 桥：GET /runs/{run_id}/stream 订阅 EventBus，把 RunEvent 转成
 text/event-stream 帧（id=seq / event=type / data=json(payload)），
 run_finished / run_error / END 到达后自动收尾；run 已终结时订阅立即结束。
@@ -16,7 +16,7 @@ from fastapi import APIRouter, Depends, HTTPException, status
 
 from app.api.deps import get_event_bus, get_run_service, get_thread_store, get_user_id
 from app.api.schemas import RunCreate, RunOut, run_out_from_record
-from app.core.run_service import (
+from harness.runtime.runs import (
     RUN_STATUS_CANCELLED,
     RUN_STATUS_ERROR,
     RUN_STATUS_FINISHED,

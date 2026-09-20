@@ -182,6 +182,6 @@ def _thread_id(runtime: Runtime) -> str | None:
 
 def _user_id(runtime: Runtime) -> str | None:
     """从 runtime 解析用户 ID（复用现有工具函数）。"""
-    from harness.runtime.user_content import resolve_runtime_user_id
+    from harness.runtime.user_context import resolve_runtime_user_id
 
     return resolve_runtime_user_id(runtime)

@@ -5,7 +5,7 @@
     - search_memory 按关键词 / 主题标签检索（底层走记忆管理器检索）
     - delete_memory 删一条记忆（按 key 定位后删除）
 
-user_id 统一从 runtime 解析（见 runtime/user_content.py），消息统一中文。
+user_id 统一从 runtime 解析（见 runtime/user_context.py），消息统一中文。
 工具签名与旧版保持一致（模型侧零改动），内部实现从 SQLite 直读写
 切换为记忆管理器的 fact CRUD。
 """
@@ -20,7 +20,7 @@ from langchain_core.messages import ToolMessage
 from langgraph.types import Command
 
 from harness.memory.manager import get_memory_manager
-from harness.runtime.user_content import resolve_runtime_user_id
+from harness.runtime.user_context import resolve_runtime_user_id
 from harness.tools.types import Runtime
 
 logger = logging.getLogger(__name__)

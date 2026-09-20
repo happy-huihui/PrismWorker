@@ -8,7 +8,7 @@ from langgraph.config import get_config
 from langchain.messages import ToolMessage
 from harness.config.paths import VIRTUAL_PATH_PREFIX, get_paths
 from harness.tools.types import Runtime
-from harness.runtime.user_content import resolve_runtime_user_id
+from harness.runtime.user_context import resolve_runtime_user_id
 
 
 

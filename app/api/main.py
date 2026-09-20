@@ -43,7 +43,7 @@ def create_app(
     async def _lifespan(app: FastAPI):
         svc = run_service
         if svc is None:
-            from app.core.run_service import get_run_service
+            from harness.runtime.assembly import get_run_service
 
             svc = get_run_service()
         await svc.start()

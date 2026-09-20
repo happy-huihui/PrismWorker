@@ -21,7 +21,7 @@ from typing import TYPE_CHECKING, Any, Callable
 from langchain.agents.middleware import AgentMiddleware
 
 from harness.memory.manager import get_memory_manager
-from harness.runtime.user_content import resolve_runtime_user_id
+from harness.runtime.user_context import resolve_runtime_user_id
 
 if TYPE_CHECKING:
     from langchain_core.messages import SystemMessage

@@ -4,115 +4,32 @@ import hashlib
 import logging
 import threading
 from collections import OrderedDict
-from contextlib import contextmanager
-from contextvars import ContextVar
 from typing import Any, Callable
 
-from app.core.event_bus import get_event_bus
-from app.core.events import RunEventType, make_event
+from harness.runtime.events import get_dispatch_sink
 
-"""
-    agent 装配注册表（agent_registry）——应用级 Lead Agent 的统一入口。
+"""Lead Agent 装配注册表（graph.registry）
 
-    关键设计：harness 的 event_sink（工具事件唯一出口）是「注入式」的——
-    build_lead_agent 时固定进中间件，而工具事件本身不带 run 标识。为了让
-    agent 能被安全缓存、同时支持并发多 run 事件归位，这里采用
-    「全局分发 sink + run 上下文变量」：
-      1. DispatchEventSink 是进程级单例，作为所有缓存 agent 的 event_sink；
-      2. run 执行期间（run_worker 内）设置 _CURRENT_RUN contextvar，工具
-         事件据此路由到对应 run 的 EventBus（参考 harness 的 user_context
-         模式，机制相同）；
-      3. 没有 run 上下文时（测试 / 直连场景）事件被忽略，不产生副作用。
+    职责：按配置构建并缓存编译好的 Lead Agent 图，供 run 编排取用。
+    背景：harness 的 event_sink（工具事件唯一出口）是注入式的、装配期固定，
+         而工具事件本身不带 run 标识；为让 agent 能被安全缓存、又支持并发
+         多 run 事件各归各位，这里把「进程级分发 sink」作为所有缓存 agent 的
+         event_sink，事件归属由 run 上下文变量决定（见 events.routing）。
+    缓存：按配置 key 做 LRU，key 含 模型名 / 思考开关 / 技能目录 / 沙箱与
+         checkpointer 身份 / 配置摘要——任一项变化都会自动重建。
 
-    AgentRegistry 按配置 key 做 LRU 缓存：key 含 模型名 / 思考开关 / 技能
-    目录 / 沙箱与 checkpointer 身份 / 配置摘要——任何一项变化都会自动重建。
+    对外暴露：
+        - AgentRegistry        装配注册表（build_agent / get_agent / sandbox）
+        - get_agent_registry   进程级单例（按 app_config 身份复用）
+        - reset_agent_registry 重置单例（测试隔离）
 """
 
 logger = logging.getLogger(__name__)
 
+# 默认 LRU 容量
 _DEFAULT_MAX_SIZE = 4
 
-
-_CURRENT_RUN: ContextVar[str | None] = ContextVar("prism_current_run", default=None)
-_CURRENT_THREAD: ContextVar[str | None] = ContextVar("prism_current_thread", default=None)
-
-
-@contextmanager
-def run_context(run_id: str, thread_id: str):
-    """进入一次 run 的执行上下文（run_worker 内包裹 astream 用）。
-
-    期间 DispatchEventSink 收到的工具事件会路由到该 run；退出时自动恢复
-    上一个上下文（支持嵌套/并发，contextvar 隔离）。
-    """
-    run_token = _CURRENT_RUN.set(run_id)
-    thread_token = _CURRENT_THREAD.set(thread_id)
-    try:
-        yield
-    finally:
-        _CURRENT_RUN.reset(run_token)
-        _CURRENT_THREAD.reset(thread_token)
-
-
-class DispatchEventSink:
-    """进程级事件分发 sink：把 harness 工具事件路由到当前 run 的 EventBus。
-
-    作为所有缓存 agent 的 event_sink 注入；事件归属由 _CURRENT_RUN 决定。
-    """
-
-    def __init__(self, *, bus: Any | None = None) -> None:
-        """初始化；bus 缺省用进程级 EventBus 单例。"""
-        self._bus = bus
-
-    async def __call__(self, event: dict[str, Any]) -> None:
-        """接收 harness 工具事件并路由发布（无 run 上下文则忽略）。"""
-        run_id = _CURRENT_RUN.get()
-        if not run_id:
-            return
-        kind = event.get("event")
-        if kind == "tool_start":
-            run_event = make_event(
-                RunEventType.TOOL_START,
-                run_id=run_id,
-                thread_id=_CURRENT_THREAD.get() or "",
-                payload={
-                    "tool": event.get("tool", ""),
-                    "tool_call_id": event.get("tool_call_id", ""),
-                    "args_preview": event.get("args_preview", ""),
-                    "ts": event.get("ts"),
-                },
-            )
-        elif kind == "tool_end":
-            run_event = make_event(
-                RunEventType.TOOL_END,
-                run_id=run_id,
-                thread_id=_CURRENT_THREAD.get() or "",
-                payload={
-                    "tool": event.get("tool", ""),
-                    "tool_call_id": event.get("tool_call_id", ""),
-                    "duration_seconds": event.get("duration_seconds"),
-                    "ts": event.get("ts"),
-                },
-            )
-        else:
-            return
-        await (self._bus or get_event_bus()).publish(run_event)
-
-
-_dispatch_sink: DispatchEventSink | None = None
-_dispatch_sink_lock = threading.Lock()
-
-
-def get_dispatch_sink() -> DispatchEventSink:
-    """返回进程级事件分发 sink 单例（懒构造，线程安全）。"""
-    global _dispatch_sink
-    if _dispatch_sink is not None:
-        return _dispatch_sink
-    with _dispatch_sink_lock:
-        if _dispatch_sink is None:
-            _dispatch_sink = DispatchEventSink()
-        return _dispatch_sink
-
-
+# 图构建器签名（缺省委托 harness build_lead_agent）
 AgentBuilder = Callable[..., Any]
 
 
@@ -130,12 +47,16 @@ class AgentRegistry:
         builder: AgentBuilder | None = None,
         max_size: int = _DEFAULT_MAX_SIZE,
     ) -> None:
-        """初始化；builder 覆盖构建器（默认 harness build_lead_agent）。
+        """初始化。
 
-        Args:
-            sandbox_provider: 沙箱懒加载提供者。sandbox 显式传入时优先用
-                显式值；否则首次 build/get 时调用 provider 取真实沙箱实例
-                （进程级主动管理容器，首用懒启动 + 显式 stop 回收）。
+        参数：
+            app_config: harness AppConfig（模型/沙箱/工具等），也是缓存身份
+            sandbox: 显式沙箱实例；传入则优先于 provider
+            sandbox_provider: 沙箱懒加载提供者；无显式 sandbox 时首用调一次
+            checkpointer: 缓存路径共享的 checkpointer（get_agent 用）
+            skills_dir: 技能目录
+            builder: 覆盖图构建器（默认 harness build_lead_agent）
+            max_size: LRU 容量
         """
         self._app_config = app_config
         self._sandbox = sandbox
@@ -150,11 +71,14 @@ class AgentRegistry:
 
     def _resolve_sandbox(self) -> Any | None:
         """解析装配用的沙箱实例（显式值优先，否则经 provider 懒启动一次）。"""
+        # 显式传入优先
         if self._sandbox is not None:
             return self._sandbox
+        # 无 provider 则无沙箱
         if self._sandbox_provider is None:
             return None
         with self._lock:
+            # 双检：可能已被别的调用懒启动
             if self._sandbox is not None:
                 return self._sandbox
             try:
@@ -178,7 +102,15 @@ class AgentRegistry:
             return "cfg-unknown"
 
     def _key(self, *, model_name: str | None, thinking_enabled: bool) -> str:
-        """计算缓存 key（模型/思考/技能/实例身份/配置任何一项变化都换 key）。"""
+        """计算缓存 key（模型/思考/技能/实例身份/配置任何一项变化都换 key）。
+
+        参数：
+            model_name: 模型名
+            thinking_enabled: 是否思考模式
+
+        返回：
+            用于 LRU 命中的字符串键
+        """
         resolved_model = model_name or "auto"
         actual = self._resolve_sandbox()
         parts = [
@@ -201,6 +133,14 @@ class AgentRegistry:
     ) -> Any:
         """按需构建一个不查、不写缓存的全新 agent（本次 run 专属 checkpointer 用）。
 
+        参数：
+            model_name: 模型名
+            thinking_enabled: 是否思考模式
+            checkpointer: 本次编译绑定的 checkpointer
+
+        返回：
+            新编译的 agent 图
+
         与 get_agent 的区别：图在编译时绑定 checkpointer 实例，而按 run 新建
         的 checkpointer 每次都是新实例 → 缓存无法复用，只能现场装配。仍走
         同一构建路径（builder/沙箱/技能/事件分发），保证装配一致性。
@@ -222,9 +162,18 @@ class AgentRegistry:
         model_name: str | None = None,
         thinking_enabled: bool = False,
     ) -> Any:
-        """按参数取 agent：命中缓存直接返回，未命中构建并缓存（LRU）。"""
+        """按参数取 agent：命中缓存直接返回，未命中构建并缓存（LRU）。
+
+        参数：
+            model_name: 模型名
+            thinking_enabled: 是否思考模式
+
+        返回：
+            缓存或新建的 agent 图
+        """
         key = self._key(model_name=model_name, thinking_enabled=thinking_enabled)
         with self._lock:
+            # 命中则移到队尾（最近使用）后返回
             cached = self._cache.pop(key, None)
             if cached is not None:
                 self._cache[key] = cached
@@ -235,6 +184,7 @@ class AgentRegistry:
                 checkpointer=self._checkpointer,
             )
             self._cache[key] = agent
+            # 超容量则从队首淘汰最久未用
             while len(self._cache) > self._max_size:
                 self._cache.popitem(last=False)
             return agent
@@ -272,7 +222,15 @@ def get_agent_registry(
     builder: AgentBuilder | None = None,
     max_size: int = _DEFAULT_MAX_SIZE,
 ) -> AgentRegistry:
-    """返回进程级 AgentRegistry 单例（按 app_config 身份复用，线程安全）。"""
+    """返回进程级 AgentRegistry 单例（按 app_config 身份复用，线程安全）。
+
+    参数：
+        app_config: 用作单例键的配置实例（id 相同即复用）
+        其余参数见 AgentRegistry 构造
+
+    返回：
+        对应 app_config 的 AgentRegistry 单例
+    """
     key = id(app_config)
     with _registry_lock:
         registry = _registries.get(key)
