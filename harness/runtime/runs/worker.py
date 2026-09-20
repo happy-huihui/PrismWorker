@@ -77,7 +77,7 @@ async def run_worker(
     live_sandbox: Any = None
     # 装配阶段：失败直接以 error 收尾
     try:
-        from harness.memory.checkpointer import create_checkpointer
+        from harness.memory.short_term import create_checkpointer
 
         checkpointer = await create_checkpointer()
         agent = registry.build_agent(

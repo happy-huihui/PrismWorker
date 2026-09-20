@@ -165,7 +165,7 @@ def assemble_tools(
 
     if app_config.memory.mode == "tool":
         try:
-            from harness.memory.tools import (
+            from harness.memory.integration import (
                 delete_memory_tool,
                 save_memory_tool,
                 search_memory_tool,

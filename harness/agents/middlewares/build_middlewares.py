@@ -85,7 +85,7 @@ def build_middlewares(
     # 记忆中间件：注入长期记忆 + （middleware 模式）每轮自动提取入队。
     # tool 模式只注入不自动提取，写入由模型记忆工具负责（行为与旧版一致）。
     if memory.enabled:
-        from harness.memory.middleware import MemoryMiddleware, memory_flush_hook
+        from harness.memory.integration import MemoryMiddleware, memory_flush_hook
 
         middlewares.append(
             MemoryMiddleware(
@@ -102,7 +102,7 @@ def build_middlewares(
     ]
     # 摘要中间件：超长压缩；压缩前记忆冲刷钩子由记忆子系统注入（无记忆时不冲刷）。
     if memory.enabled:
-        from harness.memory.middleware import memory_flush_hook
+        from harness.memory.integration import memory_flush_hook
 
         summarization = SummarizationMiddleware(
             model_name=active_name,

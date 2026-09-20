@@ -51,7 +51,7 @@ async def get_message_history(
     # 限制单次读取量，避免异常大 limit 拖垮读取
     limit = max(1, min(int(limit), 500))
     if db_path is None:
-        from harness.memory.manager import resolve_memory_paths
+        from harness.memory.paths import resolve_memory_paths
 
         _, db_path = resolve_memory_paths(None)
 

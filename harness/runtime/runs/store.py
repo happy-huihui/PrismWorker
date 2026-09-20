@@ -65,7 +65,7 @@ class RunStore:
             return
         # 未指定库路径 → 与 checkpointer 同库解析
         if self._db_path is None:
-            from harness.memory.manager import resolve_memory_paths
+            from harness.memory.paths import resolve_memory_paths
 
             _, db_path = resolve_memory_paths(None)
             self._db_path = db_path

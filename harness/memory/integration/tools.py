@@ -1,15 +1,3 @@
-"""长期记忆工具：让模型自主保存 / 检索 / 删除跨会话记忆。
-
-三个工具（仅 mode=tool 时注册）：
-    - save_memory   存一条记忆（同 key 自动更新；底层为事实 CRUD）
-    - search_memory 按关键词 / 主题标签检索（底层走记忆管理器检索）
-    - delete_memory 删一条记忆（按 key 定位后删除）
-
-user_id 统一从 runtime 解析（见 runtime/user_context.py），消息统一中文。
-工具签名与旧版保持一致（模型侧零改动），内部实现从 SQLite 直读写
-切换为记忆管理器的 fact CRUD。
-"""
-
 from __future__ import annotations
 
 import logging
@@ -25,9 +13,19 @@ from harness.tools.types import Runtime
 
 logger = logging.getLogger(__name__)
 
+"""长期记忆工具（integration.tools）
+
+    职责：让模型自主保存 / 检索 / 删除跨会话记忆（仅 mode=tool 时注册）。
+    三工具：save_memory（同 key 自动更新）/ search_memory（按关键词+标签检索）
+           / delete_memory（按 key 定位删除）。
+    约定：user_id 统一从 runtime 解析；工具签名与旧版一致（模型侧零改动），
+         底层从 SQLite 直读写切换为记忆管理器的 fact CRUD。
+"""
+
 
 def _error_message(tool_call_id: str, exc: Exception) -> Command:
     """把存取异常统一转成中文工具消息。"""
+    # 不回抛，转成一条 ToolMessage 让模型看到失败原因
     return Command(
         update={
             "messages": [
@@ -68,6 +66,7 @@ def save_memory_tool(
         kind: 主题标签，默认 general。
     """
     user_id = resolve_runtime_user_id(runtime)
+    # 1.走 fact CRUD（同 key 覆盖更新）；异常转可读消息
     try:
         _document, fact_id = get_memory_manager().create_fact(
             content,
@@ -80,6 +79,7 @@ def save_memory_tool(
     except Exception as exc:  # noqa: BLE001 —— 存储异常转成可读消息
         logger.exception("save_memory 失败")
         return _error_message(tool_call_id, exc)
+    # 2.fact_id=None 表示被 max_facts 裁掉，未真正保存
     if fact_id is None:
         action = "记忆已达上限，本条未保存"
     else:
@@ -117,6 +117,7 @@ def search_memory_tool(
         limit: 最多返回条数（默认 5）。
     """
     user_id = resolve_runtime_user_id(runtime)
+    # 1.按关键词 + 可选标签检索；异常转可读消息
     try:
         facts = get_memory_manager().search(
             query,
@@ -127,6 +128,7 @@ def search_memory_tool(
     except Exception as exc:  # noqa: BLE001
         logger.exception("search_memory 失败")
         return _error_message(tool_call_id, exc)
+    # 2.无命中回一句提示
     if not facts:
         return Command(
             update={
@@ -138,6 +140,7 @@ def search_memory_tool(
                 ]
             }
         )
+    # 3.命中列表渲染成「- [key]（标签）内容」多行
     lines = []
     for fact in facts:
         key_part = f"[{fact.get('key')}] " if fact.get("key") else ""
@@ -168,6 +171,7 @@ def delete_memory_tool(
         key: 要删除的记忆键（须与保存时一致）。
     """
     user_id = resolve_runtime_user_id(runtime)
+    # 1.读文档，按 key 定位目标 fact 的 id
     try:
         manager = get_memory_manager()
         document = manager.get_memory(user_id=user_id)
@@ -177,6 +181,7 @@ def delete_memory_tool(
             if isinstance(fact, dict) and str(fact.get("key", "")).strip() == stripped_key:
                 target_id = fact.get("id")
                 break
+        # 2.定位不到回提示；定位到则按 id 删除
         if target_id is None:
             content = f"没有找到要删除的记忆 [{key}]"
         else:
