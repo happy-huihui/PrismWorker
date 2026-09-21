@@ -80,6 +80,7 @@ def build_lead_agent(
         agent_name=app_config.agent_name,
         tool_names=tool_names,
         sandbox_enabled=sandbox is not None,
+        app_config=app_config,
     )
 
     agent = create_agent(

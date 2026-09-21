@@ -14,7 +14,6 @@ from harness.memory.processing import (
     detect_signals,
     extract_message_text,
     format_conversation_for_update,
-    load_prompt_messages,
 )
 from harness.memory.storage import (
     MemoryStorage,
@@ -22,6 +21,7 @@ from harness.memory.storage import (
     create_empty_memory,
     utc_now_iso_z,
 )
+from harness.prompt import load_chat
 
 logger = logging.getLogger(__name__)
 
@@ -606,11 +606,11 @@ class MemoryUpdater:
             "conversation": conversation_text,
             "correction_hint": correction_hint,
         }
-        # 4.渲染 chat 模板
-        prompt = load_prompt_messages(
-            "memory_update",
+        # 4.渲染 chat 模板（模板集中在 harness/prompt，base_dir 支持外部覆盖）
+        prompt = load_chat(
+            "memory/memory_update",
             variables,
-            prompts_dir=self._config.prompts_dir,
+            base_dir=self._config.prompts_dir,
         )
         return current_memory, prompt
 

@@ -5,6 +5,8 @@ from typing import Any
 
 from langchain.agents.middleware import AgentMiddleware
 
+from harness.prompt import render_text
+
 
 """
     会话标题中间件（title）——为新会话生成一句话标题（oneshot）。
@@ -21,11 +23,6 @@ logger = logging.getLogger(__name__)
 _MIN_MESSAGES_FOR_TITLE = 3
 
 _TITLE_MAX_CHARS = 60
-
-_SUMMARY_INSTRUCTION = (
-    "请为以下对话生成一个简洁的会话标题（不超过20个字，直接输出标题，"
-    "不要加引号或额外说明）：\n\n{preview}"
-)
 
 
 class TitleMiddleware(AgentMiddleware):
@@ -72,7 +69,8 @@ class TitleMiddleware(AgentMiddleware):
                 logger.warning("标题中间件创建模型失败: %s", exc)
                 return None
         try:
-            response = await model.ainvoke(_SUMMARY_INSTRUCTION.format(preview=preview))
+            # 标题模板集中在 harness/prompt，这里只传预览变量
+            response = await model.ainvoke(render_text("titler/title", {"preview": preview}))
             text = getattr(response, "content", None)
             if isinstance(text, str):
                 return text.strip()

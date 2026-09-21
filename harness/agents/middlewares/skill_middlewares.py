@@ -10,6 +10,7 @@ from langchain.agents.middleware import types
 from langchain_core.messages import SystemMessage
 
 from harness.config.paths import get_paths
+from harness.prompt import load_text, render_text
 from harness.skills.frontmatter import split_skill_markdown
 
 ModelRequest = types.ModelRequest
@@ -45,7 +46,6 @@ _ACTIVATE_TAG_RE = re.compile(
 )
 
 _AVAILABLE_MARKER = "available_skills"
-_ACTIVE_MARKER = "active_skill"
 
 
 
@@ -84,16 +84,19 @@ def scan_skills_dir(skills_dir: Path) -> list[dict[str, str]]:
 
 
 def build_available_skills_block(entries: list[dict[str, str]]) -> str:
-    """把技能清单拼成 <available_skills> 结构块。"""
+    """把技能清单拼成 <available_skills> 结构块（框架文案取自 harness.prompt）。"""
+    # 1.无技能：用集中的空态框架
     if not entries:
-        return f"<{_AVAILABLE_MARKER}>\n（当前没有可用的技能）\n</{_AVAILABLE_MARKER}>"
+        return load_text("skills/empty_block")
+    # 2.逐条技能行（name/path/desc 作普通字符串拼接，避免模板转义问题）
     lines = []
     for entry in entries:
         description = entry["description"] or "（无描述）"
         lines.append(f'<skill name="{entry["name"]}" path="{entry["path"]}">')
         lines.append(f"  {description}")
         lines.append("</skill>")
-    return f"<{_AVAILABLE_MARKER}>\n" + "\n".join(lines) + f"\n</{_AVAILABLE_MARKER}>"
+    # 3.拼好的清单作为值，注入统一框架模板
+    return render_text("skills/available_block", {"skills": "\n".join(lines)})
 
 
 def extract_activation_requests(text: str) -> list[str]:
@@ -135,11 +138,11 @@ class SkillActivationMiddleware(AgentMiddleware):
 
         needs_injection = _AVAILABLE_MARKER not in base_text
         if needs_injection and entries:
+            # 框架与激活提示都取自 harness.prompt；
+            # 提示前缀的两个换行由代码控制，与原行为逐字一致
             block = build_available_skills_block(entries)
-            activate_hint = (
-                "\n\n如需使用技能，请在回复中包含：<activate_skill name=\"技能名\" />"
-            )
-            base_text = f"{block}{activate_hint}\n\n{base_text}" if base_text else block + activate_hint
+            hint = load_text("skills/activate_hint")
+            base_text = f"{block}\n\n{hint}\n\n{base_text}" if base_text else f"{block}\n\n{hint}"
 
         activation_names = _find_activations_in_messages(request.messages)
         loaded_sections: list[str] = []
@@ -151,8 +154,9 @@ class SkillActivationMiddleware(AgentMiddleware):
             body = _load_skill_body(Path(entry["path"]))
             if not body:
                 continue
+            # 已激活技能正文包成 <active_skill> 块（框架取自 harness.prompt）
             loaded_sections.append(
-                f"<{_ACTIVE_MARKER} name=\"{name}\">\n{body}\n</{_ACTIVE_MARKER}>"
+                render_text("skills/active_block", {"name": name, "body": body})
             )
         if loaded_sections:
             base_text = "\n\n".join(loaded_sections) + "\n\n" + base_text

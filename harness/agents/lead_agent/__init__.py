@@ -7,11 +7,10 @@
 """
 
 from harness.agents.lead_agent.agent import assemble_tools, build_lead_agent
-from harness.agents.lead_agent.prompt import SYSTEM_PROMPT_TEMPLATE, format_system_prompt
+from harness.agents.lead_agent.prompt import format_system_prompt
 
 __all__ = [
     "build_lead_agent",
     "assemble_tools",
     "format_system_prompt",
-    "SYSTEM_PROMPT_TEMPLATE",
 ]

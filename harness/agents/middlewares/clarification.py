@@ -8,16 +8,13 @@ from langchain.agents.middleware import AgentMiddleware
 from langchain_core.messages import AIMessage
 
 """
-    澄清中间件（clarification）——模型信息不足时把疑问点暴露给前端。
+    澄清中间件（clarification）——向后兼容地处理模型可能残留的 <clarify> 标记。
 
-    背景：Agent 在信息不足时（工具搜不到 / 用户意图含糊）需要向人提问。
-    完整实现有专门的 clarify 工具 + 消息流；本项目收敛为「标记解析」最小版：
-      - 注入系统提示：信息不足时，模型可在回复中用
-        <clarify question="具体问题"/> 标记钦点需要澄清的问题；
-      - aafter_model：扫描本轮 AI 消息里的 clarify 标记，把它们剥离出
-        正文（避免控制标签原样出现在回复里），并把问题列表写入
-        state.prints —— 运行层把 prints 流式推给前端，前端可据此
-        向用户展示"需要澄清"的环节。无标记时静默。
+    现状：澄清已改为「工具优先」。主提示词的 <clarification_system> 指示模型在
+    信息不足/有歧义/需确认时调用 ask_clarification 工具（return_direct，会中断本轮
+    等待用户回复），不再依赖系统提示里的 <clarify> 用法说明。
+    本中间件因此只保留兜底解析：aafter_model 扫描本轮 AI 消息里遗留的 <clarify> 标记，
+    把它们从正文剥离（避免控制标签外泄）并把问题写入 state.prints，供前端展示；无标记则静默。
 """
 
 logger = logging.getLogger(__name__)
@@ -28,35 +25,15 @@ _CLARIFY_TAG_RE = re.compile(
     re.IGNORECASE,
 )
 
-_CLARIFY_HINT = (
-    "当信息不足、无法继续任务时，请在回复中单独使用"
-    "<clarify question=\"你需要澄清的问题\"/> 标记提出疑问"
-    "（每个标记一个简短具体的问题），不要编造缺失的信息。"
-)
-
 
 class ClarificationMiddleware(AgentMiddleware):
-    """澄清中间件：解析模型提出的 clarify 标记并输出为进度消息。"""
+    """澄清中间件（向后兼容）：解析模型可能残留的 <clarify> 标记。
 
-    async def awrap_model_call(
-        self,
-        request: Any,
-        handler: Any,
-    ) -> Any:
-        """包装模型调用：注入 clarify 提示（仅当尚未注入过）。"""
-        system_message = request.system_message
-        if system_message is not None and "clarify" in system_message.text:
-            return await handler(request)
-        if system_message is None:
-            from langchain_core.messages import SystemMessage
-
-            system_message = SystemMessage(content=_CLARIFY_HINT)
-        else:
-            text = system_message.text
-            system_message = system_message.__class__(
-                content=f"{_CLARIFY_HINT}\n\n{text}" if text else _CLARIFY_HINT
-            )
-        return await handler(request.override(system_message=system_message))
+    说明：澄清已改为「工具优先」——由主提示词的 <clarification_system> 指示模型
+    调用 ask_clarification 工具（该工具会中断本轮并等待用户回复）。本中间件不再
+    向系统提示注入 <clarify> 用法提示，仅在模型仍吐出遗留 <clarify> 标记时，把
+    问题剥离正文并转成进度打印，保证不污染回复。
+    """
 
     async def aafter_model(
         self, state: Any, runtime: Any  # type: ignore[override]

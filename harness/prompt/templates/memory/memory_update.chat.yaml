@@ -44,24 +44,24 @@ messages:
       - Do NOT record file upload events: uploaded files are session-specific and ephemeral
 
       Output Format (JSON only, no markdown):
-      {{
-        "user": {{
-          "workContext": {{ "summary": "...", "shouldUpdate": true/false, "scope": "user|thread|project", "authority": "descriptive|transactional" }},
-          "personalContext": {{ "summary": "...", "shouldUpdate": true/false, "scope": "user|thread|project", "authority": "descriptive|transactional" }},
-          "topOfMind": {{ "summary": "...", "shouldUpdate": true/false, "scope": "user|thread|project", "authority": "descriptive|transactional" }}
-        }},
-        "history": {{
-          "recentMonths": {{ "summary": "...", "shouldUpdate": true/false, "scope": "user|thread|project", "authority": "descriptive|transactional" }},
-          "earlierContext": {{ "summary": "...", "shouldUpdate": true/false, "scope": "user|thread|project", "authority": "descriptive|transactional" }},
-          "longTermBackground": {{ "summary": "...", "shouldUpdate": true/false, "scope": "user|thread|project", "authority": "descriptive|transactional" }}
-        }},
+      {
+        "user": {
+          "workContext": { "summary": "...", "shouldUpdate": true/false, "scope": "user|thread|project", "authority": "descriptive|transactional" },
+          "personalContext": { "summary": "...", "shouldUpdate": true/false, "scope": "user|thread|project", "authority": "descriptive|transactional" },
+          "topOfMind": { "summary": "...", "shouldUpdate": true/false, "scope": "user|thread|project", "authority": "descriptive|transactional" }
+        },
+        "history": {
+          "recentMonths": { "summary": "...", "shouldUpdate": true/false, "scope": "user|thread|project", "authority": "descriptive|transactional" },
+          "earlierContext": { "summary": "...", "shouldUpdate": true/false, "scope": "user|thread|project", "authority": "descriptive|transactional" },
+          "longTermBackground": { "summary": "...", "shouldUpdate": true/false, "scope": "user|thread|project", "authority": "descriptive|transactional" }
+        },
         "newFacts": [
-          {{ "content": "...", "category": "preference|knowledge|context|behavior|goal|correction", "confidence": 0.0-1.0, "scope": "user|thread|project", "durability": "durable|temporary", "authority": "descriptive|transactional" }}
+          { "content": "...", "category": "preference|knowledge|context|behavior|goal|correction", "confidence": 0.0-1.0, "scope": "user|thread|project", "durability": "durable|temporary", "authority": "descriptive|transactional" }
         ],
         "factsToRemove": [
-          {{ "id": "fact_id_1", "scope": "user|thread|project", "reason": "explicit user-level contradiction or retraction", "replacementFactIndex": 0 }}
+          { "id": "fact_id_1", "scope": "user|thread|project", "reason": "explicit user-level contradiction or retraction", "replacementFactIndex": 0 }
         ]
-      }}
+      }
 
       Important Rules:
       - Only set shouldUpdate=true when there is meaningful new information
@@ -75,14 +75,14 @@ messages:
     content: |-
       Current Memory State:
       <current_memory>
-      {current_memory}
+      $current_memory
       </current_memory>
 
       New Conversation to Process:
       <conversation>
-      {conversation}
+      $conversation
       </conversation>
 
-      {correction_hint}
+      $correction_hint
 
       Update the memory based on the above conversation.

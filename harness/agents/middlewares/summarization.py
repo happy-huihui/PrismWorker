@@ -14,6 +14,8 @@ from langchain_core.messages import (
 from langchain_core.messages.utils import count_tokens_approximately
 from langgraph.graph.message import REMOVE_ALL_MESSAGES
 
+from harness.prompt import render_text
+
 
 """
     对话摘要中间件（summarization）——对话超长时把早期消息压成摘要。
@@ -25,7 +27,7 @@ from langgraph.graph.message import REMOVE_ALL_MESSAGES
     清空，保留最近 keep_messages（默认 20）条；摘要正文同时写入
     state.summary_text（拼接式，保留历史摘要链），并写一条进度消息。
 
-    记忆联动：压缩前通过 flush_hook（见 harness/memory/middleware.py 的
+    记忆联动：压缩前通过 flush_hook（见 harness/memory/integration/middleware.py 的
     memory_flush_hook）把将被压缩的消息紧急冲刷进长期记忆队列，保证
     「先入记忆、再被压缩」，压缩不丢信息。flush_hook 缺省为 None，
     未注入时行为与改造前完全一致。
@@ -40,13 +42,6 @@ logger = logging.getLogger(__name__)
 _DEFAULT_MAX_MESSAGES = 40
 _DEFAULT_MAX_TOKENS = 8000
 _DEFAULT_KEEP_MESSAGES = 20
-
-_SUMMARY_PROMPT = (
-    "你是对话摘要助手。请把下面的对话历史压缩成一段条理清晰的中文摘要，"
-    "保留这样几类关键信息：用户的目标和需求、关键结论与决定、已完成的动作、"
-    "仍需继续的事情。不要遗漏重要事实，也不要编造不存在的内容。\n\n"
-    "<历史消息>\n{messages}\n</历史消息>\n\n直接输出摘要正文，不要加标题或前缀。"
-)
 
 
 def _find_safe_cutoff(messages: list[AnyMessage], messages_to_keep: int) -> int:
@@ -185,7 +180,8 @@ class SummarizationMiddleware(AgentMiddleware):
             rendered = get_buffer_string(messages)
         except Exception:  # noqa: BLE001
             rendered = "\n".join(str(m.content) for m in messages)[:20000]
-        prompt = _SUMMARY_PROMPT.format(messages=rendered[:30000])
+        # 摘要模板集中在 harness/prompt，这里只做变量装配（截断到 30000 字）
+        prompt = render_text("summarizer/summary", {"messages": rendered[:30000]})
 
         try:
             model = self._load_model()

@@ -6,6 +6,8 @@ from langchain.agents.middleware import AgentMiddleware
 from langchain.agents.middleware import types
 from langchain_core.messages import SystemMessage
 
+from harness.prompt import render_text
+
 ModelRequest = types.ModelRequest
 
 
@@ -53,10 +55,8 @@ class DeferredToolFilterMiddleware(AgentMiddleware):
 
         system_message = request.system_message
         text = system_message.text if system_message is not None else ""
-        notice = (
-            f"提示：以下工具当前不可用，请勿调用：{', '.join(blocked)}。"
-            "请改用白名单内的可用工具完成任务。"
-        )
+        # 不可用工具提示文案集中在 harness.prompt；blocked 名单作值注入
+        notice = render_text("deferred_tools/unavailable", {"blocked": ", ".join(blocked)})
         if system_message is None:
             new_system = SystemMessage(content=notice)
         else:

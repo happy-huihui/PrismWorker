@@ -6,6 +6,7 @@ from typing import TYPE_CHECKING, Any
 from langchain.agents.middleware import AgentMiddleware
 
 from harness.memory.manager import get_memory_manager
+from harness.prompt import render_text
 from harness.runtime.user_context import resolve_runtime_user_id
 
 if TYPE_CHECKING:
@@ -27,9 +28,6 @@ logger = logging.getLogger(__name__)
 
 # 系统提示里已含该标记则视为已注入，避免重复包裹
 _MEMORY_MARKER = "memory"
-# 注入块上下界标签（与系统提示词中的占位约定一致）
-_MEMORY_BLOCK_START = "<memory>"
-_MEMORY_BLOCK_END = "</memory>"
 
 
 class MemoryMiddleware(AgentMiddleware):
@@ -78,7 +76,8 @@ class MemoryMiddleware(AgentMiddleware):
             return await handler(request)
 
         # 5.包成 <memory> 块，拼到系统消息最前（原系统消息非空则续在其后）
-        block = f"{_MEMORY_BLOCK_START}\n{memory_text}\n{_MEMORY_BLOCK_END}"
+        # 用集中托管的模板包成 <memory> 块（记忆正文作值注入，不会被二次转义）
+        block = render_text("memory/injection", {"memory_content": memory_text})
         if existing is None:
             from langchain_core.messages import SystemMessage
 
