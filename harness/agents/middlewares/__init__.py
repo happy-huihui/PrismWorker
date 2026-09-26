@@ -8,7 +8,7 @@
     SubagentLimit / DelegationLedger
   - 沙箱与错误：ReadBeforeWrite / SandboxAudit / ToolError / LLMError
   - 结果与收尾：ToolOutputBudget / ToolResultSanitization / SystemMessageCoalescing /
-    SafetyFinishReason / TokenUsage
+    TokenUsage
 
 统一入口 build_middlewares(app_config, *, event_sink=..., skills_dir=...) 返回
 按固定顺序排序的 [AgentMiddleware]，供 lead_agent 组装时按序挂载。
@@ -22,12 +22,17 @@ from harness.agents.middlewares.error_handling import LLMErrorMiddleware, ToolEr
 from harness.agents.middlewares.flow_control import (
     DanglingToolCallMiddleware,
     LoopDetectionMiddleware,
-    SafetyFinishReasonMiddleware,
     SystemMessageCoalescingMiddleware,
 )
 from harness.agents.middlewares.input_sanitization_middleware import (
     InputSanitizationMiddleware,
     neutralize_untrusted_tags,
+)
+from harness.agents.middlewares.model_output_sanitizer import (
+    ModelOutputSanitizerMiddleware,
+    clean_tool_call_shells,
+    repair_history,
+    sanitize_tool_calls,
 )
 from harness.agents.middlewares.sandbox_protection import (
     ReadBeforeWriteMiddleware,
@@ -58,6 +63,10 @@ __all__ = [
     "build_middlewares",
     "InputSanitizationMiddleware",
     "neutralize_untrusted_tags",
+    "ModelOutputSanitizerMiddleware",
+    "sanitize_tool_calls",
+    "clean_tool_call_shells",
+    "repair_history",
     "ThreadContextMiddleware",
     "DynamicContextMiddleware",
     "UploadsMiddleware",
@@ -82,6 +91,5 @@ __all__ = [
     "ToolOutputBudgetMiddleware",
     "ToolResultSanitizationMiddleware",
     "SystemMessageCoalescingMiddleware",
-    "SafetyFinishReasonMiddleware",
     "TokenUsageMiddleware",
 ]

@@ -87,11 +87,24 @@ class RunOut(BaseModel):
 
 
 
+class ChainOut(BaseModel):
+    """一个历史 run 的思考链回放包（事件流 + 计时元信息）。"""
+
+    run_id: str = Field(description="归属 run")
+    status: str = Field(description="run 终态")
+    model_name: str = Field(default="", description="使用的模型名")
+    started_at: float | None = Field(default=None, description="开始时间戳")
+    finished_at: float | None = Field(default=None, description="结束时间戳")
+    events: list[dict[str, Any]] = Field(
+        default_factory=list, description="紧凑事件流 [{event, data}, ...]，前端用同一 reducer 回放"
+    )
+
+
 class ModelOut(BaseModel):
     """模型清单响应（只暴露非敏感字段）。"""
 
     name: str = Field(description="模型唯一名称")
-    provider: str = Field(description="提供方（openai / deepseek）")
+    provider: str = Field(description="提供方（openai / deepseek / mimo）")
     model: str = Field(description="模型标识")
     supports_vision: bool = Field(description="是否支持视觉输入")
     supports_thinking: bool = Field(description="是否支持思考模式")

@@ -86,6 +86,11 @@ class DispatchEventSink:
                 payload={
                     "tool": event.get("tool", ""),
                     "tool_call_id": event.get("tool_call_id", ""),
+                    # 结构化参数：前端按 path / command / query 等语义键渲染 chip
+                    "args": event.get("args") or {},
+                    # 模型自填的动作标题（DeerFlow 同款卡片标题首选）
+                    "description": event.get("description") or "",
+                    # 兼容字段：整包 JSON 预览（旧前端 / 未知键兜底）
                     "args_preview": event.get("args_preview", ""),
                     "ts": event.get("ts"),
                 },
@@ -99,6 +104,9 @@ class DispatchEventSink:
                     "tool": event.get("tool", ""),
                     "tool_call_id": event.get("tool_call_id", ""),
                     "duration_seconds": event.get("duration_seconds"),
+                    # ok/error 由工具进度中间件按执行结果给出，前端据此把步骤标红
+                    "ok": bool(event.get("ok", True)),
+                    "error": event.get("error"),
                     "ts": event.get("ts"),
                 },
             )

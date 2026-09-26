@@ -23,7 +23,10 @@
 关键点：
     1. docker 命令前缀可配置（docker_command），Windows 上 docker 在
        WSL 内，通常需要 ["wsl", "-e", "docker"]。
-    2. 工作区目录通过 -v 挂载进容器，容器内路径固定为 /mnt/user-data。
+    2. 挂载统一用 `--mount type=bind,src=..,dst=..[,readonly]`（不用 `-v`：
+       `-v` 用冒号分隔，与 Windows 盘符路径 `E:\\...` 撞语义）。
+       工作区挂到 /mnt/user-data（可写，per-thread），技能根挂到 /mnt/skills
+       （只读，全线程共享同一份宿主目录）。
 """
 
 from __future__ import annotations
@@ -35,9 +38,11 @@ import threading
 import time
 import uuid
 from dataclasses import dataclass, field
+from pathlib import Path
 
-from harness.config.paths import VIRTUAL_PATH_PREFIX
+from harness.config.paths import PROJECT_ROOT, VIRTUAL_PATH_PREFIX
 from harness.config.sandbox_config import SandboxConfig
+from harness.config.skills import SkillsConfig
 from harness.sandbox.aio_sandbox import AioSandbox, wait_for_sandbox_ready
 from harness.sandbox.warm_pool import WarmPool
 
@@ -46,6 +51,19 @@ logger = logging.getLogger(__name__)
 _CONTAINER_API_PORT = 8080
 
 _CONTAINER_MOUNT_POINT = VIRTUAL_PATH_PREFIX
+
+
+def _windows_to_wsl_path(host_path: str) -> str:
+    """把 Windows 盘符路径手工映射成 WSL 路径：`E:\\a\\b` → `/mnt/e/a/b`。
+
+    这是 `wslpath` 不可用时的兜底（标准 WSL 都把盘符挂在 /mnt/<小写盘符> 下）。
+    非盘符路径只做分隔符归一，原样返回，避免把 Linux 路径改坏。
+    """
+    if len(host_path) >= 2 and host_path[1] == ":" and host_path[0].isalpha():
+        drive = host_path[0].lower()
+        rest = host_path[2:].lstrip("\\/").replace("\\", "/")
+        return f"/mnt/{drive}/{rest}"
+    return host_path.replace("\\", "/")
 
 # idle checker 周期（秒）：清理闲置热池条目 + 周期性孤儿扫描
 _IDLE_CHECK_INTERVAL_SECONDS = 60
@@ -90,16 +108,25 @@ class SandboxManager:
 
         优先级：
             1. config.docker_command（显式配置）
-            2. 探测 which docker / wsl -e docker
+            2. 探测 docker / wsl -e docker
+
+        探测失败要区分三类原因，并全部汇总进最终报错——实测（2026-09-23）
+        `wsl.exe` 被安全策略拦截时抛的是 `PermissionError [WinError 5]`，
+        它既不是 FileNotFoundError 也不是 TimeoutExpired；旧代码没接住它，
+        导致这个原始异常直接穿透到上层，日志只剩一句「[WinError 5] 拒绝访问」，
+        完全看不出是「哪个候选命令失败、为什么失败」。这里把三种异常统一
+        收进失败清单，最终抛一条能直接照着排查的 RuntimeError。
         """
         if self._docker_cmd is not None:
             return self._docker_cmd
         if self.config.docker_command:
             self._docker_cmd = list(self.config.docker_command)
             return self._docker_cmd
-        import shutil
 
-        for candidate in (["docker"], ["wsl", "-e", "docker"]):
+        candidates = (["docker"], ["wsl", "-e", "docker"])
+        failures: list[str] = []
+        for candidate in candidates:
+            label = " ".join(candidate)
             try:
                 probe = subprocess.run(
                     candidate + ["--version"],
@@ -111,11 +138,21 @@ class SandboxManager:
                     self._docker_cmd = candidate
                     logger.info("使用 docker CLI 前缀: %s", candidate)
                     return candidate
-            except (FileNotFoundError, subprocess.TimeoutExpired):
-                continue
+                failures.append(f"{label} → 退出码 {probe.returncode}")
+            except PermissionError:
+                # 被安全策略（程序黑名单）拦截：可执行文件在，但禁止启动
+                failures.append(f"{label} → 被安全策略拦截（PermissionError，疑似程序黑名单）")
+            except FileNotFoundError:
+                failures.append(f"{label} → 可执行文件不存在")
+            except subprocess.TimeoutExpired:
+                failures.append(f"{label} → 探测超时")
+
+        detail = "；".join(failures) if failures else "无可用候选"
         raise RuntimeError(
-            "未找到可用的 docker CLI。请在 config.yaml 中配置 sandbox.docker_command，"
-            "例如 Windows 上 ['wsl', '-e', 'docker']。"
+            f"未找到可用的 docker CLI（{detail}）。"
+            "请在 config.yaml 中配置 sandbox.docker_command，"
+            "例如 Windows 上 ['wsl', '-e', 'docker']；"
+            "若已配置但仍被拦截，请检查安全中心的程序黑名单是否包含 wsl.exe。"
         )
 
     def _run_docker(self, *args: str, check: bool = True, text_output: bool = True) -> subprocess.CompletedProcess:
@@ -237,19 +274,150 @@ class SandboxManager:
                     )
                     occupied -= 1
             if replicas and replicas > 0 and occupied >= replicas:
-                # 热池已无可逐出 → 共享回退：借用现有活跃容器
-                borrowed = next(iter(self._sandboxes.values()), None)
-                if borrowed is not None:
-                    self._borrowers[borrowed.id] = self._borrowers.get(borrowed.id, 0) + 1
+                # 热池已无可逐出 → 共享回退：借用现有活跃容器。
+                #
+                # ⚠️ 仅在**没有 per-thread 挂载**时才允许借用（2026-09-23 修正）：
+                #    容器会挂载「所属线程」的 user-data 目录（见 _spawn_new 的 -v）。
+                #    一旦把线程 A 的容器借给线程 B，B 就直接读写 A 的目录 —— 跨线程
+                #    数据泄露。所以绑定了线程目录的容器绝不共享，宁可多起一个：
+                #    活跃容器按线程数增长（由并发 run 天然约束），
+                #    replicas 退化为「热池保活上限」。
+                if host_workspace_dir is None:
+                    borrowed = next(iter(self._sandboxes.values()), None)
+                    if borrowed is not None:
+                        self._borrowers[borrowed.id] = self._borrowers.get(borrowed.id, 0) + 1
+                        logger.info(
+                            "沙箱容量已满（replicas=%d），%s 共享借用容器 %s",
+                            replicas,
+                            target_id,
+                            borrowed.id,
+                        )
+                        return borrowed
+                else:
                     logger.info(
-                        "沙箱容量已满（replicas=%d），%s 共享借用容器 %s",
+                        "沙箱容量已满（replicas=%d）且容器绑定了线程工作区，%s 不共享、直接新建",
                         replicas,
                         target_id,
-                        borrowed.id,
                     )
-                    return borrowed
 
         return self._spawn_new(target_id, host_workspace_dir=host_workspace_dir)
+
+    def _to_docker_host_path(self, host_path: str) -> str:
+        """把宿主路径转成 docker CLI 能理解的路径。
+
+        为什么需要转换（Windows + WSL 场景）：
+            Windows 上 docker CLI 往往是通过 `wsl -e docker` 调用的，而 docker
+            守护进程跑在 WSL 发行版里、看到的是 Linux 命名空间 ——
+            `E:\\Project\\x` 这种盘符路径它认不出来，必须变成 `/mnt/e/Project/x`。
+            不转换的话 `-v` 会静默挂载失败或挂到错误位置。
+
+        策略：优先 `wslpath -a`（官方转换，能正确处理自定义挂载根）；
+              失败则退回手工盘符映射（标准 WSL 都是 /mnt/<盘符>）。
+              非 wsl 调用（如 Windows 原生 docker）原样返回。
+
+        参数：
+            host_path: 宿主侧路径（可能是 Windows 盘符路径）
+
+        返回：
+            docker 可用的路径字符串
+        """
+        try:
+            docker_cmd = self._resolve_docker_cmd()
+        except RuntimeError:
+            # 探测不到 docker CLI（例如被安全策略拦截）：无从判断是否 wsl 调用
+            docker_cmd = None
+
+        # 经 wsl 调用 docker：路径必须转成 WSL 命名空间的写法
+        if docker_cmd and docker_cmd[0] == "wsl":
+            try:
+                # cmd_prefix 形如 ["wsl","-e","docker"] → ["wsl","-e","wslpath","-a",path]
+                probe = subprocess.run(
+                    list(docker_cmd[:-1]) + ["wslpath", "-a", host_path],
+                    capture_output=True,
+                    text=True,
+                    timeout=20,
+                )
+                converted = (probe.stdout or "").strip()
+                if probe.returncode == 0 and converted.startswith("/"):
+                    return converted
+            except (OSError, subprocess.TimeoutExpired):
+                pass
+            return _windows_to_wsl_path(host_path)
+
+        # 非 wsl：Windows 原生 docker 认得盘符路径，原样返回；
+        # 探测不到 docker CLI 时也兜底转一次，免得把盘符路径塞给容器。
+        if docker_cmd:
+            return host_path
+        return _windows_to_wsl_path(host_path)
+
+    def _resolve_mount_source(self, source: str) -> str:
+        """把挂载源解析成宿主绝对路径。
+
+        相对路径以**项目根**为基准（不是 CWD）—— 服务可能从任意目录启动，
+        用 CWD 会让同一份配置在不同启动方式下挂到不同地方。
+        """
+        path = Path(source).expanduser()
+        if not path.is_absolute():
+            path = PROJECT_ROOT / path
+        return str(path.resolve())
+
+    def _mount_args(
+        self,
+        source: str,
+        target: str,
+        *,
+        read_only: bool,
+        ensure_exists: bool = True,
+    ) -> list[str]:
+        """生成一条 bind mount 的 docker 参数。
+
+        为什么用 `--mount type=bind,src=...,dst=...[,readonly]` 而不是 `-v src:dst[:ro]`：
+            `-v` 用冒号做分隔符，而 Windows 盘符路径（`E:\\...`）本身就含冒号，
+            经 WSL 转换后虽然变成 `/mnt/e/...` 没有冒号，但只要有一环没转成功，
+            整条挂载就会静默挂错位置。`--mount` 是键值对形式，没有这个歧义。
+
+        代价（必须记住）：`--mount` **不会**像 `-v` 那样自动创建缺失的宿主目录，
+        源路径不存在会直接 `docker run` 失败。所以这里默认先 `mkdir -p`。
+
+        Args:
+            source:        宿主侧源目录（可为相对路径，以项目根为基准）
+            target:        容器内目标路径
+            read_only:     True → 追加 `readonly`（技能目录必须为 True）
+            ensure_exists: 是否先创建宿主源目录；测试纯格式时可传 False
+
+        Returns:
+            docker 参数片段，形如 ["--mount", "type=bind,src=/mnt/e/x,dst=/mnt/skills,readonly"]
+        """
+        host = self._resolve_mount_source(source)
+        if ensure_exists:
+            Path(host).mkdir(parents=True, exist_ok=True)
+        spec = f"type=bind,src={self._to_docker_host_path(host)},dst={target}"
+        if read_only:
+            spec += ",readonly"
+        return ["--mount", spec]
+
+    def _skills_mount_args(self) -> list[str]:
+        """生成技能目录的挂载参数（只读，全线程共享同一份宿主目录）。
+
+        挂载源是整个 skills 根（不是 skills/public），容器内因此得到
+        `/mnt/skills/public/<name>/...` —— 与参考实现 DeerFlow 的路径约定完全一致，
+        于是 DeerFlow 技能正文里硬编码的
+        `/mnt/skills/public/<name>/scripts/xxx.py` **无需改写**即可直接工作。
+
+        开销说明：bind mount 只是让容器看到宿主同一份目录的引用，**不复制数据**，
+        所以「每个容器都挂」与「所有线程共享」在磁盘/内存开销上是同一件事；
+        真正贵的是 per-thread 容器本身（由 user-data 隔离需求决定，与技能无关）。
+        """
+        if not self.config.mount_skills:
+            return []
+        cfg = SkillsConfig()
+        root = cfg.resolve_skills_root()
+        if not root.is_dir():
+            logger.warning("技能目录不存在，本次不挂载技能: %s", root)
+            return []
+        return self._mount_args(
+            str(root), cfg.container_skills_dir(), read_only=True
+        )
 
     def _spawn_new(self, instance_id: str, *, host_workspace_dir: str | None) -> AioSandbox:
         """新建容器（容量闸门已放行）并注册到活跃。"""
@@ -260,13 +428,19 @@ class SandboxManager:
             "run", "-d", "--name", name,
             "-p", f"{self.config.bind_host}::{_CONTAINER_API_PORT}",
         ]
+        # 1. 线程工作区：可写，per-thread 隔离（容器与宿主是同一份文件）
         if host_workspace_dir:
-            run_args += ["-v", f"{host_workspace_dir}:{_CONTAINER_MOUNT_POINT}"]
+            run_args += self._mount_args(
+                host_workspace_dir, _CONTAINER_MOUNT_POINT, read_only=False
+            )
+        # 2. 技能目录：只读，全线程共享同一份宿主目录
+        run_args += self._skills_mount_args()
+        # 3. 配置里的额外挂载
         for m in self.config.mounts:
-            src = m.get("source") or m.get("src")
-            dst = m.get("target") or m.get("dest")
-            if src and dst:
-                run_args += ["-v", f"{src}:{dst}"]
+            if m.source and m.target:
+                run_args += self._mount_args(
+                    m.source, m.target, read_only=m.read_only
+                )
         for k, v in self.config.environment.items():
             run_args += ["-e", f"{k}={v}"]
         run_args += [self.config.image]

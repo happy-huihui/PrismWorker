@@ -1,64 +1,145 @@
+@import url("https://fonts.googleapis.com/css2?family=Fraunces:opsz,wght@9..144,500;9..144,600&family=Instrument+Sans:wght@400;500;600&family=Familjen+Grotesk:wght@500;600&family=Public+Sans:wght@400;500&family=Gabarito:wght@500;600&family=Figtree:wght@400;500&family=JetBrains+Mono:wght@400;500&family=IBM+Plex+Mono:wght@400&display=swap");
 @import "tailwindcss";
 
-@custom-variant dark (&:is(.dark *));
+/*
+  设计令牌层（theme）
+  ------------------------------------------------------------------
+  三套「背景」= 三套主题，直接复用 shadcn/Tailwind 的同一批令牌名
+  （--background/--foreground/--primary/--muted/--border/--ring/...），
+  用 html[data-bg="paper|glass|mist"] 切换；所有组件自动换肤，无需逐组件改色。
+  字体也走令牌（--font-sans/--font-display/--font-mono），随背景切换。
+  默认背景 = A 静谧纸感（:root 即 paper）。
+*/
 
-:root {
-  --radius: 0.625rem;
-  --background: oklch(1 0 0);
-  --foreground: oklch(0.145 0 0);
-  --card: oklch(1 0 0);
-  --card-foreground: oklch(0.145 0 0);
-  --popover: oklch(1 0 0);
-  --popover-foreground: oklch(0.145 0 0);
-  --primary: oklch(0.205 0 0);
-  --primary-foreground: oklch(0.985 0 0);
-  --secondary: oklch(0.97 0 0);
-  --secondary-foreground: oklch(0.205 0 0);
-  --muted: oklch(0.97 0 0);
-  --muted-foreground: oklch(0.556 0 0);
-  --accent: oklch(0.97 0 0);
-  --accent-foreground: oklch(0.205 0 0);
-  --destructive: oklch(0.577 0.245 27.325);
-  --destructive-foreground: oklch(0.985 0 0);
-  --success: oklch(0.627 0.194 149.214);
-  --success-foreground: oklch(0.985 0 0);
-  --border: oklch(0.922 0 0);
-  --input: oklch(0.922 0 0);
-  --ring: oklch(0.708 0 0);
-  --chart-1: oklch(0.646 0.222 41.116);
-  --chart-2: oklch(0.6 0.118 184.704);
-  --chart-3: oklch(0.398 0.07 227.392);
-  --chart-4: oklch(0.828 0.189 84.429);
-  --chart-5: oklch(0.769 0.188 70.08);
+/* ── A · 静谧纸感（暖中性，默认）── */
+:root,
+[data-bg="paper"] {
+  --font-sans: "Instrument Sans", ui-sans-serif, system-ui, sans-serif;
+  --font-display: "Fraunces", ui-serif, Georgia, serif;
+  --font-mono: "JetBrains Mono", ui-monospace, monospace;
+
+  --radius: 0.9rem;
+  --background: #f3efe7;
+  --foreground: #241f18;
+  --card: #faf7f1;
+  --card-foreground: #241f18;
+  --popover: #faf7f1;
+  --popover-foreground: #241f18;
+  --primary: #b4552d;
+  --primary-foreground: #fdf6ef;
+  --secondary: #efe7d8;
+  --secondary-foreground: #2a241c;
+  --muted: #efe9df;
+  --muted-foreground: #726b5f;
+  --accent: #efe7d8;
+  --accent-foreground: #2a241c;
+  --destructive: #b4342d;
+  --destructive-foreground: #fdf6ef;
+  --success: #4f7a4a;
+  --success-foreground: #f6f4ec;
+  --border: #e4ddce;
+  --input: #d8cfbc;
+  --ring: #b4552d;
+  /* 侧栏底色：比主背景深半度的「面板二」，对应模板 --panel-2 */
+  --sidebar: #f1ece2;
+
+  /* 顶部一抹极淡暖调氛围光，让大面积纯色不再生硬 */
+  --ambient: radial-gradient(
+    900px 420px at 50% -120px,
+    color-mix(in oklab, var(--primary) 8%, transparent),
+    transparent 70%
+  );
 }
 
-.dark {
-  --background: oklch(0.145 0 0);
-  --foreground: oklch(0.985 0 0);
-  --card: oklch(0.205 0 0);
-  --card-foreground: oklch(0.985 0 0);
-  --popover: oklch(0.205 0 0);
-  --popover-foreground: oklch(0.985 0 0);
-  --primary: oklch(0.922 0 0);
-  --primary-foreground: oklch(0.205 0 0);
-  --secondary: oklch(0.269 0 0);
-  --secondary-foreground: oklch(0.985 0 0);
-  --muted: oklch(0.269 0 0);
-  --muted-foreground: oklch(0.708 0 0);
-  --accent: oklch(0.269 0 0);
-  --accent-foreground: oklch(0.985 0 0);
-  --destructive: oklch(0.704 0.191 22.216);
-  --destructive-foreground: oklch(0.985 0 0);
-  --success: oklch(0.723 0.219 149.579);
-  --success-foreground: oklch(0.205 0 0);
-  --border: oklch(1 0 0 / 10%);
-  --input: oklch(1 0 0 / 15%);
-  --ring: oklch(0.556 0 0);
-  --chart-1: oklch(0.488 0.243 264.376);
-  --chart-2: oklch(0.696 0.17 162.48);
-  --chart-3: oklch(0.769 0.188 70.08);
-  --chart-4: oklch(0.627 0.265 303.9);
-  --chart-5: oklch(0.645 0.246 16.439);
+/* ── B · 深空玻璃（冷调，暗背景）── */
+[data-bg="glass"] {
+  --font-sans: "Public Sans", ui-sans-serif, system-ui, sans-serif;
+  --font-display: "Familjen Grotesk", ui-sans-serif, system-ui, sans-serif;
+  --font-mono: "JetBrains Mono", ui-monospace, monospace;
+
+  --radius: 1rem;
+  --background: #0a0d14;
+  --foreground: #e8edf5;
+  --card: #10151f;
+  --card-foreground: #e8edf5;
+  --popover: #10151f;
+  --popover-foreground: #e8edf5;
+  --primary: #3fd8c6;
+  --primary-foreground: #06110f;
+  --secondary: #16202c;
+  --secondary-foreground: #e8edf5;
+  --muted: #131b26;
+  --muted-foreground: #8a94a6;
+  --accent: #16202c;
+  --accent-foreground: #e8edf5;
+  --destructive: #ff6b6b;
+  --destructive-foreground: #1a0b0b;
+  --success: #46d39c;
+  --success-foreground: #06140f;
+  --border: rgba(255, 255, 255, 0.09);
+  --input: rgba(255, 255, 255, 0.14);
+  --ring: #3fd8c6;
+  /* 侧栏底色：模板 --panel-2（近透明白） */
+  --sidebar: rgba(255, 255, 255, 0.03);
+
+  --ambient: radial-gradient(
+      700px 400px at 15% -10%,
+      color-mix(in oklab, var(--primary) 14%, transparent),
+      transparent 60%
+    ),
+    radial-gradient(
+      700px 420px at 100% 0%,
+      color-mix(in oklab, #6ea8ff 14%, transparent),
+      transparent 60%
+    );
+}
+
+/* ── C · 柔和雾彩（低饱和渐变，浅色）── */
+[data-bg="mist"] {
+  --font-sans: "Figtree", ui-sans-serif, system-ui, sans-serif;
+  --font-display: "Gabarito", ui-sans-serif, system-ui, sans-serif;
+  --font-mono: "IBM Plex Mono", ui-monospace, monospace;
+
+  --radius: 1.15rem;
+  --background: #fbf6f2;
+  --foreground: #2a2833;
+  --card: #ffffff;
+  --card-foreground: #2a2833;
+  --popover: #ffffff;
+  --popover-foreground: #2a2833;
+  --primary: #e8795a;
+  --primary-foreground: #ffffff;
+  --secondary: #eef3f1;
+  --secondary-foreground: #2a2833;
+  --muted: #f0efe9;
+  --muted-foreground: #6c6a79;
+  --accent: #f3ece7;
+  --accent-foreground: #2a2833;
+  --destructive: #d9534f;
+  --destructive-foreground: #ffffff;
+  --success: #3f9d76;
+  --success-foreground: #ffffff;
+  --border: rgba(20, 20, 40, 0.08);
+  --input: rgba(20, 20, 40, 0.12);
+  --ring: #e8795a;
+  /* 侧栏底色：模板 --panel-2（半透明白，配模糊形成雾面） */
+  --sidebar: rgba(255, 255, 255, 0.55);
+
+  --ambient: radial-gradient(
+      40% 40% at 15% 8%,
+      color-mix(in oklab, #ff9c6e 30%, transparent),
+      transparent 60%
+    ),
+    radial-gradient(
+      45% 45% at 90% 18%,
+      color-mix(in oklab, #86c8ff 28%, transparent),
+      transparent 60%
+    ),
+    radial-gradient(
+      40% 40% at 60% 100%,
+      color-mix(in oklab, #93e6b0 26%, transparent),
+      transparent 60%
+    );
 }
 
 @theme inline {
@@ -83,21 +164,40 @@
   --color-border: var(--border);
   --color-input: var(--input);
   --color-ring: var(--ring);
-  --color-chart-1: var(--chart-1);
-  --color-chart-2: var(--chart-2);
-  --color-chart-3: var(--chart-3);
-  --color-chart-4: var(--chart-4);
-  --color-chart-5: var(--chart-5);
+  --color-sidebar: var(--sidebar);
+
+  --font-sans: var(--font-sans);
+  --font-display: var(--font-display);
+  --font-mono: var(--font-mono);
+
   --radius-sm: calc(var(--radius) - 4px);
   --radius-md: calc(var(--radius) - 2px);
   --radius-lg: var(--radius);
   --radius-xl: calc(var(--radius) + 4px);
-}
 
-@theme {
   --animate-step-in: step-in 0.15s ease-out;
   --animate-message-in: message-in 0.28s cubic-bezier(0.16, 1, 0.3, 1);
   --animate-fade-in: fade-in 0.2s ease-out;
+  --animate-shake: shake 0.3s ease-out;
+}
+
+/* 错误提示轻抖：像纸被轻敲一下（登录弹窗用） */
+@keyframes shake {
+  0%, 100% {
+    transform: translateX(0);
+  }
+  20% {
+    transform: translateX(-4px);
+  }
+  40% {
+    transform: translateX(4px);
+  }
+  60% {
+    transform: translateX(-3px);
+  }
+  80% {
+    transform: translateX(2px);
+  }
 }
 
 @keyframes step-in {
@@ -110,7 +210,6 @@
     transform: translateY(0);
   }
 }
-
 @keyframes message-in {
   from {
     opacity: 0;
@@ -121,7 +220,6 @@
     transform: translateY(0);
   }
 }
-
 @keyframes fade-in {
   from {
     opacity: 0;
@@ -134,7 +232,7 @@
 /* 细滚动条：全局统一，视觉更干净 */
 * {
   scrollbar-width: thin;
-  scrollbar-color: color-mix(in oklch, var(--border) 80%, transparent) transparent;
+  scrollbar-color: color-mix(in oklab, var(--border) 80%, transparent) transparent;
 }
 *::-webkit-scrollbar {
   width: 8px;
@@ -144,30 +242,27 @@
   background: transparent;
 }
 *::-webkit-scrollbar-thumb {
-  background: color-mix(in oklch, var(--border) 90%, transparent);
+  background: color-mix(in oklab, var(--border) 90%, transparent);
   border-radius: 9999px;
 }
 *::-webkit-scrollbar-thumb:hover {
-  background: color-mix(in oklch, var(--ring) 60%, var(--border));
+  background: color-mix(in oklab, var(--ring) 60%, var(--border));
 }
-
-/* 选中文本：与主题更统一的强调色 */
 ::selection {
-  background: color-mix(in oklch, var(--ring) 25%, transparent);
+  background: color-mix(in oklab, var(--ring) 25%, transparent);
 }
 
 @layer base {
   * {
     @apply border-border outline-ring/50;
   }
+  html {
+    font-family: var(--font-sans);
+  }
   body {
     @apply bg-background text-foreground antialiased;
-    /* 顶部一抹极淡的氛围光，让大面积纯色不再生硬 */
-    background-image: radial-gradient(
-      900px 420px at 50% -80px,
-      color-mix(in oklch, var(--primary) 4%, transparent),
-      transparent 70%
-    );
+    background-image: var(--ambient);
     background-repeat: no-repeat;
+    background-attachment: fixed;
   }
 }

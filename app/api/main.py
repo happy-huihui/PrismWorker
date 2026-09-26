@@ -5,12 +5,16 @@ create_app() 工厂模式：构建 FastAPI 实例、挂载路由、注册 lifesp
 单例；测试可注入隔离实例（thread_store / run_service / event_bus）做无
 副作用冒烟。
 
+启动预热：lifespan 里后台先造一次激活模型（模型客户端构造实测要几秒，
+Windows 上尤慢），把它存进工厂缓存，避免第一条会话替全进程买单。
+
 启动方式（开发）：
     uvicorn app.api.main:app --reload
 """
 
 from __future__ import annotations
 
+import asyncio
 import logging
 from contextlib import asynccontextmanager
 from typing import Any
@@ -24,6 +28,17 @@ from app.api.deps import get_thread_store as get_thread_store_dep
 from app.api.deps import get_checkpoint_db_path as get_checkpoint_db_path_dep
 
 logger = logging.getLogger(__name__)
+
+
+def _warm_active_model() -> None:
+    """构造一次激活模型并落入工厂缓存（预热用，失败只记日志）。"""
+    try:
+        from harness.models.factory import create_chat_model
+
+        create_chat_model()
+        logger.info("模型预热完成（默认模型客户端已缓存）")
+    except Exception as exc:  # noqa: BLE001 —— 预热失败不阻断启动，首 run 自己再建
+        logger.warning("模型预热失败（忽略，首次运行时重建）: %s", exc)
 
 
 def create_app(
@@ -47,7 +62,10 @@ def create_app(
 
             svc = get_run_service()
         await svc.start()
+        # 后台预热模型客户端：构造要几秒，不能卡住启动，也不能让首条会话等
+        warm_task = asyncio.create_task(asyncio.to_thread(_warm_active_model))
         yield
+        warm_task.cancel()
         await svc.close()
         # 优雅关闭：排空记忆防抖队列（避免重启丢失防抖缓冲中的待提取更新）
         try:
@@ -97,7 +115,9 @@ def create_app(
     from app.api.routes import messages as messages_router
     from app.api.routes import uploads as uploads_router
     from app.api.routes import artifacts as artifacts_router
+    from app.api.routes import auth as auth_router
 
+    app.include_router(auth_router.router)  # 登录/自查：唯一免 token 的业务入口
     app.include_router(threads_router.router)
     app.include_router(runs_router.router)
     app.include_router(models_router.router)

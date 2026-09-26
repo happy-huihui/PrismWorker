@@ -13,7 +13,7 @@ from langchain_core.messages import AIMessage, RemoveMessage, SystemMessage
 ModelRequest = types.ModelRequest
 
 """
-    流程控制中间件（flow_control）——四项最小护栏合集。
+    流程控制中间件（flow_control）——三项最小护栏合集。
 
     LoopDetectionMiddleware（循环检测）：
       检测模型反复调用同一个工具 + 相同参数（签名指纹相同）。最近窗口中
@@ -30,17 +30,15 @@ ModelRequest = types.ModelRequest
       排在最前的一条（同 id 覆盖 + RemoveMessage 删除其余），保持上下文
       干净。summary 消息（name == "summary"）不参与合并。
 
-    SafetyFinishReasonMiddleware（安全结束信号）：
-      模型明确表达"任务已完成"（response_metadata.finish_reason == "stop"
-      且无待执行工具调用；或正文含 <finish/> / DONE 标记）时，向 prints 写
-      一条"模型已结束当前回答"的进度消息，供前端收尾。
+    已移除：SafetyFinishReasonMiddleware（“模型已完成本轮输出”进度行）——
+      它唯一作用是往 prints 写一行内部信号，而“本轮结束”已由 run 终端事件
+      （run_finished）承担，留在思考链里只是噪声。
 """
 
 logger = logging.getLogger(__name__)
 
 _DEFAULT_MIN_REPEAT = 3
 _LOOP_WINDOW = 8
-_FINISH_MARKER_RE_PATTERN = r"<\s*finish\s*/?>\s*$|DONE\s*$"
 _DANGLING_HINT = (
     "提示：以下工具调用缺少对应的执行结果，不会生效：{names}。"
     "请不要依赖它们，重新发起完整调用或改用其它方法。"
@@ -148,32 +146,6 @@ class SystemMessageCoalescingMiddleware(AgentMiddleware):
 
 
 
-class SafetyFinishReasonMiddleware(AgentMiddleware):
-    """安全结束信号中间件：模型明确完成后写一条收尾进度消息。"""
-
-    async def aafter_model(
-        self, state: Any, runtime: Any  # type: ignore[override]
-    ) -> dict[str, Any] | None:
-        """模型调用后：检测完成信号并写进度。"""
-        messages = (state or {}).get("messages") or []
-        latest_ai = None
-        for message in reversed(messages):
-            if message is not None and getattr(message, "type", "") == "ai":
-                latest_ai = message
-                break
-        if latest_ai is None:
-            return None
-
-        reason = _finish_reason_of(latest_ai)
-        text = _extract_text(latest_ai)
-        has_finish_marker = _has_finish_marker(text)
-        has_pending_calls = bool(getattr(latest_ai, "tool_calls", None))
-        if not (has_finish_marker or (reason == "stop" and not has_pending_calls)):
-            return None
-        return {"prints": ["模型已完成本轮输出，等待下一步指令"]}
-
-
-
 def _tool_call_signature(call: dict[str, Any]) -> str:
     """把一条 tool_call 折叠成签名指纹（name + 确定性 JSON args）。"""
     try:
@@ -242,26 +214,6 @@ def _find_dangling_calls(state: Any) -> list[str]:
             if name and name not in dangling:
                 dangling.append(name)
     return dangling
-
-
-def _finish_reason_of(message: AIMessage) -> str:
-    """提取 AI 消息的 finish_reason（兼容不同供应商的响应元数据）。"""
-    metadata = getattr(message, "response_metadata", None) or {}
-    finish_reason = metadata.get("finish_reason")
-    if not finish_reason:
-        choices = metadata.get("choices")
-        if isinstance(choices, list) and choices:
-            finish_reason = (choices[0] or {}).get("finish_reason")
-    return str(finish_reason or "")
-
-
-def _has_finish_marker(text: str) -> bool:
-    """判断文本是否以完成标记结尾（<finish/> / DONE）。"""
-    if not text:
-        return False
-    import re
-
-    return bool(re.search(_FINISH_MARKER_RE_PATTERN, text.strip(), re.IGNORECASE))
 
 
 def _extract_text(message_or_response: Any) -> str:

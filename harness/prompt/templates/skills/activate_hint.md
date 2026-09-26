@@ -1,0 +1,1 @@
+如需使用技能，请在回复中包含：<activate_skill name="技能名" />

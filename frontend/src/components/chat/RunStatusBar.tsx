@@ -1,5 +1,6 @@
-import { AlertCircle, CheckCircle2, XCircle } from 'lucide-react'
+import { AlertCircle, CheckCircle2, XCircle } from '@/components/icons'
 
+import { formatDuration } from '@/lib/format'
 import { type RunStreamStatus } from '@/core/runs/useRunStream'
 
 interface RunStatusBarProps {
@@ -10,15 +11,11 @@ interface RunStatusBarProps {
   finishedAt: number | null
 }
 
-function fmtDuration(startedAt: number | null, finishedAt: number | null): string | null {
-  if (startedAt == null || finishedAt == null) return null
-  const d = Math.max(0, finishedAt - startedAt)
-  return d < 60 ? `${d.toFixed(1)} 秒` : `${Math.floor(d / 60)} 分 ${(d % 60).toFixed(0)} 秒`
-}
-
 export function RunStatusBar({ status, messageCount, error, startedAt, finishedAt }: RunStatusBarProps) {
   if (status === 'finished') {
-    const dur = fmtDuration(startedAt, finishedAt)
+    const dur = formatDuration(
+      startedAt != null && finishedAt != null ? Math.max(0, finishedAt - startedAt) : null,
+    )
     return (
       <div className="my-1 flex items-center gap-1.5 text-xs text-emerald-600 dark:text-emerald-400">
         <CheckCircle2 className="size-3.5 shrink-0" />

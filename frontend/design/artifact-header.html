@@ -1,0 +1,283 @@
+<!DOCTYPE html>
+<html lang="zh-CN" data-bg="paper">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>产物顶栏重设计 · 静态模板</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link href="https://fonts.googleapis.com/css2?family=Fraunces:opsz,wght@9..144,500;9..144,600&family=Instrument+Sans:wght@400;500;600&family=Familjen+Grotesk:wght@500;600&family=Public+Sans:wght@400;500;600&family=Gabarito:wght@500;600&family=Figtree:wght@400;500;600&family=JetBrains+Mono:wght@400;500&family=IBM+Plex+Mono:wght@400;500&display=swap" rel="stylesheet">
+<style>
+/* ── 三套主题：与 src/index.css 逐字对齐 ─────────────────────── */
+.t-paper{
+  --font-sans:"Instrument Sans",ui-sans-serif,system-ui,sans-serif;
+  --font-display:"Fraunces",ui-serif,Georgia,serif;
+  --font-mono:"JetBrains Mono",ui-monospace,monospace;
+  --radius:0.9rem;
+  --background:#f3efe7; --foreground:#241f18; --card:#faf7f1;
+  --primary:#b4552d; --primary-foreground:#fdf6ef;
+  --secondary:#efe7d8; --muted:#efe9df; --muted-foreground:#726b5f;
+  --accent:#efe7d8; --accent-foreground:#2a241c;
+  --border:#e4ddce; --sidebar:#f1ece2;
+}
+.t-glass{
+  --font-sans:"Public Sans",ui-sans-serif,system-ui,sans-serif;
+  --font-display:"Familjen Grotesk",ui-sans-serif,system-ui,sans-serif;
+  --font-mono:"JetBrains Mono",ui-monospace,monospace;
+  --radius:1rem;
+  --background:#0a0d14; --foreground:#e8edf5; --card:#10151f;
+  --primary:#3fd8c6; --primary-foreground:#06110f;
+  --secondary:#16202c; --muted:#131b26; --muted-foreground:#8a94a6;
+  --accent:#16202c; --accent-foreground:#e8edf5;
+  --border:rgba(255,255,255,.09); --sidebar:rgba(255,255,255,.03);
+}
+.t-mist{
+  --font-sans:"Figtree",ui-sans-serif,system-ui,sans-serif;
+  --font-display:"Gabarito",ui-sans-serif,system-ui,sans-serif;
+  --font-mono:"IBM Plex Mono",ui-monospace,monospace;
+  --radius:1.15rem;
+  --background:#fbf6f2; --foreground:#2a2833; --card:#ffffff;
+  --primary:#e8795a; --primary-foreground:#ffffff;
+  --secondary:#eef3f1; --muted:#f0efe9; --muted-foreground:#6c6a79;
+  --accent:#f3ece7; --accent-foreground:#2a2833;
+  --border:rgba(20,20,40,.08); --sidebar:rgba(255,255,255,.55);
+}
+
+*{box-sizing:border-box}
+body{margin:0;background:#e9e4d8;font-family:"Instrument Sans",system-ui,sans-serif;color:#241f18}
+.wrap{max-width:1120px;margin:0 auto;padding:40px 24px 80px}
+h1{font-family:"Fraunces",serif;font-size:28px;font-weight:600;margin:0 0 6px;letter-spacing:-.01em}
+.sub{color:#6b6459;font-size:14px;margin:0 0 34px;line-height:1.7}
+.sec{margin-bottom:46px}
+.sec>h2{font-size:15px;font-weight:600;margin:0 0 4px;letter-spacing:.01em}
+.sec>p{font-size:13px;color:#6b6459;margin:0 0 14px;line-height:1.7}
+.badge{display:inline-block;font-size:11px;padding:2px 8px;border-radius:99px;background:#b4552d18;color:#b4552d;font-weight:600;vertical-align:2px;margin-left:6px}
+.grid2{display:grid;grid-template-columns:1fr 1fr;gap:20px}
+@media(max-width:900px){.grid2{grid-template-columns:1fr}}
+
+/* ── 面板容器：模拟侧栏 ─────────────────────────────────────── */
+.panel{border-radius:18px;overflow:hidden;border:1px solid var(--border);background:var(--background);box-shadow:0 10px 30px -18px rgba(40,30,10,.25)}
+.stage{height:190px;background:
+  linear-gradient(120deg,#6d8ef7,#8b6ef0 55%,#a56ef0);
+  position:relative;overflow:hidden}
+.stage::after{content:"";position:absolute;inset:0;background:radial-gradient(120% 80% at 20% 0%,rgba(255,255,255,.35),transparent 55%)}
+.stage .mock-title{position:absolute;left:20px;top:18px;color:#fff;font-weight:600;font-size:15px;letter-spacing:.02em;opacity:.92}
+
+/* ── 顶栏通用 ──────────────────────────────────────────────── */
+.hd{height:60px;display:flex;align-items:center;gap:10px;padding:0 12px 0 14px;background:var(--card);border-bottom:1px solid var(--border);position:relative}
+.hd::after{content:"";position:absolute;inset:0;pointer-events:none;background:radial-gradient(120% 140% at 50% -60%,color-mix(in oklab,var(--primary) 5%,transparent),transparent 60%)}
+
+/* 文件 chip（左） */
+.file{display:flex;align-items:center;gap:9px;min-width:0;padding:5px 8px 5px 6px;border-radius:11px;cursor:pointer;transition:background .15s}
+.file:hover{background:color-mix(in oklab,var(--foreground) 5%,transparent)}
+.ficon{width:30px;height:30px;border-radius:9px;display:grid;place-items:center;flex-shrink:0;
+  background:color-mix(in oklab,var(--primary) 12%,transparent);color:var(--primary)}
+.fname{font-size:15px;font-weight:500;white-space:nowrap;overflow:hidden;text-overflow:ellipsis;max-width:180px}
+.chev{color:var(--muted-foreground);flex-shrink:0;margin-left:-2px}
+.file:hover .chev{color:var(--foreground)}
+
+/* 分段控件（中） */
+.seg{display:flex;align-items:center;gap:2px;padding:3px;border-radius:99px;border:1px solid var(--border);background:color-mix(in oklab,var(--muted) 55%,transparent)}
+.seg button{display:flex;align-items:center;gap:6px;height:30px;padding:0 12px;border:0;border-radius:99px;background:transparent;color:var(--muted-foreground);font-family:inherit;font-size:13px;font-weight:500;cursor:pointer;transition:all .16s ease}
+.seg button.on{background:var(--primary);color:var(--primary-foreground);box-shadow:0 1px 3px color-mix(in oklab,var(--primary) 35%,transparent)}
+.seg.soft button.on{background:var(--card);color:var(--foreground);box-shadow:0 1px 4px rgba(30,20,5,.14);border:1px solid var(--border)}
+.seg button:not(.on):hover{color:var(--foreground)}
+.hd .seg.center{position:absolute;left:50%;transform:translateX(-50%)}
+.seg.right{margin-left:auto}
+
+/* 操作按钮（右） */
+.acts{display:flex;align-items:center;gap:2px;margin-left:auto}
+.seg.center~.acts,.seg.right~.acts{margin-left:0}
+.ibtn{width:34px;height:34px;border-radius:10px;border:0;background:transparent;color:var(--muted-foreground);display:grid;place-items:center;cursor:pointer;transition:all .15s}
+.ibtn:hover{background:color-mix(in oklab,var(--foreground) 6%,transparent);color:var(--foreground)}
+.divider{width:1px;height:20px;background:var(--border);margin:0 6px;flex-shrink:0}
+.close{margin-left:0}
+
+svg{display:block}
+svg.ic{width:17px;height:17px;stroke:currentColor;fill:none;stroke-width:1.9;stroke-linecap:round;stroke-linejoin:round}
+svg.ic.sm{width:15px;height:15px}
+
+/* 窄面板演示 */
+.narrow{max-width:380px;margin:0 auto}
+
+/* 耗时对比 */
+.dur{display:flex;flex-direction:column;gap:10px}
+.dur .row{display:flex;align-items:center;gap:12px;padding:12px 16px;border-radius:14px;background:var(--card);border:1px solid var(--border);font-family:var(--font-mono);font-size:13px}
+.dur .tag{font-family:"Instrument Sans",sans-serif;font-size:11px;font-weight:600;padding:2px 8px;border-radius:99px;flex-shrink:0;width:44px;text-align:center}
+.dur .old-tag{background:#f2e3e1;color:#a4453f}
+.dur .new-tag{background:#e5efdd;color:#4a713f}
+.dur .old{color:#a4453f;text-decoration:line-through;text-decoration-thickness:1px;opacity:.75}
+.dur .new{color:var(--foreground);font-weight:500}
+.note{font-size:12.5px;color:#8a8272;line-height:1.8;margin:10px 0 0;padding:12px 16px;border-radius:12px;background:#00000006}
+</style>
+</head>
+<body>
+<div class="wrap">
+  <h1>产物顶栏重设计 · 4 个方案</h1>
+  <p class="sub">三套皮肤用的是项目里<b>逐字一致</b>的设计令牌（paper 静谧纸感 / glass 深空玻璃 / mist 柔和雾彩），字体也随皮肤走——所以这里看到什么，落到项目里就是什么。<br>三处统一改法：顶栏加高到 60px、文件名 15px、分段控件带上文字标签、操作按钮 34px 且加了悬停反馈。</p>
+
+  <!-- ═══ 方案 A ═══ -->
+  <div class="sec">
+    <h2>方案 A · 分段控件居中 <span class="badge">✅ 已定稿落地</span></h2>
+    <p>左侧文件、中间「代码 / 预览」分段控件（带文字，不用猜图标）、右侧操作组 + 细分隔线隔开关闭。三段各管一摊，视线不用来回找。</p>
+    <div class="panel t-paper">
+      <div class="hd">
+        <div class="file">
+          <span class="ficon"><svg class="ic" viewBox="0 0 24 24"><circle cx="12" cy="12" r="10"/><path d="M12 2a14.5 14.5 0 0 0 0 20 14.5 14.5 0 0 0 0-20"/><path d="M2 12h20"/></svg></span>
+          <span class="fname">index.html</span>
+          <svg class="ic sm chev" viewBox="0 0 24 24"><path d="m6 9 6 6 6-6"/></svg>
+        </div>
+        <div class="seg center">
+          <button class="on"><svg class="ic sm" viewBox="0 0 24 24"><polyline points="16 18 22 12 16 6"/><polyline points="8 6 2 12 8 18"/></svg>代码</button>
+          <button><svg class="ic sm" viewBox="0 0 24 24"><path d="M2 12s3.5-7 10-7 10 7 10 7-3.5 7-10 7-10-7-10-7Z"/><circle cx="12" cy="12" r="3"/></svg>预览</button>
+        </div>
+        <div class="acts">
+          <button class="ibtn" title="在新标签页打开"><svg class="ic" viewBox="0 0 24 24"><path d="M15 3h6v6"/><path d="M10 14 21 3"/><path d="M18 13v6a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2V8a2 2 0 0 1 2-2h6"/></svg></button>
+          <button class="ibtn" title="复制内容"><svg class="ic" viewBox="0 0 24 24"><rect width="14" height="14" x="8" y="8" rx="2"/><path d="M4 16c-1.1 0-2-.9-2-2V4c0-1.1.9-2 2-2h10c1.1 0 2 .9 2 2"/></svg></button>
+          <button class="ibtn" title="下载"><svg class="ic" viewBox="0 0 24 24"><path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4"/><polyline points="7 10 12 15 17 10"/><line x1="12" x2="12" y1="15" y2="3"/></svg></button>
+          <span class="divider"></span>
+          <button class="ibtn close" title="收起"><svg class="ic" viewBox="0 0 24 24"><path d="M18 6 6 18"/><path d="m6 6 12 12"/></svg></button>
+        </div>
+      </div>
+      <div class="stage"><span class="mock-title">苏超联赛 · 预览区</span></div>
+    </div>
+    <p class="note">↳ 已按此落地到 <b>ArtifactSidePanel / ArtifactFileActions / ArtifactSwitcher</b>。实际实现里分段控件在右侧（随文件 chip + 操作组自适应），不是硬居中——窄面板更稳；其余视觉与本方案一致。</p>
+  </div>
+
+  <!-- ═══ 三皮肤 ═══ -->
+  <div class="sec">
+    <h2>方案 A 在另外两套皮肤下</h2>
+    <p>同一套结构，颜色 / 字体完全随令牌走——深色下激活态是青色填充，mist 下是珊瑚橘。</p>
+    <div class="grid2">
+      <div class="panel t-glass">
+        <div class="hd">
+          <div class="file">
+            <span class="ficon"><svg class="ic" viewBox="0 0 24 24"><circle cx="12" cy="12" r="10"/><path d="M12 2a14.5 14.5 0 0 0 0 20 14.5 14.5 0 0 0 0-20"/><path d="M2 12h20"/></svg></span>
+            <span class="fname">index.html</span>
+            <svg class="ic sm chev" viewBox="0 0 24 24"><path d="m6 9 6 6 6-6"/></svg>
+          </div>
+          <div class="seg center">
+            <button class="on"><svg class="ic sm" viewBox="0 0 24 24"><polyline points="16 18 22 12 16 6"/><polyline points="8 6 2 12 8 18"/></svg>代码</button>
+            <button><svg class="ic sm" viewBox="0 0 24 24"><path d="M2 12s3.5-7 10-7 10 7 10 7-3.5 7-10 7-10-7-10-7Z"/><circle cx="12" cy="12" r="3"/></svg>预览</button>
+          </div>
+          <div class="acts">
+            <button class="ibtn"><svg class="ic" viewBox="0 0 24 24"><path d="M15 3h6v6"/><path d="M10 14 21 3"/><path d="M18 13v6a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2V8a2 2 0 0 1 2-2h6"/></svg></button>
+            <button class="ibtn"><svg class="ic" viewBox="0 0 24 24"><rect width="14" height="14" x="8" y="8" rx="2"/><path d="M4 16c-1.1 0-2-.9-2-2V4c0-1.1.9-2 2-2h10c1.1 0 2 .9 2 2"/></svg></button>
+            <button class="ibtn"><svg class="ic" viewBox="0 0 24 24"><path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4"/><polyline points="7 10 12 15 17 10"/><line x1="12" x2="12" y1="15" y2="3"/></svg></button>
+            <span class="divider"></span>
+            <button class="ibtn close"><svg class="ic" viewBox="0 0 24 24"><path d="M18 6 6 18"/><path d="m6 6 12 12"/></svg></button>
+          </div>
+        </div>
+        <div class="stage" style="background:linear-gradient(120deg,#0e2a3a,#123c4a 60%,#0f5150)"><span class="mock-title">glass · 深空玻璃</span></div>
+      </div>
+      <div class="panel t-mist">
+        <div class="hd">
+          <div class="file">
+            <span class="ficon"><svg class="ic" viewBox="0 0 24 24"><circle cx="12" cy="12" r="10"/><path d="M12 2a14.5 14.5 0 0 0 0 20 14.5 14.5 0 0 0 0-20"/><path d="M2 12h20"/></svg></span>
+            <span class="fname">index.html</span>
+            <svg class="ic sm chev" viewBox="0 0 24 24"><path d="m6 9 6 6 6-6"/></svg>
+          </div>
+          <div class="seg center">
+            <button class="on"><svg class="ic sm" viewBox="0 0 24 24"><polyline points="16 18 22 12 16 6"/><polyline points="8 6 2 12 8 18"/></svg>代码</button>
+            <button><svg class="ic sm" viewBox="0 0 24 24"><path d="M2 12s3.5-7 10-7 10 7 10 7-3.5 7-10 7-10-7-10-7Z"/><circle cx="12" cy="12" r="3"/></svg>预览</button>
+          </div>
+          <div class="acts">
+            <button class="ibtn"><svg class="ic" viewBox="0 0 24 24"><path d="M15 3h6v6"/><path d="M10 14 21 3"/><path d="M18 13v6a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2V8a2 2 0 0 1 2-2h6"/></svg></button>
+            <button class="ibtn"><svg class="ic" viewBox="0 0 24 24"><rect width="14" height="14" x="8" y="8" rx="2"/><path d="M4 16c-1.1 0-2-.9-2-2V4c0-1.1.9-2 2-2h10c1.1 0 2 .9 2 2"/></svg></button>
+            <button class="ibtn"><svg class="ic" viewBox="0 0 24 24"><path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4"/><polyline points="7 10 12 15 17 10"/><line x1="12" x2="12" y1="15" y2="3"/></svg></button>
+            <span class="divider"></span>
+            <button class="ibtn close"><svg class="ic" viewBox="0 0 24 24"><path d="M18 6 6 18"/><path d="m6 6 12 12"/></svg></button>
+          </div>
+        </div>
+        <div class="stage" style="background:linear-gradient(120deg,#f7c9a8,#f2a98c 55%,#e79ab0)"><span class="mock-title" style="color:#7a4a3a">mist · 柔和雾彩</span></div>
+      </div>
+    </div>
+  </div>
+
+  <!-- ═══ 方案 A2 ═══ -->
+  <div class="sec">
+    <h2>方案 A2 · 激活态柔化 <span class="badge">同结构，只换激活样式</span></h2>
+    <p>分段控件激活态不用主色填充，改成「卡片浮起」：白底 + 细边 + 投影，安静不少，也更有纸感。其余与 A 完全一致。</p>
+    <div class="panel t-paper">
+      <div class="hd">
+        <div class="file">
+          <span class="ficon"><svg class="ic" viewBox="0 0 24 24"><circle cx="12" cy="12" r="10"/><path d="M12 2a14.5 14.5 0 0 0 0 20 14.5 14.5 0 0 0 0-20"/><path d="M2 12h20"/></svg></span>
+          <span class="fname">index.html</span>
+          <svg class="ic sm chev" viewBox="0 0 24 24"><path d="m6 9 6 6 6-6"/></svg>
+        </div>
+        <div class="seg soft center">
+          <button><svg class="ic sm" viewBox="0 0 24 24"><polyline points="16 18 22 12 16 6"/><polyline points="8 6 2 12 8 18"/></svg>代码</button>
+          <button class="on"><svg class="ic sm" viewBox="0 0 24 24"><path d="M2 12s3.5-7 10-7 10 7 10 7-3.5 7-10 7-10-7-10-7Z"/><circle cx="12" cy="12" r="3"/></svg>预览</button>
+        </div>
+        <div class="acts">
+          <button class="ibtn"><svg class="ic" viewBox="0 0 24 24"><path d="M15 3h6v6"/><path d="M10 14 21 3"/><path d="M18 13v6a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2V8a2 2 0 0 1 2-2h6"/></svg></button>
+          <button class="ibtn"><svg class="ic" viewBox="0 0 24 24"><rect width="14" height="14" x="8" y="8" rx="2"/><path d="M4 16c-1.1 0-2-.9-2-2V4c0-1.1.9-2 2-2h10c1.1 0 2 .9 2 2"/></svg></button>
+          <button class="ibtn"><svg class="ic" viewBox="0 0 24 24"><path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4"/><polyline points="7 10 12 15 17 10"/><line x1="12" x2="12" y1="15" y2="3"/></svg></button>
+          <span class="divider"></span>
+          <button class="ibtn close"><svg class="ic" viewBox="0 0 24 24"><path d="M18 6 6 18"/><path d="m6 6 12 12"/></svg></button>
+        </div>
+      </div>
+      <div class="stage"><span class="mock-title">预览态（预览为激活项）</span></div>
+    </div>
+  </div>
+
+  <!-- ═══ 方案 B / C ═══ -->
+  <div class="sec">
+    <h2>方案 B · 右置分段（窄面板友好） & 方案 C · 极简</h2>
+    <p>侧栏可拖到 360px 左右，居中分段在窄面板里会跟文件名打架 → B 把分段挪到右侧。C 则只保留图标分段、把次要操作收进「⋯」菜单（最省空间，但多一步点击）。</p>
+    <div class="grid2">
+      <div class="panel t-paper">
+        <div class="hd">
+          <div class="file">
+            <span class="ficon"><svg class="ic" viewBox="0 0 24 24"><circle cx="12" cy="12" r="10"/><path d="M12 2a14.5 14.5 0 0 0 0 20 14.5 14.5 0 0 0 0-20"/><path d="M2 12h20"/></svg></span>
+            <span class="fname">index.html</span>
+            <svg class="ic sm chev" viewBox="0 0 24 24"><path d="m6 9 6 6 6-6"/></svg>
+          </div>
+          <div class="seg right">
+            <button><svg class="ic sm" viewBox="0 0 24 24"><polyline points="16 18 22 12 16 6"/><polyline points="8 6 2 12 8 18"/></svg>代码</button>
+            <button class="on"><svg class="ic sm" viewBox="0 0 24 24"><path d="M2 12s3.5-7 10-7 10 7 10 7-3.5 7-10 7-10-7-10-7Z"/><circle cx="12" cy="12" r="3"/></svg>预览</button>
+          </div>
+          <div class="acts">
+            <button class="ibtn"><svg class="ic" viewBox="0 0 24 24"><path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4"/><polyline points="7 10 12 15 17 10"/><line x1="12" x2="12" y1="15" y2="3"/></svg></button>
+            <span class="divider"></span>
+            <button class="ibtn close"><svg class="ic" viewBox="0 0 24 24"><path d="M18 6 6 18"/><path d="m6 6 12 12"/></svg></button>
+          </div>
+        </div>
+        <div class="stage" style="height:120px"><span class="mock-title">B · 分段右置</span></div>
+      </div>
+      <div class="panel t-paper">
+        <div class="hd">
+          <div class="file">
+            <span class="ficon"><svg class="ic" viewBox="0 0 24 24"><circle cx="12" cy="12" r="10"/><path d="M12 2a14.5 14.5 0 0 0 0 20 14.5 14.5 0 0 0 0-20"/><path d="M2 12h20"/></svg></span>
+            <span class="fname">index.html</span>
+            <svg class="ic sm chev" viewBox="0 0 24 24"><path d="m6 9 6 6 6-6"/></svg>
+          </div>
+          <div class="acts" style="margin-left:auto">
+            <div class="seg" style="padding:2px">
+              <button class="on" style="width:32px;justify-content:center;padding:0"><svg class="ic sm" viewBox="0 0 24 24"><polyline points="16 18 22 12 16 6"/><polyline points="8 6 2 12 8 18"/></svg></button>
+              <button style="width:32px;justify-content:center;padding:0"><svg class="ic sm" viewBox="0 0 24 24"><path d="M2 12s3.5-7 10-7 10 7 10 7-3.5 7-10 7-10-7-10-7Z"/><circle cx="12" cy="12" r="3"/></svg></button>
+            </div>
+            <button class="ibtn"><svg class="ic" viewBox="0 0 24 24"><circle cx="12" cy="5" r="1"/><circle cx="12" cy="12" r="1"/><circle cx="12" cy="19" r="1"/></svg></button>
+          </div>
+        </div>
+        <div class="stage" style="height:120px"><span class="mock-title">C · 极简 + ⋯ 菜单</span></div>
+      </div>
+    </div>
+  </div>
+
+  <!-- ═══ 耗时 ═══ -->
+  <div class="sec">
+    <h2>耗时格式 · 已改好（代码已落地，这里给前后对照）</h2>
+    <div class="panel t-paper" style="padding:18px">
+      <div class="dur">
+        <div class="row"><span class="tag old-tag">旧</span><span class="old">耗时 1245s</span><span style="opacity:.4">→</span><span class="new">耗时 20 分 45 秒</span></div>
+        <div class="row"><span class="tag old-tag">旧</span><span class="old">思考中… (3725s)</span><span style="opacity:.4">→</span><span class="new">思考中…（1 小时 2 分 5 秒）</span></div>
+        <div class="row"><span class="tag new-tag">新</span><span class="new">3.2 秒</span><span style="color:#8a8272">不足 10 秒保留一位小数，能看出计时在动</span></div>
+      </div>
+      <p class="note">↳ 统一收敛到 <b>lib/format.ts 的 formatDuration()</b>：思考链头部（思考中/耗时）、运行完成状态条、工具步骤行三处共用；工具步骤行保留紧凑 mono 风格（0.5s / 2m3s），另补了小时段。</p>
+    </div>
+  </div>
+
+  <p class="sub" style="margin-bottom:0">— 选一个方案（或说「A 但激活态要 A2 的」这种组合都行），我就落到 ArtifactSidePanel / ArtifactFileActions 里。窄面板（拖到 360px）的表现我会在实现时一起处理。</p>
+</div>
+</body>
+</html>

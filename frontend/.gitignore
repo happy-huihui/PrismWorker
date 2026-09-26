@@ -10,6 +10,11 @@ lerna-debug.log*
 node_modules
 dist
 dist-ssr
+# 构建验证用的临时输出目录（清 dist/ 会被 safe-delete 拦，故用独立目录验证）
+# 用 dist-verify* 而非精确名：实测会并存 dist-verify、dist-verify-2 … dist-verify-7 多份，
+# 只写 `dist-verify` 会让 -2 以后的那些目录以未跟踪噪音形式挂在 git status 里。
+dist-verify*
+.verify-out*
 *.local
 
 # Editor directories and files

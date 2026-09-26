@@ -15,6 +15,7 @@ from typing import Any
         - MAX_INPUT_PREVIEW / MAX_MESSAGE_PREVIEW   预览截断长度
         - as_list                 state 通道值 → 列表（兼容 None/列表/元组/字符串）
         - extract_text_content    消息 content → 纯文本（兼容 str 与内容块列表）
+        - extract_reasoning_content  消息 → 模型真实思考文本（reasoning_content）
         - to_role                 LangChain 消息 type → API 角色名
         - strip_user_input_wrapper 去除防注入包裹标记，还原纯用户文本
         - messages_preview        取首条用户消息文本作为输入预览（截断）
@@ -23,6 +24,7 @@ from typing import Any
     输出数据示例：
         - extract_text_content("hi")                    -> "hi"
         - extract_text_content([{type:"text",text:"a"},{type:"text",text:"b"}]) -> "ab"
+        - extract_reasoning_content(chunk_with_reasoning)          -> "用户想要…"
         - to_role("human") / to_role("ai")              -> "user" / "assistant"
         - messages_preview([{type:"human",content:"帮我查天气…"}]) -> "帮我查天气…"(<=160 字)
 """
@@ -96,6 +98,53 @@ def extract_text_content(content: Any) -> str:
                     parts.append(text)
         return "".join(parts)
     return ""
+
+
+# 思考文本可能出现的内容块类型（各家 provider 命名不统一，见到就收）
+_REASONING_BLOCK_TYPES = ("reasoning", "thinking", "reasoning_content")
+
+
+def extract_reasoning_content(message: Any) -> str:
+    """从消息（含流式增量块）里抠出模型真实思考文本。
+
+    参数：
+        message: AIMessage / AIMessageChunk（None 或无思考返回空串）
+
+    返回：
+        思考文本片段（多个来源按 additional_kwargs 优先拼接）
+
+    说明：不同提供者的落点不一样——
+        - DeepSeek / OpenAI 兼容接口：langchain_deepseek 把流式里的
+          delta.reasoning_content 放进 additional_kwargs["reasoning_content"]，
+          每个块只是一个增量片段（不合并就会丢字）；
+        - Anthropic 等：思考以 content 里的 {type:"reasoning"/"thinking"} 块出现。
+        思考链不是可选装饰：没有它，前端的「思考过程」只能拿模型叙述凑数。
+    """
+    if message is None:
+        return ""
+    parts: list[str] = []
+    # 1.additional_kwargs 里的推理文本（字符串增量片段）
+    extra = getattr(message, "additional_kwargs", None)
+    if isinstance(extra, dict):
+        for key in ("reasoning_content", "reasoning"):
+            value = extra.get(key)
+            if isinstance(value, str) and value:
+                parts.append(value)
+                break
+    # 2.内容块形式的思考（type=reasoning/thinking，文本在 reasoning/text/thinking 字段）
+    content = getattr(message, "content", None)
+    if isinstance(content, list):
+        for block in content:
+            if not isinstance(block, dict):
+                continue
+            if block.get("type") not in _REASONING_BLOCK_TYPES:
+                continue
+            for key in ("reasoning", "text", "thinking"):
+                value = block.get(key)
+                if isinstance(value, str) and value:
+                    parts.append(value)
+                    break
+    return "".join(parts)
 
 
 def to_role(msg_type: str) -> str:

@@ -77,7 +77,12 @@ async def get_message_history(
         if tup is None:
             return []
         channel_values = tup.checkpoint.get("channel_values", {}) or {}
-        messages = channel_values.get("messages", []) or []
+        # 展示历史 = 压缩归档（被摘要中间件移除的早期消息原文）+ 当前上下文。
+        # messages 只服务模型上下文窗口，可能被 RemoveMessage 物理清理；
+        # archived_messages 只增不减，保证用户可见的对话历史完整。
+        archived = channel_values.get("archived_messages", []) or []
+        current = channel_values.get("messages", []) or []
+        messages = [*archived, *current]
         result: list[dict[str, Any]] = []
         # 只取最近 limit 条
         seq = messages[-limit:]

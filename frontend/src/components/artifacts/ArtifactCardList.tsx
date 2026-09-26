@@ -10,9 +10,10 @@ import {
   Loader2,
   PackageOpen,
   type LucideIcon,
-} from 'lucide-react'
+} from '@/components/icons'
 import { toast } from 'sonner'
 
+import { useArtifactsOptional } from '@/core/artifacts/context'
 import { artifactKind, downloadArtifact, virtualPathToFilename } from '@/core/artifacts/utils'
 
 const KIND_ICONS: Record<ReturnType<typeof artifactKind>, LucideIcon> = {
@@ -23,18 +24,39 @@ const KIND_ICONS: Record<ReturnType<typeof artifactKind>, LucideIcon> = {
   other: File,
 }
 
+/**
+ * 产物卡片列表（ArtifactCardList）
+ *
+ * 职责：在消息流底部列出本轮交付的产物，点击「预览」唤起右侧产物侧边栏。
+ *
+ * 为什么优先用 Context 而不是 props 传 onPreview：
+ *      本组件位于 MessageList → MessageBubble 深层子树，而侧边栏状态
+ *      属于页面级；继续透传 props 会让整条消息渲染链都背上这个参数。
+ *      因此这里先尝试 useArtifactsOptional()，拿不到时再回退到 onPreview
+ *      （欢迎页等未挂 Provider 的场景复用本组件时用得上）。
+ */
 interface ArtifactCardListProps {
   threadId: string
   /** 产物虚拟路径列表 */
   paths: string[]
-  /** 点击「预览」→ 打开抽屉 */
-  onPreview: (path: string) => void
+  /** 回退的预览回调（无 ArtifactsProvider 时使用） */
+  onPreview?: (path: string) => void
 }
 
 export function ArtifactCardList({ threadId, paths, onPreview }: ArtifactCardListProps) {
   const [downloading, setDownloading] = useState<string | null>(null)
+  const artifactsCtx = useArtifactsOptional()
 
   if (paths.length === 0) return null
+
+  /** 打开预览：优先走侧边栏 Context，其次回退到父级回调。 */
+  const openPreview = (path: string) => {
+    if (artifactsCtx) {
+      artifactsCtx.select(path)
+      return
+    }
+    onPreview?.(path)
+  }
 
   const handleDownload = async (path: string) => {
     if (downloading) return
@@ -78,7 +100,7 @@ export function ArtifactCardList({ threadId, paths, onPreview }: ArtifactCardLis
 
               <button
                 type="button"
-                onClick={() => onPreview(path)}
+                onClick={() => openPreview(path)}
                 className="flex shrink-0 items-center gap-1 rounded-md px-2 py-1 text-xs text-muted-foreground transition-colors hover:bg-muted hover:text-foreground"
                 title="预览"
               >

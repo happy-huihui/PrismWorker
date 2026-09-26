@@ -4,6 +4,11 @@ from typing import Any
 
 from langchain_deepseek import ChatDeepSeek
 
+from harness.models.reasoning import (
+    extract_message_text,
+    restore_reasoning_content,
+)
+
 """DeepSeek 模型实现类
 
     职责：放 DeepSeek 到底用哪几个模型类，以及“思考链丢失”问题的修复代码。
@@ -16,8 +21,23 @@ from langchain_deepseek import ChatDeepSeek
         - PatchedChatDeepSeek        Pro 用的修复基类
         - is_deepseek_pro_model      精确判断是不是 Pro（deepseek-v4-pro）
         - is_deepseek_flash_model    精确判断是不是 Flash（deepseek-v4-flash）
-        - restore_reasoning_content  把思考链塞回请求里
+
+    复用：思考链还原属通用能力，已抽到 harness.models.reasoning，
+         这里 re-export 保持既有导入路径可用。
 """
+
+# 兼容旧导入路径（内部实现已迁到 reasoning 模块）
+_extract_text = extract_message_text
+__all__ = [
+    "DEEPSEEK_FLASH_MODEL_ID",
+    "DEEPSEEK_PRO_MODEL_ID",
+    "DeepSeekFlashChatModel",
+    "DeepSeekProChatModel",
+    "PatchedChatDeepSeek",
+    "is_deepseek_pro_model",
+    "is_deepseek_flash_model",
+    "restore_reasoning_content",
+]
 
 # DeepSeek 模型
 DEEPSEEK_FLASH_MODEL_ID = "deepseek-v4-flash"
@@ -56,79 +76,6 @@ def is_deepseek_flash_model(model_id: str | None) -> bool:
 
     # 去空格、转小写后与 Flash 标识精确比对
     return model_id.strip().lower() == DEEPSEEK_FLASH_MODEL_ID
-
-
-def restore_reasoning_content(
-    payload_messages: list[dict],
-    original_messages: list
-) -> list[dict]:
-    """把 assistant 消息 additional_kwargs 里的 reasoning_content 还原进请求体。
-
-    DeepSeek API 要求思考模型多轮对话时，每条 assistant 消息都要带
-    reasoning_content。langchain_deepseek 序列化时把 reasoning_content
-    塞进了 additional_kwargs 但没写回 content 数组，这里补上。
-
-    参数：
-        payload_messages: 父类生成的请求体消息列表
-        original_messages: 转换前的 LangChain 消息列表（含 additional_kwargs）
-
-    返回：
-        还原后的请求体消息列表（原地复用，长度一致）
-    """
-    # 按纯文本内容建立 reasoning 索引（原始消息 → 思考链）
-    by_content: dict[str, dict] = {}
-    for msg in original_messages:
-        reasoning = getattr(msg, "additional_kwargs", {}).get("reasoning_content")
-        if not reasoning:
-            continue
-        by_content[_extract_text(msg.content)] = {"reasoning_content": reasoning}
-
-    # 遍历请求体消息，把命中的思考链写回 assistant 文本块
-    for pm in payload_messages:
-        # 只处理 assistant 消息
-        if pm.get("role") != "assistant":
-            continue
-        # 用文本内容作为匹配键
-        key = _extract_text(pm.get("content"))
-        if not key:
-            continue
-        # 没有对应思考链则跳过
-        hit = by_content.get(key)
-        if hit is None:
-            continue
-        # 把 reasoning_content 注入 content 列表首个文本块
-        content = pm.get("content")
-        if isinstance(content, list) and content:
-            first = content[0] if isinstance(content[0], dict) else {}
-            if first.get("type") == "text":
-                content[0] = {**first, "reasoning_content": hit["reasoning_content"]}
-
-    return payload_messages
-
-
-def _extract_text(content: Any) -> str:
-    """从消息 content 中提取纯文本（兼容 str 与多模态块列表）。
-
-    参数：
-        content: 消息内容，可能是字符串或多模态块列表
-
-    返回：
-        拼接后的纯文本（无法识别时为空串）
-    """
-    # 字符串直接返回
-    if isinstance(content, str):
-        return content
-
-    # 列表则挑出所有 text 块拼接
-    if isinstance(content, list):
-        parts = []
-        for block in content:
-            if isinstance(block, dict) and block.get("type") == "text":
-                parts.append(str(block.get("text", "")))
-        return "".join(parts)
-
-    # 其他类型视为无文本
-    return ""
 
 
 class DeepSeekFlashChatModel(ChatDeepSeek):

@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import time
 from dataclasses import dataclass, field
+from typing import Any
 
 """run 数据模型（runs.models）
 
@@ -69,15 +70,17 @@ class RunRecord:
     created_at: float = 0.0
     started_at: float | None = None
     finished_at: float | None = None
+    # 思考链事件回放流（仅历史回放路径填充；常规行查询不取此列，默认空）
+    events: list[dict[str, Any]] = field(default_factory=list)
 
 
 @dataclass
 class RunHandle:
     """内存中的活动 run 句柄（运行期间的生命周期载体）。
 
-    除公开字段外，还带一组「帧解析游标」私有字段（_last_* / _msg_round_*），
-    由 worker 在解析 astream 帧时读写，用于做增量去重与按模型轮次判定
-    思考/答复；仅进程内可见，不落库。
+    除公开字段外，还带一组「帧解析游标」私有字段（_last_* / _text_* / _msg_*），
+    由 worker 在解析 astream 帧时读写：前者做增量去重，后两组做「逐 token 文本
+    待发缓冲 + 按消息定性」；仅进程内可见，不落库。
     """
 
     run_id: str
@@ -90,16 +93,26 @@ class RunHandle:
     created_at: float = field(default_factory=time.time)
     task: object | None = None
 
-    # prints / artifacts 增量游标，todos 指纹去重，最终答复文本累积
+    # prints / artifacts 增量游标，todos 指纹去重
+    # run 的墙钟起点（任务清单收尾判断 todos_touched_at 是否属于本 run）
+    _run_started_wall: float = 0.0
     _last_prints: int = 0
     _last_artifacts: int = 0
     _last_todos_fingerprint: str = ""
-    _ai_chunks: list[str] = field(default_factory=list)
 
-    # 模型轮次缓冲：按 checkpoint_ns 分轮，轮结束再定思考/答复流向
+    # 文本待发缓冲：{(kind, message_id): 累积文本}，kind 取 reasoning / message；
+    # 逐 token 到达但按时间片/字数节流下发，避免 SSE 帧数与前端重渲染爆炸
+    _text_pending: dict[tuple[str, str], str] = field(default_factory=dict)
+    # 上次冲刷文本缓冲的时刻（monotonic 秒），0 表示还没发过
+    _text_last_flush: float = 0.0
+    # 每条「消息 id + 轮次」已下发的正文累计（收尾算答复预览用；含后来被降级的那部分）
+    # 键为 (message_id, round_ns)：DeepSeek 整个 run 复用同一个 message_id，
+    # 只按 message_id 归并会把多轮正文错误地拼成一段，也无法区分是哪一轮被降级。
+    _msg_text: dict[tuple[str, str], str] = field(default_factory=dict)
+    # 已定性为「思考叙述」的 (message_id, round_ns)（该轮出现过工具调用 → 答复气泡里要剔除）
+    _msg_retracted: set[tuple[str, str]] = field(default_factory=set)
+    # 当前模型轮次的 checkpoint_ns（超步变化 = 上一轮结束，先冲刷缓冲）
     _msg_round_ns: str | None = None
-    _msg_round_text: list[str] = field(default_factory=list)
-    _msg_round_has_tools: bool = False
 
     # 收尾幂等标记
     finalized: bool = False

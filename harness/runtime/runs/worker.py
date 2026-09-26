@@ -18,6 +18,7 @@ from harness.runtime.serialization import (
     MAX_MESSAGE_PREVIEW,
     as_list,
     convert_messages,
+    extract_reasoning_content,
     extract_text_content,
 )
 
@@ -29,14 +30,33 @@ from harness.runtime.serialization import (
          astream(["values","messages"]) 逐帧解析 → 结束 flush + finalize。
     边界：不管理全局句柄/并发簿记（那是 manager 的事），只管单个 run。
 
-    帧解析要点（与现状一致）：
-        - values 帧：对 prints / todos / artifacts 做增量去重后发事件；
-        - messages 帧：按 checkpoint_ns 分轮缓冲，轮内出现 tool_call 判为
-          思考叙述（thinking_chunk），纯文本判为最终答复（message_chunk）；
+    帧解析要点：
+        - values 帧：先冲刷未发文本，再对 prints / todos / artifacts 做增量去重后发事件；
+        - messages 帧：不再「整轮缓冲后一次发」——模型的思考（reasoning_content）与
+          正文都按 token 入缓冲、按时间片/字数节流下发，带 message_id；
+        - 定性后置：正文先当答复发出（用户立刻看到字流），同一条消息里一旦出现
+          工具调用，补发 message_retract 让前端把这段文本降级成思考叙述；
         - 收尾 flush 保证最后一轮不漏发。
 """
 
 logger = logging.getLogger(__name__)
+
+# 文本增量下发节流：距上次冲刷超过该秒数，或单条缓冲攒够该字数，就发一次。
+# 实测模型块间隔 22~32ms，不合并就是每秒 ~40 个 SSE 帧 + 同样多次前端重渲染。
+TEXT_FLUSH_INTERVAL = 0.04
+# 单条缓冲达到该字数就立即发（长段不能干等时间片）。
+# 注意：这个阈值不能太高——values 帧在超步边界会强制冲刷，若阈值过高，
+# 模型单轮中途的短增量就会一直等不到时间片（时钟被边界冲刷重置），
+# 表现为「攒一大坨才吐一次」。40 字约等于 1~2 个中文句子的长度。
+TEXT_FLUSH_CHARS = 40
+
+# 缓冲 kind → 事件类型（reasoning = 真思考，message = 本轮正文）
+_TEXT_EVENT_TYPES = {
+    "reasoning": RunEventType.REASONING_CHUNK,
+    "message": RunEventType.MESSAGE_CHUNK,
+}
+# 同一批冲刷内的发送顺序：先思考后正文，与模型实际输出顺序一致
+_TEXT_KIND_ORDER = ("reasoning", "message")
 
 
 async def run_worker(
@@ -61,14 +81,18 @@ async def run_worker(
     run_id = handle.run_id
     thread_id = handle.thread_id
 
-    # 热池上下文：装配链（sandbox provider）按线程归属取用确定性沙箱
-    from harness.runtime.sandbox import set_runtime_thread_id
+    # 热池上下文：装配链（sandbox provider）按线程归属取用确定性沙箱；
+    # user_id 用于拼出「本线程 user-data 的宿主路径」当容器挂载源。
+    from harness.runtime.sandbox import set_runtime_thread_id, set_runtime_user_id
 
     set_runtime_thread_id(thread_id)
+    set_runtime_user_id(handle.user_id)
 
     converted = convert_messages(messages)
 
     handle.status = RUN_STATUS_RUNNING
+    # 墙钟起点：任务清单收尾用它判断「todos_touched_at 是否属于本 run」
+    handle._run_started_wall = time.time()
     await store.update(run_id, fields={"status": RUN_STATUS_RUNNING, "started_at": time.time()})
 
     final_values: dict[str, Any] | None = None
@@ -80,17 +104,28 @@ async def run_worker(
         from harness.memory.short_term import create_checkpointer
 
         checkpointer = await create_checkpointer()
-        agent = registry.build_agent(
-            model_name=handle.model_name or None,
-            thinking_enabled=handle.thinking_enabled,
-            checkpointer=checkpointer,
-        )
-        live_sandbox = getattr(registry, "sandbox", None)
+
+        # 装配移出事件循环：build_agent 内部经 sandbox_provider → SandboxManager.start()
+        # 会做 docker subprocess 探测与 wait_for_sandbox_ready 的 time.sleep 轮询
+        # （冷启动最长 120s），若在事件循环里直调会冻结整个 FastAPI 服务，
+        # 期间任何 HTTP 请求（含新建会话 POST /threads）都无法处理。
+        # asyncio.to_thread 会复制 contextvars，runtime 线程归属上下文不受影响。
+        def _assemble() -> tuple[Any, Any]:
+            assembled = registry.build_agent(
+                model_name=handle.model_name or None,
+                thinking_enabled=handle.thinking_enabled,
+                checkpointer=checkpointer,
+            )
+            return assembled, getattr(registry, "sandbox", None)
+
+        agent, live_sandbox = await asyncio.to_thread(_assemble)
         if live_sandbox is not None and getattr(live_sandbox, "base_url", None):
             try:
                 from harness.runtime.sandbox import push_uploads_to_sandbox
 
-                pushed = push_uploads_to_sandbox(
+                # 同样是同步 HTTP（base64 逐文件推送），不能占用事件循环
+                pushed = await asyncio.to_thread(
+                    push_uploads_to_sandbox,
                     live_sandbox,
                     user_id=handle.user_id,
                     thread_id=thread_id,
@@ -143,6 +178,8 @@ async def run_worker(
             store=store,
             bus=bus,
             threads=threads,
+            agent=agent,
+            config=config,
         )
     except asyncio.CancelledError:
         await _finalize(
@@ -153,6 +190,8 @@ async def run_worker(
             store=store,
             bus=bus,
             threads=threads,
+            agent=agent,
+            config=config,
         )
     except Exception as exc:  # noqa: BLE001 —— run 级异常归于错误状态
         logger.exception("run %s 执行失败", run_id)
@@ -164,6 +203,8 @@ async def run_worker(
             store=store,
             bus=bus,
             threads=threads,
+            agent=agent,
+            config=config,
         )
     finally:
         # 关闭本次 run 专属 checkpointer 连接
@@ -209,8 +250,9 @@ async def _handle_values(handle: RunHandle, values: dict[str, Any], *, bus: Any)
     run_id = handle.run_id
     thread_id = handle.thread_id
 
-    # 切到超步边界，先冲刷未发的模型轮次
-    await _flush_msg_round(handle, bus=bus)
+    # 切到超步边界，先冲刷未发的模型文本（保证事件与超步顺序对齐）。
+    # 这是「边界冲刷」：清空缓冲但不动节流时钟，否则会饿死 messages 帧的节流发送。
+    await _flush_text(handle, bus=bus, reset_clock=False)
 
     prints = as_list(values.get("prints"))
     # prints 只发新增片段（增量游标）
@@ -255,19 +297,26 @@ async def _handle_values(handle: RunHandle, values: dict[str, Any], *, bus: Any)
 
 
 async def _handle_message_chunk(handle: RunHandle, chunk: Any, *, bus: Any) -> None:
-    """解析一个 messages 帧：按「模型轮次」缓冲，轮结束才定流向。
+    """解析一个 messages 帧：思考与正文按 token 入缓冲，节流下发（定性后置）。
 
     参数：
-        handle: run 句柄（携带轮次缓冲）
+        handle: run 句柄（携带文本待发缓冲与消息定性表）
         chunk: (message_chunk, metadata) 元组或单条消息
         bus: 事件总线
 
-    帧是 (message_chunk, metadata) 元组。DeepSeek 这类 Chat 模型在一轮工具
-    调用里，叙述文本（"让我先搜索…"）先于 tool_call_chunks 到达；若按单帧
-    判定，叙述会被误当最终答复。因此这里按 checkpoint_ns 分轮累积：
-      - 轮内出现 tool_call_chunks / tool_calls → 整轮是思考叙述；
-      - 轮内只有文本 → 最终答复。
-    轮边界由超步（values 帧）或 ns 变化触发冲刷。
+    帧是 (message_chunk, metadata) 元组。为何「先当答复发、事后降级」：
+    DeepSeek 这类模型在一轮工具调用里，叙述文本（“让我先搜索…”）先于
+    tool_call_chunks 到达，单帧无法预判本轮是否带工具。旧做法是整轮缓冲完了
+    再发 → 答复完全不流式。现在先按答复逐 token 下发（用户立即看到字在动），
+    本轮的 message_id 上一旦出现工具调用就补发 message_retract，前端把这段
+    文本从答复气泡搬进思考步骤（DeerFlow 同款取舍：允许一次轻微跳位）。
+
+    定性键是 **(message_id, round_ns) 而非单纯 message_id**。原因（实测
+    2026-09-23，DeepSeek）：同一次 run 内所有轮次复用同一个 message_id，
+    若只按 message_id 定性，第一轮的工具调用会把该 id 永久锁成「叙述」，
+    导致后续每一轮的正文（包括最终答复）全部被吞——收尾统计出现
+    「答复=0字」，前端表现为一个永久空白的答复气泡。按轮次定性后，
+    每轮是否算叙述只看该轮自己有没有工具调用。
     """
     meta: dict[str, Any] = {}
     if isinstance(chunk, tuple) and chunk:
@@ -282,66 +331,143 @@ async def _handle_message_chunk(handle: RunHandle, chunk: Any, *, bus: Any) -> N
     node = str(meta.get("langgraph_node") or "")
     if node and node != "model":
         return
+    # 超步变化说明进入新的一轮，先把上一轮未发文本冲刷掉（边界冲刷，不动时钟）
+    ns = str(meta.get("langgraph_checkpoint_ns") or "")
+    if handle._msg_round_ns is not None and ns and ns != handle._msg_round_ns:
+        await _flush_text(handle, bus=bus, reset_clock=False)
+    if ns:
+        handle._msg_round_ns = ns
+    # 消息 id 是前端归并与定性的 key；极端情流缺失时用占位 key 兑底
+    message_id = str(getattr(chunk, "id", "") or "") or "-"
+    # 轮次键：优先用 checkpoint_ns，缺失时退化为当前记录值，保证同一轮稳定
+    round_ns = ns or handle._msg_round_ns or ""
+    # 1.模型真实思考（reasoning_content 增量）
+    reasoning = extract_reasoning_content(chunk)
+    if reasoning:
+        _stage_text(handle, "reasoning", message_id, round_ns, reasoning)
+    # 2.本轮正文（先当答复流式）
     text = extract_text_content(getattr(chunk, "content", ""))
+    if text:
+        _stage_text(handle, "message", message_id, round_ns, text)
+    # 3.工具调用到达 → 本条消息定性为思考叙述
     has_tools = bool(getattr(chunk, "tool_call_chunks", None)) or bool(
         getattr(chunk, "tool_calls", None)
     )
-    ns = str(meta.get("langgraph_checkpoint_ns") or "")
-    # ns 变化说明进入新的一超步，先冲刷上一轮
-    if handle._msg_round_ns is not None and ns and ns != handle._msg_round_ns:
-        await _flush_msg_round(handle, bus=bus)
-    if ns:
-        if handle._msg_round_ns is None:
-            handle._msg_round_ns = ns
-    else:
-        if handle._msg_round_ns is None:
-            handle._msg_round_ns = "round-%d" % len(handle._msg_round_text)
-    # 记录本轮是否有工具调用与文本
-    if has_tools:
-        handle._msg_round_has_tools = True
-    if text:
-        handle._msg_round_text.append(text)
+    if has_tools and (message_id, round_ns) not in handle._msg_retracted:
+        handle._msg_retracted.add((message_id, round_ns))
+        # 先把这条消息的待发文本冲刷，避免 retract 跑到文本前面造成错位。
+        # 注意用边界冲刷：这里清空了本条消息的缓冲，若顺带重置节流时钟，
+        # 会让紧随其后的正文帧（同一轮里的最终答复）重新陷入"攒够 40 字才发"。
+        await _flush_text(
+            handle, bus=bus, message_id=message_id, round_ns=round_ns, reset_clock=False
+        )
+        await bus.publish(
+            make_event(
+                RunEventType.MESSAGE_RETRACT,
+                run_id=handle.run_id,
+                thread_id=handle.thread_id,
+                payload={"message_id": message_id},
+            )
+        )
+        # 故意不 return：本帧可能还带着别的待发文本（例如上一轮尾巴），
+        # 且要继续维持节流节奏。旧版在这里直接 return，导致该帧的冲刷被跳过。
+    # 4.常规路径：按时间片/字数节流冲刷
+    await _flush_text_throttled(handle, bus=bus)
 
 
-async def _flush_msg_round(handle: RunHandle, *, bus: Any) -> None:
-    """冲刷当前模型轮次：按是否有工具调用定流向（思考链 / 最终答复）。
+def _stage_text(
+    handle: RunHandle,
+    kind: str,
+    message_id: str,
+    round_ns: str,
+    delta: str,
+) -> None:
+    """把一段文本增量归入待发缓冲（不直接发，由冲刷控制节奏）。
+
+    参数：
+        handle: run 句柄
+        kind: reasoning / message
+        message_id: 模型消息 id（前端按它归并与定性）
+        round_ns: 当前模型轮次的 checkpoint_ns（与 message_id 合成轮次键）
+        delta: 本次到达的文本片段
+    """
+    key = (kind, message_id, round_ns)
+    handle._text_pending[key] = handle._text_pending.get(key, "") + delta
+    # 正文累计台账：收尾算答复预览时要按它剔除被降级的轮次
+    if kind == "message":
+        msg_key = (message_id, round_ns)
+        handle._msg_text[msg_key] = handle._msg_text.get(msg_key, "") + delta
+
+
+async def _flush_text(
+    handle: RunHandle,
+    *,
+    bus: Any,
+    message_id: str | None = None,
+    round_ns: str | None = None,
+    reset_clock: bool = True,
+) -> None:
+    """冲刷文本待发缓冲（全量或只冲指定消息/轮次），每类一个事件。
 
     参数：
         handle: run 句柄
         bus: 事件总线
+        message_id: 只冲这条消息；None 为全部
+        round_ns: 只冲这一轮；None 为全部（与 message_id 同时给则取交集）
+        reset_clock: 是否顺带把节流时钟拨到现在。
+
+    说明：reset_clock 是修复「答复不流式」的关键参数。
+        超步边界（values 帧）、消息定性、run 收尾都会强制冲刷一次，
+        若这些边界冲刷也去重置 _text_last_flush，则模型单轮生成期间
+        频繁到达的 values 帧会把节流时钟一直拨回原点，
+        导致后续 messages 帧永远满足不了「距上次冲刷 ≥ 0.04s」的条件、
+        只能等单条攒够 TEXT_FLUSH_CHARS 才发 —— 用户看到的就是
+        「静默很久，然后一整坨答复突然出现」。
+        因此只有「节流路径」的冲刷才该重置时钟；边界冲刷只清缓冲不动时钟。
     """
-    if not handle._msg_round_text:
-        handle._msg_round_ns = None
-        handle._msg_round_has_tools = False
+    if not handle._text_pending:
         return
-    text = "".join(handle._msg_round_text)
-    is_thinking = handle._msg_round_has_tools
-    event_type = (
-        RunEventType.THINKING_CHUNK if is_thinking else RunEventType.MESSAGE_CHUNK
-    )
-    # 最终答复文本累积，供收尾生成预览
-    if not is_thinking:
-        handle._ai_chunks.append(text)
-    logger.info(
-        "run %s ROUND kind=%s len=%d text=%r",
-        handle.run_id,
-        "thinking" if is_thinking else "answer",
-        len(text),
-        text[:60],
-    )
-    payload_text = f"{text}\n" if is_thinking else text
-    await bus.publish(
-        make_event(
-            event_type,
-            run_id=handle.run_id,
-            thread_id=handle.thread_id,
-            payload={"text": payload_text},
-        )
-    )
-    # 轮次缓冲复位
-    handle._msg_round_ns = None
-    handle._msg_round_text = []
-    handle._msg_round_has_tools = False
+    for kind in _TEXT_KIND_ORDER:
+        keys = [
+            key
+            for key in handle._text_pending
+            if key[0] == kind
+            and (message_id is None or key[1] == message_id)
+            and (round_ns is None or key[2] == round_ns)
+        ]
+        for key in keys:
+            text = handle._text_pending.pop(key, "")
+            if not text:
+                continue
+            await bus.publish(
+                make_event(
+                    _TEXT_EVENT_TYPES[kind],
+                    run_id=handle.run_id,
+                    thread_id=handle.thread_id,
+                    payload={"message_id": key[1], "text": text},
+                )
+            )
+    if reset_clock:
+        handle._text_last_flush = time.monotonic()
+
+
+async def _flush_text_throttled(handle: RunHandle, *, bus: Any) -> None:
+    """节流冲刷：时间片到了、或单条缓冲攒得够多，才真发。
+
+    参数：
+        handle: run 句柄
+        bus: 事件总线
+
+    说明：超步边界 / 消息定性 / run 收尾都走 _flush_text 全量冲刷，所以
+        尾巴不会卡在缓冲里；这里只管“流式中途”的发送频率。
+        只有本路径会重置节流时钟（见 _flush_text 的 reset_clock 说明）。
+    """
+    now = time.monotonic()
+    if now - handle._text_last_flush < TEXT_FLUSH_INTERVAL:
+        # 时间片未到，但单条已攒够字数也要立即发（长段不能干等）
+        if not any(len(t) >= TEXT_FLUSH_CHARS for t in handle._text_pending.values()):
+            return
+    await _flush_text(handle, bus=bus, reset_clock=True)
 
 
 async def _finalize(
@@ -353,8 +479,10 @@ async def _finalize(
     store: Any,
     bus: Any,
     threads: Any,
+    agent: Any = None,
+    config: dict[str, Any] | None = None,
 ) -> None:
-    """run 收尾：落库、回填线程元数据、发终端事件并结束订阅。
+    """run 收尾：落库、任务清单收尾、回填线程元数据、发终端事件并结束订阅。
 
     参数：
         handle: run 句柄
@@ -364,6 +492,8 @@ async def _finalize(
         store: RunStore
         bus: EventBus
         threads: ThreadStore
+        agent: 本 run 的图实例（任务清单收尾要写回 checkpoint；装配失败时为 None）
+        config: 本 run 的 langgraph config（aupdate_state 用）
 
     说明：幂等（handle.finalized 保护）；终端事件必达后 publish_end 结束订阅。
          全局句柄/并发簿记由 manager 在任务结束时清理，不在此处。
@@ -372,8 +502,8 @@ async def _finalize(
         return
     handle.finalized = True
     handle.status = status
-    # 先把未冲刷的最后一轮发出
-    await _flush_msg_round(handle, bus=bus)
+    # 先把未冲刷的最后一轮文本发出（收尾边界冲刷，时钟已无意义）
+    await _flush_text(handle, bus=bus, reset_clock=False)
     run_id = handle.run_id
     thread_id = handle.thread_id
     finished_at = time.time()
@@ -389,14 +519,98 @@ async def _finalize(
         generated = final_values.get("title")
         if isinstance(generated, str) and generated.strip():
             title = generated.strip()
-    ai_text = "".join(handle._ai_chunks)
+    # 答复文本 = 各「消息 + 轮次」正文里「没被降级成叙述」的那部分（按到达顺序拼接）。
+    # 键含轮次：同一 message_id 的多轮正文不能混为一谈，只有被降级的那一轮要剔除。
+    ai_text = "".join(
+        text
+        for msg_key, text in handle._msg_text.items()
+        if msg_key not in handle._msg_retracted
+    )
+    logger.info(
+        "run %s 收尾 kind=%s 答复=%d字 降级为叙述=%d条 消息=%d条",
+        run_id,
+        status,
+        len(ai_text),
+        len(handle._msg_retracted),
+        len(handle._msg_text),
+    )
+
+    # ── 任务清单收尾（2026-09-26 用户定稿语义）─────────────────────────
+    #   · 本轮模型没产出计划（todos_touched_at 未越过本 run 起点）→ 清空：
+    #     「新问题没有计划，就不该挂着上一轮的旧清单」。
+    #   · 产出过 → 如实收尾：还挂在 in_progress 的条目说明「没做完就结束了」，
+    #     落到 cancelled，不伪造 completed。
+    #   · 两条路都要：① aupdate_state 写回 checkpoint（下一轮看到干净状态）
+    #                ② 发 TODOS 事件（前端即时更新，无需刷新）。
+    if agent is not None and config is not None:
+        values = final_values
+        if values is None:
+            # 取消/异常路径没有最后一帧：从 checkpoint 取回状态，
+            # 任务清单才能如实收尾（否则只能清空，丢掉「做了一半被取消」的信息）
+            try:
+                snapshot = await agent.aget_state(config)
+                values = snapshot.values if snapshot is not None else None
+            except Exception:  # noqa: BLE001 —— 取不到状态就按清空处理
+                logger.warning("run %s 收尾取回 checkpoint 状态失败", run_id, exc_info=True)
+                values = None
+        raw_todos = as_list(values.get("todos")) if values else []
+        touched_at = 0.0
+        if values:
+            raw_touched = values.get("todos_touched_at")
+            if isinstance(raw_touched, (int, float)):
+                touched_at = float(raw_touched)
+        # 本轮模型碰过 todo = 触达时刻晚于本 run 启动（todos_touched_at 持久化在
+        # checkpoint 里，上一轮的时间戳必然早于本 run 启动，故该比较能区分两轮）
+        if touched_at > handle._run_started_wall:
+            final_todos = [
+                {
+                    **item,
+                    "status": (
+                        "cancelled"
+                        if item.get("status") == "in_progress"
+                        else item.get("status")
+                    ),
+                }
+                for item in raw_todos
+                if isinstance(item, dict)
+            ]
+            action = "收尾"
+        else:
+            final_todos = []
+            action = "清空"
+        try:
+            # as_node 必须显式指定（实测省略会抛 Ambiguous update）；
+            # todos 是独立通道，挂到 model 节点只为满足 langgraph 的归属要求
+            await agent.aupdate_state(config, {"todos": final_todos}, as_node="model")
+            await bus.publish(
+                make_event(
+                    RunEventType.TODOS,
+                    run_id=run_id,
+                    thread_id=thread_id,
+                    payload={"todos": final_todos},
+                )
+            )
+            logger.info(
+                "run %s 任务清单%s：%d 项（模型触达=%s）",
+                run_id,
+                action,
+                len(final_todos),
+                touched_at > handle._run_started_wall,
+            )
+        except Exception:  # noqa: BLE001 —— 清空/写回失败不阻断收尾
+            logger.warning("run %s 任务清单收尾失败（忽略）", run_id, exc_info=True)
+
     preview = ai_text[:MAX_MESSAGE_PREVIEW] or handle.input_preview
+    # 取回本 run 录制的思考链事件流（供历史回放）；总线无此能力时降级为空
+    drain = getattr(bus, "drain_record", None)
+    chain_events = drain(run_id) if callable(drain) else []
     await store.update(
         run_id,
         fields={
             "status": status,
             "error": error,
             "artifacts": json.dumps(artifacts, ensure_ascii=False),
+            "events": json.dumps(chain_events, ensure_ascii=False),
             "message_count": message_count,
             "finished_at": finished_at,
         },
@@ -468,6 +682,13 @@ async def pull_run_outputs(sandbox: Any, *, user_id: str, thread_id: str) -> int
         FakeSandbox 或 None 直接返回 0。to_thread 异步执行，避免阻塞事件循环。
     """
     if sandbox is None or not getattr(sandbox, "base_url", None):
+        return 0
+    # 已挂载宿主工作区时，容器的 /mnt/user-data/outputs 就是下面这个 dest 目录本身，
+    # 回传纯属重复搬运（读一遍再原样写回自己）→ 直接跳过。
+    from harness.runtime.sandbox import is_workspace_mounted
+
+    if is_workspace_mounted(thread_id):
+        logger.debug("沙箱已挂载宿主工作区，跳过产物回传（两边同一份文件）")
         return 0
     try:
         from harness.config.paths import get_paths

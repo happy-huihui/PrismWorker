@@ -1,97 +1,199 @@
+# ══════════════════════════════════════════════════════════════════════
+# PrismWorker 主配置
+#   · 分组顺序：基础 → 模型与路由 → 数据库 → 沙箱 → 记忆 → 工具 → 子代理
+#   · 值中的 ${VAR:default} 在加载时按环境变量展开（见 harness/config/app_config.py）
+#   · 每一项的字段含义见对应的 harness/config/*_config.py
+# ══════════════════════════════════════════════════════════════════════
 
-agent_name: LeadAgent
 
-log_level: INFO
+# ─────────────────────────── 1. 应用基础 ───────────────────────────
+agent_name: LeadAgent              # Agent 名，用于系统提示与日志标识
+log_level: INFO                    # 日志级别（DEBUG / INFO / WARNING / ERROR）
 
-active_model: deepseek-flash
 
+# ───────────────────────── 2. 模型与路由 ─────────────────────────
+active_model: mimo-pro             # 激活档：路由未命中或规则关闭时的兜底模型
+
+# 模型清单。每个条目 = 一个可被 active_model / routing 选中的「档位」。
+# provider 决定用哪个策略实例化（openai / deepseek / mimo，见 harness/models/registry.py）
 models:
-  - name: openai-default
-    provider: openai
-    model: ${OPENAI_MODEL:gpt-4o-mini}
-    base_url: ${OPENAI_BASE_URL:}
-    api_key: ${OPENAI_API_KEY:}
-    supports_vision: true
-    supports_thinking: false
-    context_window: 128000
-    max_tokens: 4096
-  - name: deepseek-flash
-    provider: deepseek
-    model: ${DEEPSEEK_FLASH_MODEL:deepseek-v4-flash}
-    api_key: ${DEEPSEEK_API_KEY:}
-    supports_vision: false
-    supports_thinking: false
-    context_window: 65536
-    max_tokens: 4096
-  - name: deepseek-pro
-    provider: deepseek
-    model: ${DEEPSEEK_PRO_MODEL:deepseek-v4-pro}
-    api_key: ${DEEPSEEK_API_KEY:}
+  # --- MiMo（小米，OpenAI 兼容；当前默认档）---
+  - name: mimo-pro                 # 档位名（路由与 active_model 引用它）
+    provider: mimo
+    model: ${MIMO_PRO_MODEL:mimo-v2.6-pro}   # 最新 pro 档，默认即输出 reasoning_content
+    base_url: ${MIMO_BASE_URL:https://api.xiaomimimo.com/v1}   # OpenAI 兼容接口根地址
+    api_key: ${MIMO_API_KEY:}      # 密钥；留空回退环境变量 MIMO_API_KEY
+    supports_vision: false         # 暂未接视觉输入
+    supports_thinking: true        # 输出思考链（无需下发开关参数，传了反而退化）
+    context_window: 131072         # 上下文窗口(token)
+    max_tokens: 16384              # 输出上限；reasoning token 计入其中，给足避免思维链被截断
+  - name: mimo-flash
+    provider: mimo
+    model: ${MIMO_FLASH_MODEL:mimo-v2.6-flash}
+    base_url: ${MIMO_BASE_URL:https://api.xiaomimimo.com/v1}
+    api_key: ${MIMO_API_KEY:}
     supports_vision: false
     supports_thinking: true
+    context_window: 131072
+    max_tokens: 16384
+
+  # --- DeepSeek（备选推理档）---
+  - name: deepseek-pro
+    provider: deepseek
+    model: ${DEEPSEEK_PRO_MODEL:deepseek-v4-pro}   # 推理档，输出思考链
+    api_key: ${DEEPSEEK_API_KEY:}
+    supports_vision: false
+    supports_thinking: true        # 开思考时下发 reasoning_effort=high
     context_window: 65536
-    max_tokens: 8192
+    max_tokens: 16384              # 同上：推理档思维链更长，需要足够输出预算
+  - name: deepseek-flash
+    provider: deepseek
+    model: ${DEEPSEEK_FLASH_MODEL:deepseek-v4-flash}   # 快速档，不出思考链
+    api_key: ${DEEPSEEK_API_KEY:}
+    supports_vision: false
+    supports_thinking: false
+    context_window: 65536
+    max_tokens: 16384
 
+  # --- OpenAI 兼容（默认指向官方，可用 OPENAI_BASE_URL 改指代理）---
+  - name: openai-default
+    provider: openai
+    model: ${OPENAI_MODEL:gpt-6-astra}
+    base_url: ${OPENAI_BASE_URL:}  # 兼容接口地址；留空走官方
+    api_key: ${OPENAI_API_KEY:}    # 密钥；留空回退 OPENAI_API_KEY
+    supports_vision: true          # 支持图像输入
+    supports_thinking: true        # 支持推理；开思考时下发 reasoning.effort=high
+    context_window: 1050000        # 上下文窗口(token)
+    max_tokens: 16384              # 输出上限（模型自身上限 128000，这里按项目惯例收敛）
+
+# 模型动态路由：不再由前端选模型，改由这里按规则自动挑
+routing:
+  enabled: true                    # 总开关；关掉则永远用 active_model
+  default_model: mimo-pro          # 默认档：未命中关键词时用哪个
+  escalate_model: mimo-pro         # 升级档：命中关键词时用哪个（与默认档相同=不降档）
+  vision_model: null               # 带图输入时改用的模型名；null=带图也不换
+  min_chars_for_escalation: 8      # 输入短于此长度不升档，避免一句话被误判
+  escalate_keywords:               # 命中即升档的关键词（子串匹配、大小写不敏感）
+    - 深度分析
+    - 深入分析
+    - 详细分析
+    - 逐步推理
+    - 推理一下
+    - 论证
+    - 权衡
+    - 对比分析
+    - 根因
+    - 定位问题
+    - 排查
+    - debug
+    - 调试
+    # · 工程实施类（长链路、需多步工具协作）
+    - 写代码
+    - 写个代码
+    - 实现一个
+    - 重构
+    - 架构设计
+    - 设计方案
+    - 设计一个
+    - 完整实现
+    - 单元测试
+    - code review
+    - 代码审查
+    # · 复杂产出
+    - 生成报告
+    - 写一份报告
+    - 研究
+    - 调研
+    - 论文
+    - 算法
+
+
+# ─────────────────────────── 3. 数据库 ───────────────────────────
 database:
-  postgres_url: ${DATABASE_URL:postgresql://postgres:root@localhost:5432/prismworker}
-  postgres_schema: public
-  pool_size: 5
-  pool_recycle: 300
-  command_timeout: 30
-  echo_sql: false
+  postgres_url: ${DATABASE_URL:postgresql://postgres:root@localhost:5432/prismworker}  # 连接串；环境变量优先
+  postgres_schema: public          # schema 名
+  pool_size: 5                     # 连接池大小
+  pool_recycle: 300                # 连接回收间隔(秒)
+  command_timeout: 30              # 单条命令超时(秒)
+  echo_sql: false                  # 是否打印 SQL 日志
 
+
+# ──────────────────────────── 4. 沙箱 ────────────────────────────
 sandbox:
-  use: aio
-  lifecycle: auto
-  image: enterprise-public-cn-beijing.cr.volces.com/vefaas-public/all-in-one-sandbox:1.11.0
-  port: 8080
-  container_prefix: prism-sandbox
-  base_url: null
-  idle_timeout: 600
-  replicas: 1
-  docker_command: []
-  mounts: []
-  environment: {}
-  allow_host_bash: true
-  bash_command_timeout: 600
-  bash_output_max_chars: 30000
-  read_file_output_max_chars: 50000
-  ls_output_max_chars: 30000
+  # · 提供方与镜像
+  use: aio                         # 沙箱提供方（目前仅支持 aio）
+  image: enterprise-public-cn-beijing.cr.volces.com/vefaas-public/all-in-one-sandbox:1.11.0  # 沙箱镜像
+  # · 容器生命周期
+  lifecycle: auto                  # auto=按需起停；manual=外部已起好
+  port: 8080                       # 沙箱 API 的容器内端口
+  container_prefix: prism-sandbox  # 容器名前缀
+  base_url: null                   # 已启动沙箱的 HTTP 地址（manual 模式必填）
+  idle_timeout: 600                # 空闲多久销毁容器(秒，0=不销毁)
+  replicas: 1                      # 容器最大副本数
+  docker_command: []               # docker CLI 调用前缀（如 ["wsl","docker"]）
+  # · 卷挂载与注入
+  mounts: []                       # 额外卷挂载；技能目录由 mount_skills 自动挂载
+  environment: {}                  # 注入容器的环境变量
+  # · 执行与输出截断
+  allow_host_bash: true            # 是否允许沙箱内执行 shell
+  bash_command_timeout: 600        # 命令执行超时(秒)
+  bash_output_max_chars: 30000     # 命令输出截断上限
+  read_file_output_max_chars: 50000  # 读文件输出截断上限
+  ls_output_max_chars: 30000       # 列目录输出截断上限
 
+
+# ──────────────────────────── 5. 记忆 ────────────────────────────
 memory:
-  enabled: true
-  mode: middleware
-  injection_enabled: true
-  root_dir: null
-  checkpoints_db_file: checkpoints.db
-  max_results: 5
-  backend_config:
-    debounce_seconds: 30
-    queue_max_depth: 1000
-    max_facts: 100
-    fact_confidence_threshold: 0.7
-    max_injection_tokens: 2000
-    watermark_max_keys: 4096
-    model: null
+  enabled: true                    # 总开关；false 时记忆链路直接短路
+  mode: middleware                 # middleware=中间件自动提取+注入；tool=模型工具读写
+  injection_enabled: true          # 是否把长期记忆注入系统提示词
+  root_dir: null                   # 记忆数据根目录；null → {数据根}/data
+  checkpoints_db_file: checkpoints.db  # 短期记忆 checkpoint 库文件名
+  max_results: 5                   # 记忆检索条数上限
+  backend_config:                  # 记忆后端私有参数（非共享字段，放这里）
+    debounce_seconds: 30           # 两次提取之间的去抖窗口(秒)
+    queue_max_depth: 1000          # 提取队列最大深度
+    max_facts: 100                 # 单用户保留的事实条数上限
+    fact_confidence_threshold: 0.7  # 事实入库置信度阈值
+    max_injection_tokens: 2000     # 注入系统提示的 token 上限
+    watermark_max_keys: 4096       # 注入水位线最多记录多少键
+    model: null                    # 记忆提取专用模型；null=复用当前模型
 
+
+# ──────────────────────────── 6. 工具 ────────────────────────────
 tools:
+  # · Web 搜索（tavily）
   web_search:
-    enabled: true
-    api_key: ${TAVILY_API_KEY:}
-    max_results: 5
+    enabled: true                  # 是否启用搜索工具
+    api_key: ${TAVILY_API_KEY:}    # tavily 密钥
+    max_results: 5                 # 每次返回条数
+  # · 网页抓取
   web_fetch:
-    enabled: true
-    max_chars: 20000
-    timeout_seconds: 20
-  enabled_tools: []
+    enabled: true                  # 是否启用抓取工具
+    max_chars: 20000               # 正文截断上限（字符）
+    timeout_seconds: 20            # 抓取超时(秒)
+  # · 火山方舟豆包生图（generate_image 工具）
+  ark_image:
+    enabled: true                  # 是否启用生图工具
+    api_key: ${ARK_API_KEY:}       # 方舟密钥（从 .env 的 ARK_API_KEY 读取，勿硬编码提交）
+    base_url: https://ark.cn-beijing.volces.com/api/v3  # 方舟 OpenAI 兼容根地址
+    model: ${ARK_IMAGE_MODEL:doubao-seedream-4-0-250828}  # 生图模型 ID
+    size: "2K"
+    watermark: false               # 是否加 AI 水印
+    response_format: url           # 返回格式：url（24h 有效） / b64_json
+    timeout_seconds: 120           # 单次生图超时(秒)
+    filename_prefix: image         # 落盘文件名前缀（image-20260923-153000.png）
+  enabled_tools: []                # 工具白名单；空列表 = 全部启用
 
+
+# ────────────────────────── 7. 子代理 ──────────────────────────
 subagents:
-  timeout_seconds: 600
-  max_turns: 30
-  max_total_per_run: 10
-  agents:
+  timeout_seconds: 600             # 单个子代理默认超时(秒)
+  max_turns: 30                    # 单个子代理默认轮次上限
+  max_total_per_run: 10            # 一次 run 内允许派发的子代理总数
+  agents:                          # 按名称覆盖上面的默认值
     general_purpose:
-      name: general_purpose
+      name: general_purpose        # 子代理名（与 task 工具入参对应）
       timeout_seconds: 600
       max_turns: 30
-      token_budget: null
+      token_budget: null           # token 预算；null=不限制

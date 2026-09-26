@@ -147,6 +147,23 @@ def merge_artifacts(
 
 
 
+def merge_archived_messages(
+    existing: list[AnyMessage] | None,
+    new: list[AnyMessage] | None,
+) -> list[AnyMessage]:
+    """`archived_messages` 字段的 reducer：压缩归档只增不减、追加保序。
+
+    摘要中间件（summarization）压缩早期消息时，会把被移除的消息原文
+    归档到这里——模型上下文（messages）保持精简，但对话展示历史
+    （history reader）可以从本字段完整取回，二者从此解耦。
+    """
+    if existing is None:
+        return list(new) if new else []
+    if new is None:
+        return existing
+    return existing + list(new)
+
+
 def merge_prints(existing: list[str] | None, new: list[str] | None) -> list[str]:
     """`prints` 字段的 reducer：把各中间件产出的进度消息追加保存。
 
@@ -376,6 +393,11 @@ class ThreadState(AgentState):
     title: NotRequired[str | None]
     artifacts: Annotated[list[str], merge_artifacts]
     todos: Annotated[list | None, merge_todos]
+    # 模型最近一次产出/更新任务计划的墙钟时刻（time.time()）。
+    # 用途：run 收尾判断「本轮模型有没有碰过 todo」——没碰过就把 todos 清空
+    # （用户语义：新问题没有计划就不该挂着上一轮的旧清单）。
+    # plain 字段即 last-value-wins，无需 reducer。
+    todos_touched_at: NotRequired[float]
     goal: Annotated[GoalState | None, merge_goal]
     uploaded_files: NotRequired[list[dict] | None]
     viewed_images: Annotated[dict[str, ViewedImageData], merge_viewed_images]
@@ -383,6 +405,7 @@ class ThreadState(AgentState):
     delegations: Annotated[list[DelegationEntry], merge_delegations]
     skill_context: Annotated[list[SkillEntry], merge_skill_context]
     summary_text: NotRequired[str | None]
+    archived_messages: Annotated[list[AnyMessage], merge_archived_messages]
     prints: Annotated[list[str], merge_prints]
 
 
@@ -529,6 +552,7 @@ THREAD_STATE_REDUCER_FIELDS = frozenset(
         "promoted",
         "delegations",
         "skill_context",
+        "archived_messages",
         "prints",
     }
 )

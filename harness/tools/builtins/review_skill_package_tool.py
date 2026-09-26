@@ -113,7 +113,7 @@ def _snapshot_for_target(target: str, runtime: Runtime) -> dict:
         cfg = SkillsConfig()
         return InstalledSkillReader.read_target(
             target,
-            skills_root=cfg.skills_root,
+            skills_root=str(cfg.resolve_skills_root()),
         )
 
     path = Path(target).expanduser()
@@ -138,7 +138,7 @@ def _ensure_local_target_allowed(path: Path, runtime: Runtime) -> None:
 
     allowed_roots: list[Path] = [
         Path.cwd().resolve(),
-        Path(SkillsConfig().skills_root).resolve(),
+        SkillsConfig().resolve_skills_root(),
     ]
     try:
         thread_data = runtime.state.get("thread_data") or {} if runtime.state else {}

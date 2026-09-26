@@ -42,6 +42,73 @@ from harness.runtime.threads_data import get_thread_store
 logger = logging.getLogger(__name__)
 
 
+def _thinking_degraded(model_name: str | None, thinking_enabled: bool) -> bool:
+    """该次 run 是否“请求了思考但模型不支持”（与工厂的降级判定同源）。
+
+    参数：
+        model_name: 配置里的模型名（None = 激活模型）
+        thinking_enabled: 用户是否开了思考
+
+    返回：
+        True 表示已降级（工厂会忽略思考开关继续跑）；能力查不到时按 False 处理
+    """
+    if not thinking_enabled:
+        return False
+    try:
+        from harness.models.capabilities import supports_thinking
+
+        return not bool(supports_thinking(model_name))
+    except Exception:  # noqa: BLE001 —— 能力探测失败不影响 run，仅少一个提示
+        return False
+
+
+def _route_model(
+    messages: Sequence[Any],
+    *,
+    model_name: str | None,
+    thinking_enabled: bool,
+) -> tuple[str | None, dict[str, Any]]:
+    """用动态路由把「未指定的模型」解析成具体模型名。
+
+    参数：
+        messages: 本轮输入消息（路由据此判断意图）
+        model_name: 调用方显式指定的模型名（非空则路由会尊重它）
+        thinking_enabled: 是否开了深度思考
+
+    返回：
+        (最终模型名, 决策元信息 dict)。决策元信息进 run_meta，供前端展示
+        「已自动选择 X（因为 Y）」。
+
+    降级：路由模块自身抛错时不影响 run，退回调用方给的名字
+        （即改造前的行为），只记一条 warning。
+    """
+    try:
+        from harness.models.routing import get_model_router
+
+        decision = get_model_router().decide(
+            messages,
+            thinking_enabled=thinking_enabled,
+            explicit_model=model_name,
+        )
+        if decision.model_name != model_name:
+            logger.info(
+                "模型路由：%s -> %s（%s）",
+                model_name or "auto",
+                decision.model_name or "auto",
+                decision.reason,
+            )
+        return decision.model_name, decision.to_meta()
+    except Exception:  # noqa: BLE001 —— 路由失败不阻断 run，退回原始行为
+        logger.warning("模型路由决策失败，使用调用方指定的模型", exc_info=True)
+        return model_name, {
+            "model_name": model_name or "",
+            "source": "fallback",
+            "reason": "模型路由不可用，使用调用方指定的模型",
+            "matched_keyword": None,
+            "escalated": False,
+        }
+
+
 class RunManager:
     """run 编排管理：创建 / 执行 / 取消 / 查询一次 agent run。"""
 
@@ -137,6 +204,14 @@ class RunManager:
         if not self._store.connected:
             await self._store.connect()
 
+        # 动态路由：调用方没指定模型时按规则自动挑（默认 flash，命中关键词升 pro）。
+        # 决策原因随 run_meta 下发，前端思考链据此展示「已自动选择 X」。
+        resolved_model, routing_meta = _route_model(
+            messages,
+            model_name=model_name,
+            thinking_enabled=thinking_enabled,
+        )
+
         run_id = uuid.uuid4().hex
         created_at = time.time()
         preview = messages_preview(messages)
@@ -156,7 +231,7 @@ class RunManager:
             run_id=run_id,
             thread_id=thread_id,
             user_id=user_id,
-            model_name=model_name or "",
+            model_name=resolved_model or "",
             thinking_enabled=thinking_enabled,
             input_preview=preview,
             created_at=created_at,
@@ -167,11 +242,11 @@ class RunManager:
             thread_id=thread_id,
             user_id=user_id,
             status=RUN_STATUS_PENDING,
-            model_name=model_name or "",
+            model_name=resolved_model or "",
             input_preview=preview,
             created_at=created_at,
         )
-        # 开跑先发 run_started 与 run_meta
+        # 开跑先发 run_started 与 run_meta（事件会被总线录制，订阅晚一步也能回放拿到）
         await self._bus.publish(
             make_event(
                 RunEventType.RUN_STARTED,
@@ -185,7 +260,15 @@ class RunManager:
                 RunEventType.RUN_META,
                 run_id=run_id,
                 thread_id=thread_id,
-                payload={"model_name": model_name or "auto"},
+                payload={
+                    "model_name": resolved_model or "auto",
+                    "thinking_enabled": bool(thinking_enabled),
+                    # 降级标记：用户开了思考但模型不支持（工厂已静默忽略），
+                    # 前端据此在思考链里说明，不拿一行错误打断会话
+                    "thinking_degraded": _thinking_degraded(resolved_model, thinking_enabled),
+                    # 路由决策：模型是怎么被选出来的（含原因），前端展示用
+                    "routing": routing_meta,
+                },
             )
         )
         # 后台执行；任务结束后清理句柄与并发槽
@@ -320,6 +403,45 @@ class RunManager:
                 row_to_record(row) for row in rows if row["run_id"] not in seen
             )
         return records[:limit]
+
+    async def get_thread_chains(
+        self, *, user_id: str, thread_id: str, limit: int = 100
+    ) -> list[dict[str, Any]]:
+        """取某线程已落库 run 的思考链事件（创建时间正序，供前端历史回放）。
+
+        参数：
+            user_id / thread_id: 归属
+            limit: 最多条数
+
+        返回：
+            [{run_id, status, model_name, started_at, finished_at, events:[...]}]；
+            未收尾的 run（事件尚未落库）不在其中，由前端实时流承担。
+        """
+        import json
+
+        if not self._store.connected:
+            return []
+        rows = await self._store.fetch_chains(
+            user_id=user_id, thread_id=thread_id, limit=limit
+        )
+        chains: list[dict[str, Any]] = []
+        for row in rows:
+            item = dict(row)
+            try:
+                events = json.loads(item.get("events") or "[]")
+            except (json.JSONDecodeError, TypeError):
+                events = []
+            chains.append(
+                {
+                    "run_id": item["run_id"],
+                    "status": item["status"],
+                    "model_name": item.get("model_name") or "",
+                    "started_at": item.get("started_at"),
+                    "finished_at": item.get("finished_at"),
+                    "events": events if isinstance(events, list) else [],
+                }
+            )
+        return chains
 
     @staticmethod
     async def _await_task_quiet(task: Any) -> None:

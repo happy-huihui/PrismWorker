@@ -3,6 +3,7 @@ from __future__ import annotations
 import re
 from pathlib import PurePosixPath
 
+from harness.config.paths import SKILLS_CONTAINER_PREFIX, VIRTUAL_PATH_PREFIX
 from harness.skills.package_paths import is_eval_fixture_path
 from harness.skills.review.models import make_finding, normalize_relative_path
 
@@ -23,7 +24,17 @@ _MARKDOWN_LINK_RE = re.compile(
     r"!?\[[^\]]*\]\(([^)\s]+)(?:\s+\"[^\"]*\")?\)"
 )
 
-_CODE_SPAN_RE = re.compile(r"`([^`]+)`")
+# 行内代码 span。**必须排除换行**（`[^`\n]+`）：
+# 按 CommonMark，行内代码不能跨行；若允许换行，正则会把**围栏代码块**
+# 的首尾反引号配成一对 —— 例如
+#     ```markdown
+#     - 技术栈：[语言 / 框架]
+#     ```
+# 中 ``` 的前两个反引号互相不成对，于是「第 3 个反引号 … 结束围栏的第 1 个反引号」
+# 被当成一个 span，把整块正文吞成「引用路径」，进而报出
+# `resource.missing: Referenced resource does not exist: markdown\n- 技术栈：...`
+# 这类垃圾 finding（实测：15 个技能里 12 个中招，105 条代码 span 引用中 61 条是误报）。
+_CODE_SPAN_RE = re.compile(r"`([^`\n]+)`")
 
 _PATH_TOKEN_RE = re.compile(
     r"(?<![\w./-])(?:references|scripts|templates|assets|evals)"
@@ -33,6 +44,30 @@ _PATH_TOKEN_RE = re.compile(
 _RESOURCE_DIRS: frozenset[str] = frozenset({
     "references", "scripts", "templates", "assets", "evals",
 })
+
+
+"""平台刻意挂载的容器内绝对路径前缀。
+
+技能说明书里提到它们**不是**「引用越界」：
+    - `/mnt/user-data`  沙箱工作区（产物 / 工作文件的正常去向，沙箱刻意挂载）
+    - `/mnt/skills`     技能自身的只读挂载点（说明书引用自带脚本 / 跨技能脚本属正常）
+两者都是平台设计的一部分，与「乱指 /etc/passwd」性质不同。
+常量统一取自 harness.config.paths，不写死字符串。
+"""
+_PLATFORM_ABSOLUTE_PREFIXES: tuple[str, ...] = (VIRTUAL_PATH_PREFIX, SKILLS_CONTAINER_PREFIX)
+
+
+def _is_platform_absolute(ref: str) -> bool:
+    """判断绝对路径是否落在平台刻意挂载的前缀下。
+
+    带 `..` 段的一律**不放行**：白名单只管「正当目的地」，
+    不管「借道穿越」（如 `/mnt/user-data/../../etc/passwd` 仍按越界报告）。
+    前缀必须按段边界匹配，避免 `/mnt/user-datafoo` 这类搭车路径蒙混过关。
+    """
+    for prefix in _PLATFORM_ABSOLUTE_PREFIXES:
+        if ref == prefix or ref.startswith(prefix + "/"):
+            return ".." not in PurePosixPath(ref).parts
+    return False
 
 
 
@@ -80,12 +115,20 @@ def _resolve_reference(source_path: str, raw_ref: str) -> str | None:
     if not ref:
         return None
 
+    # 提取噪音：`///`、` / ` 这类「只剩斜杠」的 token 不是路径，直接丢弃。
+    if not ref.strip("/"):
+        return None
+
     if ref.startswith("#"):
         return None
     if re.match(r"^[A-Za-z][A-Za-z0-9.+-]*:", ref) or "://" in ref:
         return None
 
     if ref.startswith("/"):
+        # 平台刻意挂载的绝对路径（/mnt/user-data、/mnt/skills）属正当去向，不报越界；
+        # 其余绝对路径（如 /etc/passwd）仍按越界报告。
+        if _is_platform_absolute(ref):
+            return None
         return "__ESCAPES__"
 
     base = PurePosixPath(source_path).parent

@@ -4,9 +4,12 @@ from harness.runtime.sandbox.runtime import (
     derive_sandbox_id,
     get_app_sandbox,
     get_runtime_thread_id,
+    get_runtime_user_id,
+    is_workspace_mounted,
     push_uploads_to_sandbox,
     release_app_sandbox,
     set_runtime_thread_id,
+    set_runtime_user_id,
     stop_app_sandbox,
 )
 
@@ -18,6 +21,9 @@ from harness.runtime.sandbox.runtime import (
 __all__ = [
     "set_runtime_thread_id",
     "get_runtime_thread_id",
+    "set_runtime_user_id",
+    "get_runtime_user_id",
+    "is_workspace_mounted",
     "derive_sandbox_id",
     "get_app_sandbox",
     "release_app_sandbox",

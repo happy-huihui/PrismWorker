@@ -45,7 +45,7 @@ export interface RunCreateBody {
 
 export interface ModelOut {
   name: string
-  provider: 'openai' | 'deepseek' | string
+  provider: 'openai' | 'deepseek' | 'mimo' | string
   model: string
   supports_vision: boolean
   supports_thinking: boolean
@@ -73,4 +73,21 @@ export interface ApiErrorShape {
 
 export interface HealthOut {
   status: string
+}
+
+
+/** 思考链回放：单条事件（event=类型名，data=payload），与 SSE 帧同构 */
+export interface ChainEvent {
+  event: string
+  data: Record<string, unknown>
+}
+
+/** 一个历史 run 的思考链回放包（GET /threads/{id}/chains） */
+export interface ChainOut {
+  run_id: string
+  status: string
+  model_name: string
+  started_at: number | null
+  finished_at: number | null
+  events: ChainEvent[]
 }

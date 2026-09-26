@@ -1,19 +1,21 @@
 from __future__ import annotations
 
 from harness.models.deepseek_strategy import DeepSeekChatModelStrategy
+from harness.models.mimo_strategy import MiMoChatModelStrategy
 from harness.models.openai_strategy import OpenAIChatModelStrategy
 from harness.models.strategy import ChatModelStrategy
 
 """策略注册表
 
     职责：记一张表，provider 名字 -> 该用哪个策略，工厂来这张表按名字取策略。
-    现状：目前只登记了 openai 和 deepseek 两种。
+    现状：登记了 openai（及其兼容接口）、deepseek、mimo 三种。
 """
 
 # provider 标识 → 策略单例（策略无状态，进程内复用即可）
 _STRATEGIES: dict[str, ChatModelStrategy] = {
     OpenAIChatModelStrategy.provider: OpenAIChatModelStrategy(),
     DeepSeekChatModelStrategy.provider: DeepSeekChatModelStrategy(),
+    MiMoChatModelStrategy.provider: MiMoChatModelStrategy(),
 }
 
 

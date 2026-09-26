@@ -86,8 +86,13 @@ def format_system_prompt(
         names.append(f"- {name}：{desc}" if desc else f"- {name}")
     tool_block = "\n".join(names) if names else "（当前没有可用工具，直接基于知识回答）"
 
-    # 2.沙箱段是独立模板，仅在启用时取原文，否则空串
-    sandbox_note = load_text("lead_agent/sandbox_note") if sandbox_enabled else ""
+    # 2.沙箱段是独立模板：连上沙箱 → 给路径约定；没连上 → 明确告知「你没有写盘能力」。
+    #   为什么两种情况都要有模板：实测（2026-09-23）沙箱不可用时，模型不知道这件事，
+    #   连派 3 个子代理去「确认能不能写文件」，白烧了大量 token 才退回「贴正文」。
+    #   与其让它自己试探，不如在提示里直接说清，并给出替代交付方式。
+    sandbox_note = load_text(
+        "lead_agent/sandbox_note" if sandbox_enabled else "lead_agent/sandbox_off"
+    )
 
     # 3.子代理分节按注册表 + 上限动态渲染（无 task 工具则为空）
     subagent_section = _build_subagent_section(app_config, has_task=has_task)

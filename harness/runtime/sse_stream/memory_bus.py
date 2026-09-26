@@ -11,10 +11,15 @@ from harness.runtime.events.types import RunEvent, TERMINAL_EVENT_TYPES
 
 """事件总线（memory_bus）——run 事件的进程内发布/订阅枢纽。
 
-    设计对齐「生产侧不阻塞」原则：订阅者队列有界（默认 1000 条），队列满时
+    设计对齐「生产侧不阻塞」原则：订阅者队列有界（默认 4096 条），队列满时
     普通事件直接丢弃并计数（思考链可丢、agent 执行不可停）；终端事件
     （run_finished / run_error）与 END 哨兵走高优先级必达通道（阻塞入队，
     保证消费端一定能收到收尾信号）。订阅者彼此独立，互不拖累。
+
+    回放：文本改成逐 token 下发后，“建 run 时就发事件、前端拿到 run_id
+    后才订阅”的竞态会被放大（run_started / run_meta 永远错过）。所以总线按 run
+    录制已发布事件，新订阅者先回放存量再跟实时（快照与入队之间无 await，
+    不会重复投递）。录制同时用于 run 结束后落库与历史思考链回放。
 
     典型消费流程：
         async for event in bus.subscribe(run_id):
@@ -32,8 +37,13 @@ from harness.runtime.events.types import RunEvent, TERMINAL_EVENT_TYPES
 
 logger = logging.getLogger(__name__)
 
-# 每个订阅者队列容量上限（满则丢普通事件）
-_DEFAULT_QUEUE_MAXSIZE = 1000
+# 每个订阅者队列容量上限（满则丢普通事件）；逐 token 文本事件量比旧版大两个数量级，
+# 千字答复实测 150~800 块，留足余量避免丢字
+_DEFAULT_QUEUE_MAXSIZE = 4096
+
+# 参与「相邻合并」的文本类事件：录制/回放时把同一消息的连续增量并成一条，
+# 控制落库体积（runs.events）
+_MERGEABLE_TEXT_EVENTS = frozenset({"message_chunk", "thinking_chunk", "reasoning_chunk"})
 
 
 @dataclass(frozen=True)
@@ -60,6 +70,9 @@ class EventBus:
         self._unwatched_events: int = 0
         self._queue_maxsize = queue_maxsize
         self._lock = threading.Lock()
+        # 按 run 录制已发布事件（一份数据两用：订阅回放 + run 结束后落库）；
+        # 相邻同类文本增量合并为一条，控制体积
+        self._record: dict[str, list[RunEvent]] = {}
 
 
     async def publish(self, event: RunEvent) -> RunEvent:
@@ -74,6 +87,8 @@ class EventBus:
         # 为该 run 分配递增序号，并复制成带 seq 的事件
         seq = self._next_seq(event.run_id)
         event = _with_seq(event, seq)
+        # 录制（无论有无订阅者都要录，保证后台 run 也能持久化思考链）
+        self._record_event(event)
         subs = self._subscribers.get(event.run_id)
         # 无订阅者：计入 unwatched，直接返回
         if not subs:
@@ -102,26 +117,40 @@ class EventBus:
         """
         # 标记已结束，向所有订阅队列投递 END 哨兵
         self._ended.add(run_id)
+        # 录制缓冲随 run 一起释放（drain_record 不 pop，避免抢在回放前丢数据）
+        self._record.pop(run_id, None)
         subs = self._subscribers.pop(run_id, [])
         for queue in subs:
             await queue.put(_EndMarker(cause))
 
 
-    async def subscribe(self, run_id: str) -> AsyncIterator[RunEvent]:
+    async def subscribe(
+        self, run_id: str, *, replay: bool = True
+    ) -> AsyncIterator[RunEvent]:
         """订阅一个 run 的事件流，直到 END 哨兵到达。
 
         参数：
             run_id: 目标 run
+            replay: 是否先回放已录制的事件（默认是）——订阅者往往晚于开跑才连上，
+                不回放就会永久丢掉 run_started / run_meta 这类首批事件
 
         返回：
             异步迭代器，逐个产出该 run 的事件；run 已结束则立即结束
+
+        说明：存量快照与队列挂载之间没有 await，单线程事件循环下与 publish
+            无交叉，不会出现「同一条既回放又实时」的重复投递。
         """
         # 每个订阅者拥有独立队列；已结束的 run 不再产生事件
         queue: asyncio.Queue[Any] = asyncio.Queue(maxsize=self._queue_maxsize)
         if run_id in self._ended:
             return
+        backlog = list(self._record.get(run_id, ())) if replay else []
         self._subscribers.setdefault(run_id, []).append(queue)
         try:
+            # 1.先补发存量（回放）
+            for event in backlog:
+                yield event
+            # 2.再跟实时流
             while True:
                 item = await queue.get()
                 # 收到 END 哨兵即收尾
@@ -143,6 +172,7 @@ class EventBus:
         # 事件腾出槽位，保证 END 哨兵必达。
         subs = self._subscribers.pop(run_id, [])
         self._ended.add(run_id)
+        self._record.pop(run_id, None)
         for queue in subs:
             marker = _EndMarker("cancelled")
             for _attempt in range(2):
@@ -180,6 +210,45 @@ class EventBus:
         self._dropped.clear()
         self._ended.clear()
 
+
+    def drain_record(self, run_id: str) -> list[dict[str, Any]]:
+        """取出某 run 的录制事件流（worker 收尾时持久化用；不删除，留给回放）。
+
+        参数：
+            run_id: 目标 run
+
+        返回：
+            紧凑事件列表 [{event, data}, ...]（按发布顺序）；录制本体在
+            publish_end / cancel 时才释放
+        """
+        return [
+            {"event": item.type.value, "data": dict(item.payload or {})}
+            for item in self._record.get(run_id, ())
+        ]
+
+    def _record_event(self, event: RunEvent) -> None:
+        """把一条事件追加到该 run 的录制缓冲；相邻同类文本增量合并。"""
+        etype = event.type.value
+        buf = self._record.setdefault(event.run_id, [])
+        data = event.payload or {}
+        # 1.文本增量：同类型 + 同 message_id 才合并。跳消息粘连会让前端无法按
+        #   消息定性（哪条是答复、哪条被降级），历史回放也会把两轮叙述接成一团
+        last = buf[-1] if buf else None
+        if etype in _MERGEABLE_TEXT_EVENTS and last is not None:
+            last_data = last.payload or {}
+            same_kind = last.type.value == etype
+            same_message = (
+                last_data.get("message_id") == data.get("message_id")
+                # 旧版 thinking_chunk 不带 message_id，保持无条件合并
+                or etype == "thinking_chunk"
+            )
+            if same_kind and same_message:
+                buf[-1] = _with_text(
+                    last, str(last_data.get("text", "")) + str(data.get("text", ""))
+                )
+                return
+        # 2.其余事件原样追加（事件本体已带 seq，回放时可直接当 SSE 帧 id）
+        buf.append(event)
 
     def _next_seq(self, run_id: str) -> int:
         """为该 run 分配下一个递增序号。
@@ -225,6 +294,23 @@ def _with_seq(event: RunEvent, seq: int) -> RunEvent:
     from dataclasses import replace
 
     return replace(event, seq=seq)
+
+
+def _with_text(event: RunEvent, text: str) -> RunEvent:
+    """把事件 payload 的 text 换成合并后的新值（其余字段/seq 不变）。
+
+    参数：
+        event: 被合并到的前一条事件
+        text: 拼接后的完整文本
+
+    返回：
+        新事件副本（录制缓冲里原地替换，seq 保持首条的值）
+    """
+    from dataclasses import replace
+
+    payload = dict(event.payload or {})
+    payload["text"] = text
+    return replace(event, payload=payload)
 
 
 

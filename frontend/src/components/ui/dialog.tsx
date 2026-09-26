@@ -1,6 +1,6 @@
 import * as React from 'react'
 import * as DialogPrimitive from '@radix-ui/react-dialog'
-import { XIcon } from 'lucide-react'
+import { XIcon } from '@/components/icons'
 
 import { cn } from '@/lib/utils'
 
@@ -26,7 +26,7 @@ function DialogOverlay({ className, ...props }: React.ComponentProps<typeof Dial
       data-slot="dialog-overlay"
       className={cn(
         'data-[state=open]:animate-in data-[state=closed]:animate-out data-[state=closed]:fade-out-0 data-[state=open]:fade-in-0',
-        'fixed inset-0 z-50 bg-black/50',
+        'fixed inset-0 z-50 bg-foreground/40 backdrop-blur-[2px]',
         className,
       )}
       {...props}

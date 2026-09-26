@@ -1,13 +1,18 @@
-"""子代理配置。
-
-管理子代理（subagent）的运行时限制：单次执行超时、最大轮次、
-每次运行允许的总调用次数、token 预算。子代理是 main agent
-通过 task 工具派发出去的独立执行单元。
-"""
-
 from __future__ import annotations
 
 from pydantic import BaseModel, Field
+
+"""子代理配置
+
+    职责：管理子代理（subagent）的运行时限制——单次执行超时、最大轮次、
+         每次运行允许的总调用次数、token 预算。
+    背景：子代理是主 Agent 通过 task 工具派发出去的独立执行单元，
+         预算与轮次上限在这里统一定义，避免被无限递归拖垮。
+
+    对外暴露：
+        - SubagentConfig       单个子代理的按名覆盖配置
+        - SubagentsAppConfig   子代理运行总配置
+"""
 
 
 class SubagentConfig(BaseModel):

@@ -1,44 +1,69 @@
+<div align="center">
+
 # PrismWorker
+
+</div>
 
 面向多步骤复杂任务的 Harness Agent。基于 LangGraph 实现 ReAct 编排，提供子代理协作、跨会话持久记忆、沙盒隔离执行、Skill/Tool 装配与 Middleware 链式上下文治理。拥有文件、代码、图片产物生成能力。
 
 ![PrismWorker 工作台界面](assets/example.png)
 
-## NextPlan:
-    - SSE 连接速度优化
-    - 前端 UI 重构 
-    - 用户 Agnet.md 支持
-    - 重构提示词模板管理             ✅
-    - 支持当前会话使用临时 skill
-    - 会话轮次快速索引
-    - 树形对话
-        - 子卡片：深挖背景知识
-        - 关联卡片：横向对比发散
-        - 分支卡片：继承上下文另起炉灶
-    - 记忆检索
-    - 记忆系统学习强化
-    - 完整 langsmith 测评
-    - 完整日志观测链路
-    
+## NextPlan
 
-## 核心特性
+- [x] SSE 连接速度优化
+- [x] 前端 UI 重构
+- [x] 会话轮次快速索引
+- [x] 重构提示词模板管理
+- [ ] 用户 Agent.md 支持
+- [ ] 支持当前会话使用临时 skill
+- [ ] 树形对话
+  - [ ] 子卡片：深挖背景知识
+  - [ ] 关联卡片：横向对比发散
+  - [ ] 分支卡片：继承上下文另起炉灶
+- [ ] 记忆多路检索
+- [ ] 完整日志观测链路
+- [ ] 完整 langsmith 测评
 
-- **ReAct 编排**：LangGraph 驱动，模型每轮「先思考、再行动」，支持多轮工具/Skill 动态装配
-- **子代理协作**：主代理可派发子代理并行处理子任务，并统一收拢结果交付
-- **跨会话持久记忆**：SQLite 检查点 + 全文/向量检索级记忆，会话可长期延续
-- **沙盒隔离执行**：基于 Docker all-in-one-sandbox 隔离执行命令与文件读写，安全可控
-- **产物生成**：文件、代码、图片等多形态交付物，支持流式预览与下载
-- **Middleware 治理**：链式中间件管理上下文、Token 用量、工具进度与命令安全审计
+## 项目结构
+
+```
+PrismWorker
+├── .prism-worker/        # 运行时数据（自动生成，勿提交版本库）
+│   ├── data/             # SQLite 检查点（checkpoints.db）与鉴权密钥
+│   ├── logs/             # 运行日志（app.log）
+│   ├── users/            # 用户数据目录
+│   └── users.json        # 用户索引
+├── app/                  # FastAPI 服务端
+│   ├── api/              # 路由与请求处理
+│   ├── core/             # 核心逻辑与启动引导
+│   └── runner.py         # 启动入口
+├── assets/               # 静态资源
+├── frontend/             # React 前端
+│   └── src/              
+├── harness/              # Agent 运行时
+│   ├── agents/           # 主代理编排
+│   ├── subagents/        # 子代理协作
+│   ├── middleware/       # 链式中间件治理
+│   ├── skills/           # Skill 装配
+│   ├── tools/            # 工具装配
+│   ├── memory/           # 记忆
+│   ├── sandbox/          # 沙箱
+│   ├── models/           # 模型注册与路由
+│   ├── config/           # 配置加载
+│   └── runtime/          # 运行时环境
+└── skills/               # Skill 文档库
+    └── public/           # 公开技能（code-documentation / deep-research 等）
+```
 
 ## 技术栈
 
-| 层 | 技术                                            |
-| --- |-----------------------------------------------|
+| 层   | 技术                                            |
+|------|-----------------------------------------------|
 | 编排 | LangGraph / LangChain（Python ≥ 3.12）          |
 | 后端 | FastAPI + Uvicorn，SSE 实时事件流                   |
-| 模型 | DeepSeek / OpenAI / Anthropic / Google（可插拔）   |
+| 模型 | MiMo / OpenAI / DeepSeek / Doubao-Seedream           |
 | 记忆 | SQLite + langgraph-checkpoint-sqlite + FTS5   |
-| 沙盒 | Docker all-in-one-sandbox                     |
+| 沙箱 | Docker                                        |
 | 前端 | React 19 + TypeScript + Vite + Tailwind CSS 4 |
 
 ## 快速开始
@@ -54,11 +79,3 @@ python -m app.runner                             # http://127.0.0.1:8000
 cd frontend
 pnpm install && pnpm dev                         # http://localhost:5173
 ```
-
-> 沙盒依赖本机 docker ，首次运行会自动拉取 all-in-one-sandbox 镜像。
-
-## 目录结构
-
-- `app/` —— FastAPI 服务端：API、run 编排、SSE 事件总线
-- `harness/` —— Agent 运行时：agents / subagents / middleware / skills / tools / memory / sandbox
-- `frontend/` —— React 工作台前端

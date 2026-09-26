@@ -9,7 +9,7 @@ from langchain.agents.middleware import AgentMiddleware
 from langchain.agents.middleware import types
 from langchain_core.messages import SystemMessage
 
-from harness.config.paths import get_paths
+from harness.config.skills import SkillsConfig
 from harness.prompt import load_text, render_text
 from harness.skills.frontmatter import split_skill_markdown
 
@@ -20,7 +20,7 @@ ModelRequest = types.ModelRequest
     技能中间件（skill_middlewares）——技能发现、激活与工具访问策略。
 
     SkillActivationMiddleware：
-      1. abefore_model 扫描技能目录（{base_dir}/skills/*/SKILL.md），用
+      1. abefore_model 扫描技能目录（{项目根}/skills/public/*/SKILL.md），用
          frontmatter 解析每个技能的 name/description，把可用技能清单以
          <available_skills> 结构块注入系统消息，让模型知道可以激活哪些技能；
       2. awrap_model_call 检测模型输出中的激活指令标签
@@ -37,8 +37,6 @@ ModelRequest = types.ModelRequest
 """
 
 logger = logging.getLogger(__name__)
-
-_DEFAULT_SKILLS_DIR_NAME = "skills"
 
 _ACTIVATE_TAG_RE = re.compile(
     r"<\s*activate_skill\s+name=[\"']([^\"']+)[\"']\s*/?>",
@@ -116,14 +114,20 @@ class SkillActivationMiddleware(AgentMiddleware):
     """技能激活中间件：注入技能清单 + 响应激活指令加载技能正文。"""
 
     def __init__(self, *, skills_dir: str | Path | None = None) -> None:
-        """初始化；skills_dir 指定技能目录（默认 {base_dir}/skills）。"""
+        """初始化；skills_dir 指定技能目录（默认 {项目根}/skills/public）。"""
         self._skills_dir = skills_dir
 
     def _resolve_skills_dir(self) -> Path:
-        """解析技能目录绝对路径。"""
+        """解析技能目录绝对路径（与 review 工具共用同一个技能根）。
+
+        默认走 SkillsConfig.public_skills_dir()，即 {项目根}/skills/public。
+        此前用的是 get_paths().base_dir / "skills"（= {数据根}/skills），
+        与 review_skill_package_tool 的 SkillsConfig().skills_root 不是同一个目录，
+        导致「审查看得到的技能，激活看不到」。
+        """
         if self._skills_dir is not None:
             return Path(self._skills_dir).resolve()
-        return (get_paths().base_dir / _DEFAULT_SKILLS_DIR_NAME).resolve()
+        return SkillsConfig().public_skills_dir()
 
     async def awrap_model_call(
         self,

@@ -66,6 +66,8 @@ def build_lead_agent(
         app_config,
         event_sink=event_sink,
         skills_dir=skills_dir,
+        # 传沙箱给中间件：「写前读」护栏用它探测目标是否存在（不存在即新建 → 放行）
+        sandbox=sandbox,
     )
 
     seen: set[str] = set()
@@ -110,13 +112,14 @@ def assemble_tools(
 ) -> list[BaseTool]:
     """按配置组装 Lead Agent 的全部可用工具（含开关与白名单过滤）。
 
-    工具来源（四组）：
+    工具来源（五组）：
       1. 沙箱工具：read_file / write_file / glob_files / grep_files / list_dir / exec_command
          （sandbox 提供时注册；缺沙箱则跳过这一组）
       2. 内置工具：ask_clarification / list_uploaded_files / present_file /
          review_skill_package / task / view_image（视觉模型才注册）
       3. web 工具：web_search / web_fetch（按 tools 配置开关）
-      4. 记忆工具：save_memory / search_memory / delete_memory（memory.mode=tool 时）
+      4. 生成工具：generate_image（火山方舟豆包生图，按 tools.ark_image.enabled 开关）
+      5. 记忆工具：save_memory / search_memory / delete_memory（memory.mode=tool 时）
 
     所有工具最终再过一遍 app_config.is_tool_enabled 白名单过滤。
     """
@@ -163,6 +166,14 @@ def assemble_tools(
             tools.append(web_fetch_tool)
         except Exception as exc:  # noqa: BLE001
             logger.warning("web_fetch 工具加载失败: %s", exc)
+
+    if app_config.tools.ark_image.enabled:
+        try:
+            from harness.community.ark_image.tools import generate_image_tool
+
+            tools.append(generate_image_tool)
+        except Exception as exc:  # noqa: BLE001 —— 依赖缺失时可注入性失败
+            logger.warning("generate_image 工具加载失败: %s", exc)
 
     if app_config.memory.mode == "tool":
         try:

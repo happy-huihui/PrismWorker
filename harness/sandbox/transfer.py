@@ -162,7 +162,13 @@ def _pull_single_file(
         raw = base64.b64decode(chunk, validate=True)
         if not raw:
             break
-        with target.open("ab") as fh:
+        # 首块用 "wb" 截断，之后才 "ab" 追加。
+        # 为什么必须截断（2026-09-23）：容器现在会挂载宿主工作区，此时宿主目标
+        # 文件与容器源文件是**同一份**；若一律用 "ab" 追加，回传会把已有内容
+        # 再写一遍 → 文件体积翻倍（且字节数对账 written 仍等于 size_bytes，
+        # 检查不出来）。首块截断让回传变成幂等操作。
+        mode = "wb" if offset == 0 else "ab"
+        with target.open(mode) as fh:
             fh.write(raw)
         written += len(raw)
         offset += len(raw)

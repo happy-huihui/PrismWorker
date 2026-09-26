@@ -1,5 +1,5 @@
 import { useNavigate } from 'react-router-dom'
-import { AlertTriangle, Loader2 } from 'lucide-react'
+import { AlertTriangle, Loader2 } from '@/components/icons'
 import { toast } from 'sonner'
 
 import { Button } from '@/components/ui/button'

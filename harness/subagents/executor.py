@@ -14,6 +14,7 @@ from langchain_core.messages import HumanMessage
 from langchain_core.tools import BaseTool
 from langgraph.errors import GraphRecursionError
 
+from harness.agents.middlewares.model_output_sanitizer import ModelOutputSanitizerMiddleware
 from harness.agents.thread_state import ThreadState
 from harness.models.factory import create_chat_model
 from harness.subagents.config import SubagentConfig, resolve_subagent_model_name
@@ -108,6 +109,9 @@ class SubagentExecutor:
             tools=tools,
             system_prompt=self.config.system_prompt,
             state_schema=ThreadState,
+            # 子代理同用 MiMo，退化输出照样会打挂执行（无兜底中间件）——
+            # 挂边界净化：幻影 tool_call / 空 id / 正文 `<tool_call>` 壳在这里消毒
+            middleware=[ModelOutputSanitizerMiddleware()],
         )
 
         initial_state: dict[str, Any] = {

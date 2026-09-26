@@ -133,6 +133,9 @@ class SummarizationMiddleware(AgentMiddleware):
         return {
             "messages": new_messages,
             "summary_text": combined_summary,
+            # 被移除的消息原文归档到独立 channel：模型上下文（messages）精简，
+            # 但对话展示历史（history reader 合并 archived + messages）不丢消息。
+            "archived_messages": list(to_summarize),
             "prints": [
                 f"对话超长，已压缩早期 {len(to_summarize)} 条消息为摘要"
                 f"（保留最近 {len(preserved)} 条）",

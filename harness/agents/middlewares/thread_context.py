@@ -83,9 +83,6 @@ class ThreadContextMiddleware(AgentMiddleware):
             except OSError as exc:
                 logger.warning("创建线程目录失败 %s: %s", thread_id, exc)
 
-        return {
-            "thread_data": thread_data,
-            "prints": [
-                f"会话上下文就绪（线程 {thread_id}，用户 {user_id}）",
-            ],
-        }
+        # 只回写 thread_data：不再往 prints 记“会话上下文就绪（线程…，用户…）”——
+        # 内部准备信息不是思考内容，进前端只会污染思考链
+        return {"thread_data": thread_data}

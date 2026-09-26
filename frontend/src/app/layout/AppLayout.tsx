@@ -1,6 +1,7 @@
 import { useState } from 'react'
 import { Outlet } from 'react-router-dom'
 
+import { LoginDialog } from '@/components/auth/LoginDialog'
 import { Toaster } from '@/components/ui/sonner'
 
 import { ThreadSidebar } from './ThreadSidebar'
@@ -38,6 +39,8 @@ export function AppLayout() {
           <Outlet />
         </div>
       </main>
+      {/* 全站唯一登录弹窗（开关由 AuthProvider 控制，多处入口共享） */}
+      <LoginDialog />
       <Toaster position="top-center" richColors />
     </div>
   )

@@ -14,12 +14,6 @@
     - tool_call_id: Annotated[str, InjectedToolCallId] 注入
     - 返回 Command(update={"messages": [ToolMessage(...)]})
 
-设计说明（与用户确认）：
-    1. 文件类工具的 path 参数强制校验：必须在 /mnt/user-data 内，
-       不允许 .. 穿越（AioSandbox._validate_path 承担）。
-    2. exec_command 默认允许任意命令（allow_host_bash=true 语义），
-       其 work_dir 参数同样限制在 /mnt/user-data 内。
-    3. 命令非零退出码不抛异常，作为文本返回给模型自行修正。
 """
 
 from __future__ import annotations
@@ -32,7 +26,7 @@ from langchain_core.messages import ToolMessage
 from langchain_core.tools import BaseTool
 from langgraph.types import Command
 
-from harness.config.paths import VIRTUAL_PATH_PREFIX
+from harness.config.paths import SKILLS_CONTAINER_PREFIX, VIRTUAL_PATH_PREFIX
 from harness.sandbox.aio_sandbox import AioSandbox
 from harness.sandbox.exceptions import SandboxError
 from harness.tools.types import Runtime
@@ -99,10 +93,10 @@ def _make_read_file(sandbox: AioSandbox):
         start_line: int | None = None,
         end_line: int | None = None,
     ) -> Command:
-        """读取沙箱工作区内的文件内容。
+        """读取沙箱内的文件内容（仅限 /mnt/user-data 与只读的 /mnt/skills 之下）。
 
         Args:
-            path: 要读取的文件，必须是 {VIRTUAL_PATH_PREFIX} 下的路径
+            path: 要读取的文件路径，必须在 /mnt/user-data（可写工作区）或 /mnt/skills（只读技能目录，技能自带的 references/ 与 scripts/ 都在这里）之下
             start_line: 起始行号（1 起；省略则从文件头）
             end_line: 结束行号（含；省略则到文件尾）
         """
@@ -128,7 +122,7 @@ def _make_write_file(sandbox: AioSandbox):
         """写入或追加文件到沙箱工作区。
 
         Args:
-            path: 目标文件路径，必须是 {VIRTUAL_PATH_PREFIX} 下的路径
+            path: 目标文件路径，必须在 /mnt/user-data 之下（/mnt/skills 是只读挂载的技能目录，不可写入）
             content: 文件内容
             append: true 时追加到文件末尾，默认覆写整个文件
         """
@@ -154,7 +148,7 @@ def _make_glob_files(sandbox: AioSandbox):
         """列出目录下匹配 glob 模式的文件路径。
 
         Args:
-            path: 搜索根目录，必须是 {VIRTUAL_PATH_PREFIX} 下的路径
+            path: 搜索根目录，必须在 /mnt/user-data 或 /mnt/skills 之下
             pattern: glob 模式，如 "**/*.py" 或 "*.md"
             max_results: 最多返回多少条结果（默认 200）
         """
@@ -183,7 +177,7 @@ def _make_grep_files(sandbox: AioSandbox):
         """在目录下的文件中按正则搜索内容。
 
         Args:
-            path: 搜索根目录，必须是 {VIRTUAL_PATH_PREFIX} 下的路径
+            path: 搜索根目录，必须在 /mnt/user-data 或 /mnt/skills 之下
             pattern: 正则表达式（Python 风格）
             max_results: 最多返回多少条匹配（默认 100）
         """
@@ -211,10 +205,10 @@ def _make_list_dir(sandbox: AioSandbox):
         tool_call_id: Annotated[str, InjectedToolCallId],
         max_depth: int = 2,
     ) -> Command:
-        """列出沙箱工作区内目录的内容。
+        """列出沙箱内目录的内容。
 
         Args:
-            path: 要查看的目录，必须是 {VIRTUAL_PATH_PREFIX} 下的路径
+            path: 要查看的目录，必须在 /mnt/user-data 或 /mnt/skills 之下
             max_depth: 递归深度（默认 2）
         """
         try:
@@ -242,10 +236,12 @@ def _make_exec_command(sandbox: AioSandbox):
         可执行任意命令（安装工具 / 运行脚本 / 编译程序等）。
         命令在容器内运行，与宿主机隔离。
 
+        技能自带的脚本位于 /mnt/skills/public/<技能名>/scripts/ 下，
+        例如 `python /mnt/skills/public/data-analysis/scripts/analyze.py --help`。
+
         Args:
             command: 要执行的 bash 命令
-            work_dir: 命令工作目录，必须是 {VIRTUAL_PATH_PREFIX} 下的路径
-                      （省略则使用沙箱默认工作目录 /mnt/user-data）
+            work_dir: 命令工作目录，必须在 /mnt/user-data 或 /mnt/skills 之下（省略则用默认工作目录 /mnt/user-data）
         """
         try:
             output = sandbox.exec_command(command, exec_dir=work_dir)

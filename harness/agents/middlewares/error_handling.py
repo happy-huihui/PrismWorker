@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import logging
+import uuid
 from typing import Any, Awaitable, Callable
 
 from langchain.agents.middleware import AgentMiddleware
@@ -49,6 +50,10 @@ class ToolErrorMiddleware(AgentMiddleware):
         """包装工具执行：兜底异常为错误 ToolMessage。"""
         tool_call_id = str(request.tool_call.get("id") or "")
         tool_name = str(request.tool_call.get("name") or "")
+        # 空 id 兜底：合成一个合法 id，避免 ToolMessage(tool_call_id="") 入历史后
+        # 下一轮请求体出现空 id 引发服务端 400（2026-09-26 线上实锤）
+        if not tool_call_id:
+            tool_call_id = f"call_sanitized_{uuid.uuid4().hex[:24]}"
         last_error: Exception | None = None
         try:
             return await handler(request)

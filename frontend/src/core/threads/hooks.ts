@@ -5,11 +5,13 @@ import { type ThreadCreatePayload, type ThreadOut, type ThreadRenamePayload } fr
 
 export const threadListKey = ['threads'] as const
 
-export function useThreads() {
+export function useThreads(options?: { enabled?: boolean }) {
   return useQuery({
     queryKey: threadListKey,
     queryFn: listThreads,
     staleTime: 1000,
+    // 未登录时不发请求（避免无意义的 401；侧栏改由 UI 展示登录引导）
+    enabled: options?.enabled ?? true,
   })
 }
 

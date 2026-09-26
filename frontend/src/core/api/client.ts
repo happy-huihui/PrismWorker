@@ -1,7 +1,8 @@
+import { authHeader, clearToken, UNAUTHORIZED_EVENT } from '@/core/auth/token'
+
 import { type ApiErrorShape } from './types'
 
 export const API_BASE: string = (import.meta.env.VITE_API_BASE as string | undefined) || '/api'
-export const USER_ID: string = 'default'
 
 export class ApiError extends Error {
   status: number
@@ -34,7 +35,9 @@ export async function request<T>(path: string, init: RequestInit = {}): Promise<
   if (init.body != null && !isForm && !headers.has('Content-Type')) {
     headers.set('Content-Type', 'application/json')
   }
-  headers.set('X-User-Id', USER_ID)
+  // 身份：统一带 Bearer token（未登录则不带，由后端 401 拦截）；旧 X-User-Id 头已废弃
+  const auth = authHeader()
+  if (auth) headers.set('Authorization', auth)
 
   const body = init.body != null && !isForm && typeof init.body === 'object' && !(init.body instanceof Blob)
     ? JSON.stringify(init.body)
@@ -56,6 +59,11 @@ export async function request<T>(path: string, init: RequestInit = {}): Promise<
 
   if (!res.ok) {
     const detail = parseDetail(text) || `请求失败（HTTP ${res.status}）`
+    // 401 统一拦截：清失效 token + 广播全局事件（AuthProvider 监听后弹登录框）
+    if (res.status === 401) {
+      clearToken()
+      window.dispatchEvent(new Event(UNAUTHORIZED_EVENT))
+    }
     throw new ApiError(res.status, detail)
   }
 

@@ -22,7 +22,7 @@ from harness.runtime.runs.models import RUN_COLUMNS, RunRecord
 
 logger = logging.getLogger(__name__)
 
-# 建表 SQL（幂等；artifacts 存 JSON 字符串）
+# 建表 SQL（幂等；artifacts / events 存 JSON 字符串）
 _CREATE_TABLE_SQL = """
 CREATE TABLE IF NOT EXISTS runs (
     run_id        TEXT PRIMARY KEY,
@@ -33,6 +33,7 @@ CREATE TABLE IF NOT EXISTS runs (
     input_preview TEXT NOT NULL DEFAULT '',
     error         TEXT,
     artifacts     TEXT NOT NULL DEFAULT '[]',
+    events        TEXT NOT NULL DEFAULT '[]',
     message_count INTEGER NOT NULL DEFAULT 0,
     created_at    REAL NOT NULL,
     started_at    REAL,
@@ -74,6 +75,11 @@ class RunStore:
         conn = await aiosqlite.connect(str(self._db_path))
         conn.row_factory = aiosqlite.Row
         await conn.execute(_CREATE_TABLE_SQL)
+        # 旧库迁移：补 events 列（已存在则忽略 duplicate column 报错）
+        try:
+            await conn.execute("ALTER TABLE runs ADD COLUMN events TEXT NOT NULL DEFAULT '[]'")
+        except Exception:  # noqa: BLE001 —— 列已存在属正常
+            pass
         await conn.execute("CREATE INDEX IF NOT EXISTS idx_runs_thread ON runs(thread_id)")
         await conn.execute("CREATE INDEX IF NOT EXISTS idx_runs_user ON runs(user_id)")
         await conn.commit()
@@ -119,8 +125,9 @@ class RunStore:
         """
         if not fields:
             return
-        # 白名单过滤，避免拼进非法列名
-        safe_fields = {k: v for k, v in fields.items() if k in RUN_COLUMNS}
+        # 白名单过滤，避免拼进非法列名（events 为思考链回放列，允许更新）
+        allowed = set(RUN_COLUMNS) | {"events"}
+        safe_fields = {k: v for k, v in fields.items() if k in allowed}
         if not safe_fields:
             return
         assignments = ", ".join(f"{k} = ?" for k in safe_fields)
@@ -176,6 +183,33 @@ class RunStore:
             f"SELECT {', '.join(RUN_COLUMNS)} FROM runs {where} "
             "ORDER BY created_at DESC LIMIT ?",
             (*params, limit),
+        )
+        rows = await cursor.fetchall()
+        await cursor.close()
+        return list(rows)
+
+
+    async def fetch_chains(
+        self,
+        *,
+        user_id: str,
+        thread_id: str,
+        limit: int = 100,
+    ) -> list[Any]:
+        """取某线程全部 run 的思考链事件（按创建时间正序，供历史回放）。
+
+        参数：
+            user_id / thread_id: 归属过滤
+            limit: 最多返回条数
+
+        返回：
+            行对象列表（含 run_id/status/model_name/started_at/finished_at/events）
+        """
+        cursor = await self._conn.execute(
+            "SELECT run_id, status, model_name, created_at, started_at, finished_at, events "
+            "FROM runs WHERE user_id = ? AND thread_id = ? "
+            "ORDER BY created_at ASC LIMIT ?",
+            (user_id, thread_id, limit),
         )
         rows = await cursor.fetchall()
         await cursor.close()

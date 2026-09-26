@@ -6,8 +6,10 @@
     - file.glob_files / grep_files / list_path —— 查找与查看
 
 关键设计：
-    1. 所有文件操作路径都必须以 /mnt/user-data 开头，且不允许 ..
-       穿越——这是沙箱的唯一工作区。
+    1. 文件操作路径分两类：
+       - **可写工作区** `/mnt/user-data`（读写皆可，per-thread 隔离）
+       - **只读挂载区** `/mnt/skills`（只能读；写入会被拒绝，防止模型改写技能包）
+       两者都不允许 .. 穿越。
     2. 命令执行失败（非零退出码）不抛异常，而是把退出码和输出
        原样返回给模型，让模型自行修正（参考成熟工具行为）；
        只有「连不上沙箱/网络错误」才抛 SandboxConnectionError。
@@ -28,7 +30,7 @@ import httpx
 from agent_sandbox import Sandbox as AioSandboxClient
 from agent_sandbox.core.api_error import ApiError
 
-from harness.config.paths import VIRTUAL_PATH_PREFIX
+from harness.config.paths import SKILLS_CONTAINER_PREFIX, VIRTUAL_PATH_PREFIX
 from harness.sandbox.exceptions import (
     SandboxCommandError,
     SandboxConnectionError,
@@ -173,13 +175,28 @@ class AioSandbox:
         return VIRTUAL_PATH_PREFIX
 
 
-    def _validate_path(self, path: str) -> str:
-        """校验沙箱内路径：必须在 /mnt/user-data 下且无 .. 穿越。
+    def _validate_path(self, path: str, *, for_write: bool = False) -> str:
+        """校验沙箱内路径：必须在允许的挂载区内且无 .. 穿越。
+
+        允许的区域：
+            1. `/mnt/user-data`  —— 可写工作区（per-thread 隔离）
+            2. `/mnt/skills`     —— 只读技能目录（全线程共享）
+                                   仅在 for_write=False 时放行
 
         规则：
-            1. 必须是以 /mnt/user-data 开头的绝对路径
+            1. 必须是以允许前缀开头的绝对路径
             2. 路径中各段不允许出现 ..（防止穿越到挂载区之外）
             3. 返回 POSIX 风格路径，满足沙箱内文件系统要求
+
+        为什么技能目录要单独放行（2026-09-24）：
+            技能正文与脚本里引用 `/mnt/skills/public/<name>/references/*.md`、
+            `scripts/*.py`。此前校验只认 `/mnt/user-data`，模型一读技能自带资源
+            就抛 SandboxPathError；而 `exec_command` 只校验 exec_dir、不校验命令串，
+            于是出现「脚本能跑、但读不到脚本说明」的割裂状态。
+
+        为什么写入必须拒绝：
+            该挂载在 lifecycle 里是 `readonly` 的，写操作到容器层也会失败；
+            在应用层提前拦下能给出更清晰的错误，并避免模型反复重试。
 
         Raises:
             SandboxPathError: 路径越界或格式非法
@@ -187,12 +204,32 @@ class AioSandbox:
         if not isinstance(path, str) or not path.strip():
             raise SandboxPathError("路径不能为空", path=path)
         normalized = path.replace("\\", "/").strip().rstrip("/") or "/"
-        prefix = VIRTUAL_PATH_PREFIX.rstrip("/")
-        if normalized != prefix and not normalized.startswith(prefix + "/"):
+
+        allowed_prefixes = [VIRTUAL_PATH_PREFIX.rstrip("/")]
+        if not for_write:
+            allowed_prefixes.append(SKILLS_CONTAINER_PREFIX.rstrip("/"))
+
+        matched = next(
+            (
+                prefix
+                for prefix in allowed_prefixes
+                if normalized == prefix or normalized.startswith(prefix + "/")
+            ),
+            None,
+        )
+        if matched is None:
+            if for_write:
+                raise SandboxPathError(
+                    f"不可写入 {path!r}：只有 {VIRTUAL_PATH_PREFIX} 可写"
+                    f"（{SKILLS_CONTAINER_PREFIX} 是只读技能目录）",
+                    path=path,
+                )
             raise SandboxPathError(
-                f"路径必须在 {VIRTUAL_PATH_PREFIX} 之下: {path!r}", path=path
+                f"路径必须在 {' 或 '.join(allowed_prefixes)} 之下: {path!r}",
+                path=path,
             )
-        for segment in normalized[len(prefix) + 1 :].split("/"):
+
+        for segment in normalized[len(matched) + 1 :].split("/"):
             if segment == "..":
                 raise SandboxPathError(f"路径不允许 .. 穿越: {path!r}", path=path)
             if segment in (".", ""):
@@ -318,7 +355,8 @@ class AioSandbox:
         Returns:
             成功消息文本
         """
-        safe_path = self._validate_path(path)
+        # for_write=True：技能目录是只读挂载，写入必须被拒绝
+        safe_path = self._validate_path(path, for_write=True)
         try:
             client = self._get_client()
             self._ensure_workspace()
@@ -376,6 +414,51 @@ class AioSandbox:
             raise SandboxFileError(
                 f"查找文件异常: {exc}", path=safe_path, operation="glob"
             ) from exc
+
+    def file_exists(self, path: str) -> bool | None:
+        """判断容器内目标文件是否已存在。
+
+        用途：**「写前读」护栏判断这次写是「新建」还是「覆盖」**——
+        目标本来就不存在时没有可覆盖的内容，应当直接放行，不该拦着让模型
+        先 read（实测 2026-09-25：拦下来会让模型陷入重试死循环）。
+
+        实现：对父目录做一次精确文件名的 glob（比 read_file 便宜，且能区分
+        「父目录不存在」与「目录在但文件不在」）。
+
+        参数：
+            path: 目标文件路径（/mnt/user-data 下）
+
+        返回：
+            True  确认已存在
+            False 未确认到存在（文件不存在、父目录缺失、或无权限读到该目录）
+            None  连接类失败（沙箱已关闭 / 超时 / 网络）→ 调用方应保守按「已存在」处理
+
+        为什么把「父目录缺失 / 无权限」也算 False 而不算「未知」：
+            这两种情况下这次写入要么是在建新文件、要么写入本身也会失败，
+            不存在「把已有内容覆盖掉」的风险；而连接类失败必须返回 None，
+            否则一次网络抖动就会让护栏失效、放行真正的覆盖写。
+            判据来自实测（2026-09-25，镜像 1.11.0）：
+              · 目录在、文件在   → glob 成功、1 条匹配
+              · 目录在、文件不在 → glob 成功、0 条匹配
+              · 父目录不存在     → 服务端 success=false，响应缺字段，
+                                   SDK 抛 "validation error for ResponseFileGlobResult"
+                                   （文本里带 FileNotFoundError）
+        """
+        parent, _, name = path.rstrip("/").rpartition("/")
+        if not parent or not name:
+            return None
+        try:
+            found = self.glob(parent, name, max_results=1)
+        except SandboxFileError as exc:
+            text = str(exc)
+            # ① 连接类失败：判不出、也不能猜 → 未知
+            if any(k in text for k in ("沙箱已关闭", "连接", "超时", "timeout", "Connection")):
+                return None
+            # ② 目录不存在 / 读不到目录：按「未确认存在」处理（见上文理由）
+            return False
+        except SandboxError:
+            return None
+        return bool(found)
 
     def grep(
         self,

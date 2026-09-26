@@ -1,10 +1,14 @@
 """网关依赖（deps）——FastAPI 依赖注入的统一出口。
 
-提供三个依赖：
-  - get_user_id：从 X-User-Id 请求头解析用户身份（缺省 default）；
+提供四个依赖：
+  - get_bearer_token：从 Authorization: Bearer 头取原始 token（无则 None）；
+  - get_user_id：验 token 换出 user_id（缺失/篡改/过期 → 401，全部业务路由据此拦截）；
   - verify_internal_token：X-Internal-Token 与 PRISM_INTERNAL_TOKEN 环境变量
     比对（未配置环境变量 → 本地开发模式放行）；
   - process_request_body：把请求体转成 core 层认识的 dict（类型/字段兜底）。
+
+鉴权演进说明：旧版从 X-User-Id 头直接取身份（可伪造），现已废弃；
+身份唯一来源 = 登录后签发的 HMAC token（能力在 app.core.auth）。
 """
 
 from __future__ import annotations
@@ -12,29 +16,34 @@ from __future__ import annotations
 import os
 from typing import Any
 
-from fastapi import Header, HTTPException
+from fastapi import Depends, Header, HTTPException
 
 _INTERNAL_TOKEN_HEADER = "X-Internal-Token"
-_USER_ID_HEADER = "X-User-Id"
+_AUTHORIZATION_HEADER = "Authorization"
+_BEARER_PREFIX = "Bearer "
 
-_USER_ID_RE = None
+
+def get_bearer_token(
+    authorization: str | None = Header(default=None, alias=_AUTHORIZATION_HEADER),
+) -> str | None:
+    """从 Authorization 头剥出 Bearer token；格式不对一律视为未登录（None）。"""
+    if not authorization or not authorization.startswith(_BEARER_PREFIX):
+        return None
+    token = authorization[len(_BEARER_PREFIX):].strip()
+    return token or None
 
 
-def _validate_user_id(user_id: str) -> str:
-    """校验用户 id 合法（1-64 位字母数字下划线连字符），非法抛 400。"""
-    import re
+def get_user_id(token: str | None = Depends(get_bearer_token)) -> str:
+    """业务路由的身份闸门：token → user_id，任何不合法一律 401。
 
-    if not re.fullmatch(r"[A-Za-z0-9_-]{1,64}", user_id):
-        raise HTTPException(status_code=400, detail=f"用户 id 非法: {user_id!r}")
+    前端收到 401 会清本地 token 并弹登录框（core/api/client.ts 统一拦截）。
+    """
+    from app.core.auth import verify_token  # 延迟导入：避免模块循环依赖
+
+    user_id = verify_token(token or "")
+    if user_id is None:
+        raise HTTPException(status_code=401, detail="未登录或登录已失效")
     return user_id
-
-
-def get_user_id(
-    x_user_id: str | None = Header(default=None, alias=_USER_ID_HEADER),
-) -> str:
-    """从请求头取用户身份，缺省 'default' 并做合法性校验。"""
-    user_id = (x_user_id or "").strip() or "default"
-    return _validate_user_id(user_id)
 
 
 def verify_internal_token(

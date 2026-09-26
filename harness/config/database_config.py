@@ -1,11 +1,3 @@
-"""数据库配置。
-
-包含两层内容：
-1. checkpoint 通道模式基元（thread_state 依赖的最小定义，历史已有）
-2. PostgreSQL 连接配置（连接串 / schema / 连接池参数），供
-   langgraph-checkpoint-postgres 与记忆后端共同使用
-"""
-
 from __future__ import annotations
 
 import os
@@ -13,8 +5,19 @@ from typing import Literal
 
 from pydantic import BaseModel, Field
 
+"""数据库配置
+
+    职责：定义 PostgreSQL 连接参数，供 checkpoint 持久化与记忆后端共用。
+
+    对外暴露：
+        - CheckpointChannelMode  checkpoint 通道模式（full=全量快照 / delta=增量）
+        - DEFAULT_CHECKPOINT_SNAPSHOT_FREQUENCY  增量模式下每几步落一次全量快照
+        - DatabaseConfig         PostgreSQL 连接配置
+"""
+
 CheckpointChannelMode = Literal["full", "delta"]
 
+# delta 模式下的全量快照间隔（步）
 DEFAULT_CHECKPOINT_SNAPSHOT_FREQUENCY = 10
 
 
@@ -39,7 +42,8 @@ class DatabaseConfig(BaseModel):
     echo_sql: bool = Field(default=False, description="打印 SQL 日志")
 
     def resolved_url(self) -> str:
-        """返回实际连接串：先取环境变量 DATABASE_URL，再回退配置值。"""
+        """返回实际连接串：环境变量 DATABASE_URL 优先，其次配置值。"""
+        # 环境变量优先，便于容器/CI 覆盖
         env_url = os.getenv("DATABASE_URL")
         if env_url:
             return env_url

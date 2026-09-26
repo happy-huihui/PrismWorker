@@ -15,7 +15,7 @@ from typing import Any
 from fastapi import APIRouter, Depends, HTTPException, status
 
 from app.api.deps import get_event_bus, get_run_service, get_thread_store, get_user_id
-from app.api.schemas import RunCreate, RunOut, run_out_from_record
+from app.api.schemas import ChainOut, RunCreate, RunOut, run_out_from_record
 from harness.runtime.runs import (
     RUN_STATUS_CANCELLED,
     RUN_STATUS_ERROR,
@@ -74,6 +74,17 @@ async def list_thread_runs(
     return [run_out_from_record(r) for r in records]
 
 
+@router.get("/threads/{thread_id}/chains", response_model=list[ChainOut])
+async def get_thread_chains(
+    thread_id: str,
+    user_id: str = Depends(get_user_id),
+    service: Any = Depends(get_run_service),
+) -> list[ChainOut]:
+    """返回该线程已落库 run 的思考链事件流（创建时间正序），供前端重开会话时回放。"""
+    chains = await service.get_thread_chains(user_id=user_id, thread_id=thread_id)
+    return [ChainOut(**c) for c in chains]
+
+
 @router.get("/runs/{run_id}", response_model=RunOut)
 async def get_run(
     run_id: str,
@@ -113,6 +124,10 @@ async def stream_run_events(
         event: {type}          # tool_start / prints / todos / artifacts / ...
         data: {json(payload)}
     客户端依据 run_finished / run_error 事件收尾；SSE 连接随之关闭。
+
+    回放：订阅前该 run 已发布的事件（run_started / run_meta / 已出的文本块）会先
+    补发一遍——前端是拿到 run_id 后才连流，不回放就永远错过首批事件。
+    不缓存：响应头显式禁缓 + 禁代理缓冲，否则中间代理会把流式帧攒成一团。
     """
     record = await service.get_run(run_id)
     if record is None:
@@ -123,6 +138,7 @@ async def stream_run_events(
     async def event_generator():
         """把 EventBus 订阅流转成 SSE 帧。"""
         if record.status in (RUN_STATUS_FINISHED, RUN_STATUS_CANCELLED, RUN_STATUS_ERROR):
+            # 已终结的 run：总线录制已随 run 释放，历史思考链走 /threads/{id}/chains
             if record.status == RUN_STATUS_ERROR:
                 payload = {
                     "run_id": run_id,
@@ -155,7 +171,13 @@ async def stream_run_events(
         except asyncio.CancelledError:
             raise
 
-    return EventSourceResponse(event_generator())
+    return EventSourceResponse(
+        event_generator(),
+        headers={
+            "Cache-Control": "no-cache, no-transform",
+            "X-Accel-Buffering": "no",
+        },
+    )
 
 
 

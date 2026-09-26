@@ -1,4 +1,5 @@
-import { API_BASE, USER_ID } from '@/core/api/client'
+import { API_BASE } from '@/core/api/client'
+import { authHeaders } from '@/core/auth/token'
 
 const OUTPUTS_PREFIX = '/mnt/user-data/outputs/'
 
@@ -55,7 +56,7 @@ export async function fetchArtifact(
 ): Promise<Response> {
   const url = artifactUrl(threadId, virtualPath)
   if (!url) throw new Error('非法产物路径')
-  return fetch(url, { headers: { 'X-User-Id': USER_ID }, signal })
+  return fetch(url, { headers: { ...authHeaders() }, signal })
 }
 
 export function parseArtifactError(resp: Response): string {

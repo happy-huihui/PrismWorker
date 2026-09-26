@@ -1,30 +1,36 @@
-import { useEffect, useLayoutEffect, useMemo, useRef, useState } from 'react'
-import { ChevronDown, MessagesSquare } from 'lucide-react'
+import { Fragment, useEffect, useLayoutEffect, useMemo, useRef, useState } from 'react'
+import { ChevronDown, MessagesSquare } from '@/components/icons'
 
 import { Skeleton } from '@/components/ui/skeleton'
 import { type MessageOut } from '@/core/api/types'
 import {
+  type ChainStep,
+  type RoutingInfo,
+  type RunStreamState,
   type RunStreamStatus,
   type ToolCallItem,
 } from '@/core/runs/useRunStream'
 import { cn } from '@/lib/utils'
 
+import { ClarificationBubble } from './ClarificationBubble'
 import { MarkdownContent } from './MarkdownContent'
 import { MessageBubble } from './MessageBubble'
 import { RunStatusBar } from './RunStatusBar'
-import { ThinkingPanel } from './ThinkingPanel'
+import { ThinkingChain } from './ThinkingChain/ThinkingChain'
 import { ArtifactCardList } from '@/components/artifacts/ArtifactCardList'
 
 export interface RunActivity {
-  prints: string[]
-  toolCalls: ToolCallItem[]
-  /** 模型思考叙述累积（thinking_chunk → 思考链文本行） */
-  thinkingText?: string
+  /** 本轮思考链步骤（模型思考 / 叙述 / 工具调用，按到达顺序） */
+  steps: ChainStep[]
   active: boolean
-  /** run 开始时间（秒时间戳，ThinkingPanel 流式计时用） */
+  /** run 开始时间（秒时间戳，ThinkingChain 流式计时用） */
   startedAt?: number | null
-  /** run 结束时间（秒时间戳，ThinkingPanel 耗时展示用） */
+  /** run 结束时间（秒时间戳，ThinkingChain 耗时展示用） */
   finishedAt?: number | null
+  /** 思考开关被降级（模型不支持） */
+  degraded?: boolean
+  /** 后端动态路由的决策（模型名 + 来源 + 理由） */
+  routing?: RoutingInfo | null
 }
 export interface RunStatusView {
   status: RunStreamStatus
@@ -49,6 +55,31 @@ interface MessageListProps {
   onArtifactPreview?: (path: string) => void
   /** 产物所属线程（构造下载/预览 URL） */
   threadId?: string
+  /** 历史思考链快照（按 run 创建时间正序）：逐个附到对应的 assistant 回复之前回放 */
+  chains?: RunStreamState[]
+  /** 澄清气泡的选项被点击时回调：把选项文本塞进下方输入框（可选） */
+  onFillInput?: (text: string) => void
+  /** 澄清气泡的选项被点击时直接发送为回复（与 onFillInput 互斥；优先于它） */
+  onSendOption?: (text: string) => void
+}
+
+/** 判断一个 tool call 名称是否是 ask_clarification（兼容带命名空间的形式）。 */
+function isAskClarification(toolName: string): boolean {
+  return toolName === 'ask_clarification' || toolName.endsWith('ask_clarification')
+}
+
+/** 从思考链步骤里挑出最近一个完成态的 ask_clarification 工具调用（用于渲染气泡）。 */
+function pickClarificationTool(steps: ChainStep[]): ToolCallItem | null {
+  let picked: ToolCallItem | null = null
+  for (const s of steps) {
+    if (s.kind !== 'tool') continue
+    if (!isAskClarification(s.item.tool)) continue
+    // 优先取完成态；进行中也展示（避免漏掉运行中的问句）
+    if (s.item.status === 'running' || s.item.status === 'completed' || s.item.status === 'failed') {
+      picked = s.item
+    }
+  }
+  return picked
 }
 
 function isTool(role: string) {
@@ -119,6 +150,9 @@ export function MessageList({
   artifacts,
   onArtifactPreview,
   threadId,
+  chains,
+  onFillInput,
+  onSendOption,
 }: MessageListProps) {
   const bottomRef = useRef<HTMLDivElement>(null)
 
@@ -138,19 +172,39 @@ export function MessageList({
   const rest = streamTail ? messages.slice(0, -1) : messages
   const history = useMemo(() => renderableHistory(rest), [rest])
 
-  // 最后一条用户消息的索引：思考链面板应插在「用户问题之后、本轮回复之前」，
-  // 而不是在完整回复的后面（结束后 history 已含回复，直接平铺会把思考链挤到下边）
-  const lastUserIdx = useMemo(() => {
-    let idx = -1
-    for (let i = 0; i < history.length; i++) {
-      if (history[i].role === 'user') idx = i
+  // 按 user 消息切「回合」：第 i 回合 = 第 i 条 user 消息 + 其后直到下一 user 的
+  // assistant 回复。思考链按回合配对（一次提交 = 一个 run = 一条链，chains 按
+  // run 创建时间正序，与回合一一对应）。
+  //
+  // 为什么不能按 assistant 消息配对（旧逻辑 chainIdx 只在 assistant 上自增）：
+  // 澄清 run（ask_clarification return_direct）不产生 assistant 正文消息，
+  // 它的链在历史里无处挂载——要么消失（澄清卡片丢失），要么被下一条
+  // assistant 错消费（run1 的链挂到 run2 的回复前，整体错位一位）。
+  const turns = useMemo(() => {
+    const list: { user: MessageOut | null; replies: MessageOut[] }[] = []
+    for (const m of history) {
+      if (m.role === 'user') {
+        list.push({ user: m, replies: [] })
+      } else if (list.length === 0) {
+        list.push({ user: null, replies: [m] })
+      } else {
+        list[list.length - 1].replies.push(m)
+      }
     }
-    return idx
+    return list
   }, [history])
-  const headHistory = lastUserIdx >= 0 ? history.slice(0, lastUserIdx + 1) : history
-  const tailHistory = lastUserIdx >= 0 ? history.slice(lastUserIdx + 1) : []
+  // 本轮活动（实时思考链）插在最后一条 user 消息之后、其回复之前：
+  // 即最后一个含 user 的回合内部。没有 user 回合时退化为插到所有回合之后。
+  const lastUserTurnIdx = useMemo(() => {
+    for (let i = turns.length - 1; i >= 0; i--) {
+      if (turns[i].user) return i
+    }
+    return -1
+  }, [turns])
 
-  const hasActivity = !!activity && (activity.prints.length > 0 || activity.toolCalls.length > 0)
+  // 有步骤、或本轮正在进行（要出「正在处理…」占位）时，思考链卡片都要出现
+  const hasActivity =
+    !!activity && (activity.steps.length > 0 || activity.active)
   const finalStatus = runStatus
 
   const [showFab, setShowFab] = useState(false)
@@ -170,7 +224,7 @@ export function MessageList({
 
   if (isLoading) {
     return (
-      <div className="flex flex-col gap-3 px-4 py-6">
+      <div className="mx-auto flex w-full max-w-[820px] flex-col gap-3 px-4 py-6">
         <Skeleton className="ml-auto h-16 w-2/3" />
         <Skeleton className="h-20 w-3/4" />
         <Skeleton className="ml-auto h-16 w-1/2" />
@@ -192,44 +246,76 @@ export function MessageList({
     )
   }
 
-  return (
-    <div className="relative flex w-full flex-col gap-2 px-4 py-4 sm:px-6">
-      {headHistory.map((m, i) => {
-        const isUser = m.role === 'user'
-        return (
-          <MessageBubble key={i} role={isUser ? 'user' : 'assistant'}>
-            {isUser ? (
-              <span className="whitespace-pre-wrap break-words">{m.content}</span>
-            ) : (
-              <MarkdownContent text={m.content} />
-            )}
-          </MessageBubble>
-        )
-      })}
+  // 会话轮次计数：供 TurnIndex 定位（每次渲染重置）
+  let userTurn = -1
+  // 历史思考链索引：逐个「含 user 的回合」消费一条（回合序 = run 创建序）
+  let chainIdx = 0
 
-      {hasActivity && activity && (
-        <ThinkingPanel
-          prints={activity.prints}
-          toolCalls={activity.toolCalls}
-          thinkingText={activity.thinkingText}
-          active={activity.active}
-          startedAt={activity.startedAt}
-          finishedAt={activity.finishedAt}
+  // 活动块（实时思考链 + 澄清气泡）渲染片段，复用于「回合内」与「无回合」两种位置
+  const activityBlock = hasActivity && activity && (
+    <>
+      <ThinkingChain
+        steps={activity.steps}
+        active={activity.active}
+        startedAt={activity.startedAt}
+        finishedAt={activity.finishedAt}
+        degraded={activity.degraded}
+        pending={activity.active && activity.steps.length === 0}
+        routing={activity.routing}
+      />
+      {pickClarificationTool(activity.steps) && (
+        <ClarificationBubble
+          tool={pickClarificationTool(activity.steps)!}
+          onFillInput={onFillInput}
+          onSendOption={onSendOption}
         />
       )}
+    </>
+  )
 
-      {tailHistory.map((m, i) => {
-        const isUser = m.role === 'user'
+  return (
+    // 模板 .body/.wrap：上 26px、左右 28px、下 8px；内容 820px 居中、行间距 22px
+    <div className="relative flex w-full flex-col px-7 pt-[26px] pb-2">
+      <div className="mx-auto flex w-full max-w-[820px] flex-col gap-[22px]">
+      {turns.map((turn, ti) => {
+        // 无 user 的领头回合（异常历史，如旧压缩数据）不消费链，保持后续配对不错位
+        const chain = turn.user ? (chains?.[chainIdx++] ?? null) : null
         return (
-          <MessageBubble key={`tail-${i}`} role={isUser ? 'user' : 'assistant'}>
-            {isUser ? (
-              <span className="whitespace-pre-wrap break-words">{m.content}</span>
-            ) : (
-              <MarkdownContent text={m.content} />
+          <Fragment key={ti}>
+            {turn.user && (
+              <MessageBubble role="user" turnIndex={++userTurn}>
+                <span className="whitespace-pre-wrap break-words">{turn.user.content}</span>
+              </MessageBubble>
             )}
-          </MessageBubble>
+            {chain && (
+              <>
+                <ThinkingChain
+                  steps={chain.steps}
+                  active={false}
+                  startedAt={chain.startedAt}
+                  finishedAt={chain.finishedAt}
+                />
+                {pickClarificationTool(chain.steps) && (
+                  <ClarificationBubble
+                    tool={pickClarificationTool(chain.steps)!}
+                    onFillInput={onFillInput}
+                    onSendOption={onSendOption}
+                  />
+                )}
+              </>
+            )}
+            {ti === lastUserTurnIdx && activityBlock}
+            {turn.replies.map((m, ri) => (
+              <MessageBubble key={ri} role="assistant">
+                <MarkdownContent text={m.content} />
+              </MessageBubble>
+            ))}
+          </Fragment>
         )
       })}
+
+      {/* 没有含 user 的回合时（首轮刚提交历史未回写 / 异常历史），活动块落在最后 */}
+      {lastUserTurnIdx < 0 && activityBlock}
 
       {streamTail && (
         <MessageBubble role="assistant" streaming>
@@ -237,9 +323,9 @@ export function MessageList({
         </MessageBubble>
       )}
 
-      {threadId && artifacts && artifacts.length > 0 && (
-        <ArtifactCardList threadId={threadId} paths={artifacts} onPreview={onArtifactPreview ?? (() => {})} />
-      )}
+  {threadId && artifacts && artifacts.length > 0 && (
+    <ArtifactCardList threadId={threadId} paths={artifacts} onPreview={onArtifactPreview} />
+  )}
 
       {finalStatus && (
         <RunStatusBar
@@ -266,6 +352,7 @@ export function MessageList({
           <ChevronDown className="size-4" />
         </button>
       )}
+      </div>
     </div>
   )
 }

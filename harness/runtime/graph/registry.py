@@ -70,27 +70,37 @@ class AgentRegistry:
 
 
     def _resolve_sandbox(self) -> Any | None:
-        """解析装配用的沙箱实例（显式值优先，否则经 provider 懒启动一次）。"""
-        # 显式传入优先
+        """解析装配用的沙箱实例。
+
+        显式注入的实例（构造参数 sandbox）直接用；否则**每次装配都问一次
+        provider**，绝不把它缓存下来。
+
+        为什么不缓存（2026-09-25 实测缺陷，见 .prism-worker/logs/app.log）：
+            provider（runtime.sandbox.get_app_sandbox）走的是「活跃缓存 → 热池
+            提升 → 新建」状态机，其中「热池提升」会把条目从热池**摘出来**放进
+            活跃集。一旦把结果缓存下来，第二次装配就完全绕过了状态机：
+            同一个实例既留在 run 手里、又留在热池里被当成闲置件，
+            闲置守护线程按 parked_at 计满 idle_timeout 就把它销毁（sbx.close()），
+            而 run 还在用它 → 后续所有沙箱工具报「沙箱已关闭」。
+            实测时间线：19:14:43 沙箱回源热池 → 19:18:51 新 run 直接拿到缓存实例
+            （无「从热池提升复用」日志）→ 19:25:26 被闲置回收 → run 中途失效。
+        """
+        # 显式注入优先：这类实例的生命周期由调用方自己管
         if self._sandbox is not None:
             return self._sandbox
         # 无 provider 则无沙箱
         if self._sandbox_provider is None:
             return None
-        with self._lock:
-            # 双检：可能已被别的调用懒启动
-            if self._sandbox is not None:
-                return self._sandbox
-            try:
-                self._sandbox = self._sandbox_provider()
-            except Exception as exc:  # noqa: BLE001 —— 启动失败降级无沙箱，不阻断装配
-                logger.warning("沙箱懒启动失败，本次装配不带沙箱工具: %s", exc)
-                self._sandbox = None
-        return self._sandbox
+        # 每次都问 provider，让状态机（活跃/热池）如实流转
+        try:
+            return self._sandbox_provider()
+        except Exception as exc:  # noqa: BLE001 —— 解析失败降级无沙箱，不阻断装配
+            logger.warning("沙箱解析失败，本次装配不带沙箱工具: %s", exc)
+            return None
 
     @property
     def sandbox(self) -> Any | None:
-        """当前装配用的沙箱实例（可能触发懒启动）。"""
+        """当前装配用的沙箱实例（每次调用都向 provider 取一次）。"""
         return self._resolve_sandbox()
 
 

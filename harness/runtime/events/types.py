@@ -20,15 +20,24 @@ from typing import Any
 
     输出数据示例（各事件真实 payload）：
         - run_started                 {"run_id": "…", "thread_id": "…"}
-        - run_meta                    {"model_name": "deepseek-v4-pro"}
-        - tool_start                  {"tool": "web_search", "tool_call_id": "…", "args_preview": "…", "ts": 1710000000.0}
-        - tool_end                    {"tool": "web_search", "tool_call_id": "…", "duration_seconds": 1.2, "ts": 1710000001.2}
-        - thinking_chunk / message_chunk  {"text": "…"}
+        - run_meta                    {"model_name": "deepseek-v4-pro",
+                                       "thinking_enabled": true, "thinking_degraded": false}
+        - tool_start                  {"tool": "read_file", "tool_call_id": "…",
+                                       "args": {"path": "/mnt/…/a.html", "description": "读取页面模板"},
+                                       "description": "读取页面模板", "args_preview": "{…}", "ts": 1710000000.0}
+        - tool_end                    {"tool": "web_search", "tool_call_id": "…", "duration_seconds": 1.2, "ok": true, "error": null, "ts": 1710000001.2}
+        - reasoning_chunk             {"message_id": "lc_…", "text": "…"}   # 模型真实思考（逐 token）
+        - message_chunk               {"message_id": "lc_…", "text": "…"}   # 本轮文本（先按答复流式）
+        - message_retract             {"message_id": "lc_…"}                # 同轮出现工具 → 文本降级为叙述
+        - thinking_chunk              {"text": "…"}                         # 旧版整轮叙述（仅历史兼容）
         - prints                      {"prints": ["…", "…"]}          # 增量进度行
         - todos                       {"todos": […]}                  # 全量任务清单
         - artifacts                   {"artifacts": ["outputs/a.md"]} # 增量产物路径
         - run_finished                {"status": "finished", "message_count": 3, "artifacts": […], "finished_at": 1710000009.0}
         - run_error                   {"status": "error", "message_count": 0, "artifacts": [], "error": "…"}
+
+    文本事件为何带 message_id：模型一轮输出是一个固定 id 的流，前端按它归并才能
+    做到「逐 token + 事后定性」（见到工具就把该条文本从答复气泡降级进思考步骤）。
 """
 
 # 终端事件：总线保证必达（队列满也不丢），消费端据此收尾
@@ -45,11 +54,17 @@ class RunEventType(str, Enum):
     RUN_META = "run_meta"
     TOOL_START = "tool_start"
     TOOL_END = "tool_end"
+    # 模型真实思考（reasoning_content）逐 token 下发
+    REASONING_CHUNK = "reasoning_chunk"
+    # 本轮文本逐 token 下发（先当答复展示，出现工具则被 message_retract 降级）
+    MESSAGE_CHUNK = "message_chunk"
+    # 同一条模型消息里出现了工具调用：此前文本属于思考叙述，前端搬进思考链
+    MESSAGE_RETRACT = "message_retract"
+    # 旧版「整轮叙述」；实时链路不再产生，仅历史落库数据回放时兼容读取
     THINKING_CHUNK = "thinking_chunk"
     PRINTS = "prints"
     TODOS = "todos"
     ARTIFACTS = "artifacts"
-    MESSAGE_CHUNK = "message_chunk"
     TOOL_MESSAGE = "tool_message"
     RUN_FINISHED = "run_finished"
     RUN_ERROR = "run_error"
