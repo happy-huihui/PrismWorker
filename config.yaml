@@ -177,7 +177,7 @@ tools:
     enabled: true                  # 是否启用生图工具
     api_key: ${ARK_API_KEY:}       # 方舟密钥（从 .env 的 ARK_API_KEY 读取，勿硬编码提交）
     base_url: https://ark.cn-beijing.volces.com/api/v3  # 方舟 OpenAI 兼容根地址
-    model: ${ARK_IMAGE_MODEL:doubao-seedream-4-0-250828}  # 生图模型 ID
+    model: ${ARK_IMAGE_MODEL:doubao-seedream-5-0-pro-260628}  # 生图模型 ID（Seedream 5.0 Pro）
     size: "2K"
     watermark: false               # 是否加 AI 水印
     response_format: url           # 返回格式：url（24h 有效） / b64_json

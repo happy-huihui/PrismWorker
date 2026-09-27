@@ -116,8 +116,12 @@ def create_app(
     from app.api.routes import uploads as uploads_router
     from app.api.routes import artifacts as artifacts_router
     from app.api.routes import auth as auth_router
+    from app.api.routes import agent_md as agent_md_router
+    from app.api.routes import skills as skills_router
 
     app.include_router(auth_router.router)  # 登录/自查：唯一免 token 的业务入口
+    app.include_router(agent_md_router.router)  # 用户自定义指令（agent.md）读写
+    app.include_router(skills_router.router)  # 技能清单与用户黑名单
     app.include_router(threads_router.router)
     app.include_router(runs_router.router)
     app.include_router(models_router.router)

@@ -1,5 +1,5 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react'
-import { Sparkles } from '@/components/icons'
+import { CircleDot, FileText, X } from '@/components/icons'
 import { useNavigate, useParams } from 'react-router-dom'
 import { useQueryClient } from '@tanstack/react-query'
 import { toast } from 'sonner'
@@ -17,6 +17,7 @@ import { ArtifactsProvider, useArtifacts } from '@/core/artifacts/context'
 import { useMessages } from '@/core/messages'
 import { threadListKey, useCreateThread, useThreads } from '@/core/threads'
 import { useRunStream, useThreadChains, useThreadRuns, chainListKey, replayChainEvents } from '@/core/runs'
+import { applySkillSlash, useSkills } from '@/core/skills'
 import { uploadFile } from '@/core/uploads'
 import { type MessageOut, type ThreadOut } from '@/core/api/types'
 
@@ -132,81 +133,124 @@ function pickSuggestions(): string[] {
 function WelcomeView() {
   const navigate = useNavigate()
   const createThread = useCreateThread()
+  const { data: threads } = useThreads()
   const { userId, openLogin } = useAuth()
+  // 技能清单：主页大输入框同样支持 / 技能命令
+  const { data: skillsData } = useSkills({ enabled: !!userId })
   const [input, setInput] = useState('')
-  // 推荐话题：每次挂载（进入欢迎页）重新抽一批， StrictMode 双挂载也只会多抽一次，无副作用
+  // 主页附件：仅暂存文件引用，发送时先建会话再上传进该会话的 uploads 空间
+  const [pendingFiles, setPendingFiles] = useState<File[]>([])
+  const [isSending, setIsSending] = useState(false)
+  // 推荐话题：每次挂载（进入主页）重新抽一批， StrictMode 双挂载也只会多抽一次，无副作用
   const suggestions = useMemo(pickSuggestions, [])
 
-  const handleWelcomeSend = (text: string) => {
+  // 主页首问：创建会话（有空会话则复用）→ 附件上传进会话 → 写自动发送接力 → 跳转。
+  // ThreadView 挂载时检测接力标记并直接发送，用户不需要再按一次回车。
+  const handleWelcomeSend = async (text: string) => {
     // 未登录：不提交，弹登录框（登录后再发一次即可）
     if (!userId) {
       openLogin()
       return
     }
-    createThread.mutate(
-      { title: '新对话' },
-      {
-        onSuccess: (thread) => {
-          try {
-            sessionStorage.setItem(`prism-draft:${thread.thread_id}`, text)
-          } catch {
-          }
-          setInput('')
-          navigate(`/chats/${thread.thread_id}`)
-        },
-        onError: (err) =>
-          toast.error('新建会话失败', {
-            description: err instanceof Error ? err.message : '未知错误',
-          }),
-      },
-    )
+    if (isSending) return
+    setIsSending(true)
+    try {
+      // 1.建会话（有空会话复用，不重复新建）
+      const empty = threads?.find((t) => t.message_count === 0)
+      const thread = empty ?? (await createThread.mutateAsync({ title: '新对话' }))
+      // 2.附件先上传进该会话的 uploads 空间（run 时由 UploadsMiddleware 自动拾取）
+      for (const file of pendingFiles) {
+        try {
+          await uploadFile(thread.thread_id, file)
+        } catch (err) {
+          toast.error('附件上传失败', {
+            description: `${file.name}：${err instanceof Error ? err.message : '未知错误'}`,
+          })
+          setIsSending(false)
+          return
+        }
+      }
+      // 3.写自动发送接力并跳转（ThreadView 挂载后立即发送）
+      try {
+        sessionStorage.setItem(`prism-autosend:${thread.thread_id}`, text)
+      } catch {
+      }
+      setInput('')
+      setPendingFiles([])
+      navigate(`/chats/${thread.thread_id}`)
+    } catch (err) {
+      toast.error('新建会话失败', {
+        description: err instanceof Error ? err.message : '未知错误',
+      })
+      setIsSending(false)
+    }
   }
 
   return (
-    <div className="flex h-full flex-col items-center justify-center gap-6 px-6">
-      <div className="flex flex-col items-center gap-4 text-center animate-message-in">
-        <div className="relative">
-          <div className="absolute -inset-3 rounded-[1.6rem] bg-primary/10 blur-xl" aria-hidden />
-          <div className="relative flex size-14 items-center justify-center rounded-2xl bg-primary text-primary-foreground shadow-lg">
-            <Sparkles className="size-7" />
+    <div className="flex h-full flex-col justify-center overflow-y-auto px-6">
+      <div className="mx-auto w-full max-w-[760px] py-10">
+        {/* 1.大标题（品牌衬线英文口号）+ 一句中文定位 */}
+        <h1 className="font-display text-[32px] font-semibold leading-tight tracking-tight">
+          Ask once, we deliver.
+        </h1>
+        <p className="mt-2 text-sm text-muted-foreground">
+          多智能体工作流引擎 · 提问、思考、交付，一气呵成；输入 / 可使用技能命令
+        </p>
+
+        {/* 2.主页附件 chips（发送时随首问上传进新会话） */}
+        {pendingFiles.length > 0 && (
+          <div className="mb-2 flex flex-wrap gap-1.5">
+            {pendingFiles.map((file, i) => (
+              <span
+                key={`${file.name}-${i}`}
+                className="flex items-center gap-1.5 rounded-full border bg-card px-2.5 py-1 text-xs text-muted-foreground"
+              >
+                <FileText className="size-3 shrink-0" />
+                <span className="max-w-[160px] truncate">{file.name}</span>
+                <button
+                  type="button"
+                  onClick={() => setPendingFiles((prev) => prev.filter((_, j) => j !== i))}
+                  className="transition-colors hover:text-foreground"
+                  aria-label={`移除附件 ${file.name}`}
+                >
+                  <X className="size-3" />
+                </button>
+              </span>
+            ))}
           </div>
+        )}
+
+        {/* 3.大号输入卡（hero）：功能与底栏输入框完全一致 */}
+        <div className="mt-7">
+          <ChatInput
+            hero
+            value={input}
+            onChange={setInput}
+            onSend={handleWelcomeSend}
+            onAttach={(files) => setPendingFiles((prev) => [...prev, ...files])}
+            disabled={createThread.isPending || isSending}
+            placeholder="规划与编程，问点什么…（Enter 发送，/ 使用技能）"
+            skills={skillsData?.skills}
+          />
         </div>
-        <div className="space-y-1.5">
-          <h1 className="text-2xl font-semibold tracking-tight">欢迎使用 PrismWorker</h1>
-          <p className="text-sm text-muted-foreground">
-            多智能体工作流引擎 · 提问、思考、交付，一气呵成
-          </p>
+
+        {/* 4.建议列表（Qoder 式单行条目，点击即发送） */}
+        <div className="mt-5 flex flex-col gap-0.5">
+          {suggestions.map((s) => (
+            <button
+              key={s}
+              type="button"
+              onClick={() => handleWelcomeSend(s)}
+              disabled={createThread.isPending || isSending}
+              className="flex max-w-full items-center gap-2.5 rounded-lg px-2.5 py-2 text-left text-[13px] text-muted-foreground transition-colors hover:bg-secondary hover:text-foreground disabled:opacity-50"
+              title={s}
+            >
+              <CircleDot className="size-3.5 shrink-0" />
+              <span className="truncate">{s}</span>
+            </button>
+          ))}
         </div>
       </div>
-
-      <div className="w-full max-w-xl">
-        <ChatInput
-          value={input}
-          onChange={setInput}
-          onSend={handleWelcomeSend}
-          disabled={createThread.isPending}
-          placeholder="问点什么…（Enter 发送，Shift+Enter 换行）"
-        />
-      </div>
-
-      <div className="flex w-full max-w-xl flex-wrap items-center justify-center gap-2">
-        {suggestions.map((s) => (
-          <button
-            key={s}
-            type="button"
-            onClick={() => handleWelcomeSend(s)}
-            disabled={createThread.isPending}
-            className="max-w-full truncate rounded-full border bg-card px-3.5 py-1.5 text-xs text-muted-foreground transition-all hover:border-primary/30 hover:bg-accent hover:text-foreground disabled:opacity-50"
-            title={s}
-          >
-            {s}
-          </button>
-        ))}
-      </div>
-
-      <p className="max-w-md text-center text-xs text-muted-foreground/70">
-        也可以从左侧选择一个已有会话继续，或点击「新建会话」。
-      </p>
     </div>
   )
 }
@@ -219,6 +263,9 @@ function ThreadView({ threadId }: { threadId: string }) {
 
   const { data: threads, isLoading } = useThreads()
   const thread = threads?.find((t) => t.thread_id === threadId)
+  // 技能清单：供 Composer 斜杠浮层与发送时的 /技能名 改写（未登录不拉取）
+  const { data: skillsData } = useSkills({ enabled: !!userId })
+  const skills = skillsData?.skills
 
   const { data: messages = [], isLoading: msgLoading } = useMessages(threadId)
 
@@ -376,14 +423,21 @@ function ThreadView({ threadId }: { threadId: string }) {
   ])
 
   const [draft, setDraft] = useState<string>(() => {
+    // 只读不清：草稿随输入持续持久化，切走再切回不丢（发送后随 setDraft('') 覆盖）
     try {
-      const d = sessionStorage.getItem(`prism-draft:${threadId}`)
-      if (d != null) sessionStorage.removeItem(`prism-draft:${threadId}`)
-      return d ?? ''
+      return sessionStorage.getItem(`prism-draft:${threadId}`) ?? ''
     } catch {
       return ''
     }
   })
+  // 草稿持久化：每次输入即写 sessionStorage（按 threadId 隔离），主流通用做法
+  useEffect(() => {
+    try {
+      sessionStorage.setItem(`prism-draft:${threadId}`, draft)
+    } catch {
+      // 忽略持久化失败（隐私模式等）
+    }
+  }, [threadId, draft])
   // 本地待发 user 气泡：text 为原文，afterCount 记录发送时服务端历史的条数，
   // 清理/去重只匹配该位置之后的消息——避免「往轮发过同文本」被误判为已落库
   const [pendingUser, setPendingUser] = useState<{ text: string; afterCount: number } | null>(null)
@@ -483,10 +537,13 @@ function ThreadView({ threadId }: { threadId: string }) {
       return
     }
     setDraft('')
+    // 斜杠技能（方案 A）：/技能名 开头的输入在发送前改写为自然语言提示，
+    // 展示仍用用户原文；改写后激活仍由模型读到技能清单自主完成
+    const finalText = applySkillSlash(text, skills)
     setPendingUser({ text, afterCount: messages.length })
     // 新一轮开始前失效历史链：让已完成的往轮链从后端取回（当前轮仍走实时流）
     qc.invalidateQueries({ queryKey: chainListKey(threadId) })
-    const ok = await runStream.submit(text, {
+    const ok = await runStream.submit(finalText, {
       // model_name 传 null = 交给后端动态路由决定（harness/models/routing）
       model_name: null,
       thinking_enabled: thinking,
@@ -496,6 +553,26 @@ function ThreadView({ threadId }: { threadId: string }) {
   const handleStop = () => {
     void runStream.stop()
   }
+
+  // 主页首问自动发送：WelcomeView 创建/复用会话后写 prism-autosend 接力标记，
+  // 这里挂载时读后即删并直接走统一发送链路（用户不需要再按一次回车）；
+  // 「读后即删」天然防 StrictMode 双挂载重复发送，runStream 内部另有 running 防重。
+  const autoSentRef = useRef(false)
+  useEffect(() => {
+    if (autoSentRef.current) return
+    let auto: string | null = null
+    try {
+      auto = sessionStorage.getItem(`prism-autosend:${threadId}`)
+      if (auto != null) sessionStorage.removeItem(`prism-autosend:${threadId}`)
+    } catch {
+    }
+    if (auto && auto.trim()) {
+      autoSentRef.current = true
+      void handleSend(auto.trim())
+    }
+    // 仅挂载时接力一次；skills 与主页共享同一份 React Query 缓存，改写不受影响
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [threadId])
 
   return (
     // ArtifactsProvider 包住整页：消息流里的产物卡片（深层子树）要能唤起右侧侧边栏
@@ -562,6 +639,7 @@ function ThreadView({ threadId }: { threadId: string }) {
               isRunning={runActive}
               thinking={thinking}
               onThinkingChange={handleThinkingChange}
+              skills={skills}
             />
           </div>
         </div>

@@ -11,6 +11,8 @@ from langchain_core.messages import SystemMessage
 
 from harness.config.skills import SkillsConfig
 from harness.prompt import load_text, render_text
+from harness.runtime.skill_prefs import get_skill_blacklist_store
+from harness.runtime.user_context import resolve_runtime_user_id
 from harness.skills.frontmatter import split_skill_markdown
 
 ModelRequest = types.ModelRequest
@@ -129,14 +131,54 @@ class SkillActivationMiddleware(AgentMiddleware):
             return Path(self._skills_dir).resolve()
         return SkillsConfig().public_skills_dir()
 
+    def _scan_entries(self, runtime: Any) -> list[dict[str, str]]:
+        """扫描技能清单：公共技能 + 当前用户自定义技能（users/{uid}/skills）合并。
+
+        同名时**用户版 shadow 公共版**（对齐 DeerFlow；运行期优先用用户自己的）。
+        用户目录按 runtime 现取（每轮模型调用解析，不能固化）；
+        用户目录读取失败只降级为公共技能，不阻断装配。
+        """
+        by_name: dict[str, dict[str, str]] = {}
+        try:
+            from harness.skills.user_skills import list_user_skills
+
+            for entry in list_user_skills(resolve_runtime_user_id(runtime)):
+                by_name[entry["name"]] = entry
+        except Exception as exc:  # noqa: BLE001 —— 用户技能目录异常不阻断装配
+            logger.warning("用户自定义技能扫描失败，本次仅公共技能: %s", exc)
+        # 公共技能兜底填充（未被用户同名版本 shadow 的才生效）
+        for entry in scan_skills_dir(self._resolve_skills_dir()):
+            by_name.setdefault(entry["name"], entry)
+        return sorted(by_name.values(), key=lambda entry: entry["name"])
+
+    def _filter_blocked(
+        self,
+        entries: list[dict[str, str]],
+        runtime: Any,
+    ) -> list[dict[str, str]]:
+        """按当前用户技能黑名单过滤清单（被关闭的技能不装配、不可激活）。
+
+        每次调用现取 runtime 用户（不能在 __init__ 固化——黑名单按用户变化）；
+        黑名单加载异常视为空集，绝不阻断技能装配。
+        """
+        try:
+            user_id = resolve_runtime_user_id(runtime)
+            blocked = get_skill_blacklist_store().load(user_id)
+        except Exception as exc:  # noqa: BLE001 —— 黑名单异常不阻断技能装配
+            logger.warning("技能黑名单加载失败，本次按全量装配: %s", exc)
+            return entries
+        if not blocked:
+            return entries
+        return [entry for entry in entries if entry["name"] not in blocked]
+
     async def awrap_model_call(
         self,
         request: ModelRequest[Any],
         handler: Callable[[ModelRequest[Any]], Awaitable[Any]],
     ) -> Any:
         """包装模型调用：注入技能清单，响应激活指令加载技能正文。"""
-        skills_dir = self._resolve_skills_dir()
-        entries = scan_skills_dir(skills_dir)
+        # 合并公共 + 用户自定义技能，再按用户黑名单过滤
+        entries = self._filter_blocked(self._scan_entries(request.runtime), request.runtime)
         system_message = request.system_message
         base_text = system_message.text if system_message is not None else ""
 
@@ -184,7 +226,8 @@ class SkillActivationMiddleware(AgentMiddleware):
         if not names:
             return None
         updates: dict[str, Any] = {}
-        entries = scan_skills_dir(self._resolve_skills_dir())
+        # 写回 skill_context 前同样合并用户技能并按黑名单过滤
+        entries = self._filter_blocked(self._scan_entries(runtime), runtime)
         by_name = {entry["name"]: entry for entry in entries}
         import time as _time
 

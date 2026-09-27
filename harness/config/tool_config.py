@@ -59,8 +59,8 @@ class ArkImageConfig(BaseModel):
     )
 
     model: str = Field(
-        default="doubao-seedream-4-0-250828",
-        description="生图模型 ID（doubao-seedream-*-*）",
+        default="doubao-seedream-5-0-pro-260628",
+        description="生图模型 ID（doubao-seedream-*-*；Seedream 5.0 Pro）",
     )
 
     size: str = Field(default="2K", description="图像尺寸：2K / 4K / 2048x2048")

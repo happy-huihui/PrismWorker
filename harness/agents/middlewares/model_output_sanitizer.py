@@ -59,6 +59,15 @@ _ATTR_PAIR_RE = re.compile(
 # 标签协议的技能激活标签（归一化目标，与 SkillActivationMiddleware 的正则对齐）
 _ACTIVATE_SKILL_TAG = '<activate_skill name="{name}" />'
 
+# 文本协议工具的幻影调用（2026-09-27 实锤）：prompt 教的是正文标签协议
+# （<todo>[...]</todo> / <finish/>），但模型会把它们当真工具发起 tool_call——
+# 这些名字从未注册，ToolNode 执行必失败（思考链里出现「更新任务计划/finish 失败」）。
+# 出向净化时把它们转回正文标签：todo 的计划真正落库，finish 不再报错。
+_PROTOCOL_TAG_TOOLS: dict[str, str] = {
+    "todo": "<todo>{body}</todo>",
+    "finish": "<finish/>",
+}
+
 # 合成 id 的前缀（OpenAI 风格，便于日志辨认是净化器补的）
 _SYNTHETIC_ID_PREFIX = "call_sanitized_"
 
@@ -252,6 +261,11 @@ def sanitize_ai_message(
     if not isinstance(message, AIMessage):
         return message, False
     current, changed = sanitize_tool_calls(message)
+    if recover:
+        # 出向专属：把文本协议工具的幻影调用转回正文标签（入向不动配对历史）
+        current, conv_changed = _convert_protocol_calls(current, tool_names)
+        if conv_changed:
+            changed = True
     content = current.content
     if isinstance(content, str):
         cleaned, text_changed, recovered = clean_tool_call_shells(
@@ -265,6 +279,91 @@ def sanitize_ai_message(
             current = current.model_copy(update={"tool_calls": [*calls, *recovered]})
             changed = True
     return current, changed
+
+
+def _convert_protocol_calls(
+    message: AIMessage,
+    tool_names: frozenset[str],
+) -> tuple[AIMessage, bool]:
+    """把文本协议工具（todo/finish）的幻影 tool_call 转回正文标签。
+
+    只处理「名字命中协议表 且 不在真实工具清单里」的调用（真注册了同名工具
+    则照常执行）。todo 的计划从 args 里尽力提取（兼容字符串化 JSON / 列表
+    两种形态），提取失败时保留原调用走既有失败-重试路径，不静默丢计划。
+
+    参数：
+        message: 模型产出的 AI 消息（已经过幻影/缺 id 净化）
+        tool_names: 当前真实注册的工具名集合
+
+    返回：
+        (消息, 是否有改动)
+    """
+    calls = getattr(message, "tool_calls", None) or []
+    kept: list[dict[str, Any]] = []
+    appendix: list[str] = []
+    changed = False
+    for call in calls:
+        if not isinstance(call, dict):
+            kept.append(call)
+            continue
+        name = str(call.get("name") or "").strip()
+        template = _PROTOCOL_TAG_TOOLS.get(name)
+        # 真实工具 / 非协议名：照常保留
+        if template is None or name in tool_names:
+            kept.append(call)
+            continue
+        if "{body}" in template:
+            payload = _extract_protocol_payload(call.get("args") or {})
+            if not payload:
+                # 提取不出计划内容：保留原调用（执行失败会提示模型改用文本协议）
+                kept.append(call)
+                continue
+            appendix.append(template.format(body=payload))
+        else:
+            appendix.append(template)
+        changed = True
+    if not changed:
+        return message, False
+
+    # 转出的标签追加到正文（str 直拼；多模态块列表补一个 text 块）
+    extra_text = "\n\n".join(appendix)
+    content = message.content
+    if isinstance(content, str):
+        new_content = f"{content}\n\n{extra_text}" if content.strip() else extra_text
+        return message.model_copy(
+            update={"content": new_content, "tool_calls": kept, "invalid_tool_calls": []}
+        ), True
+    if isinstance(content, list):
+        new_content = [*content, {"type": "text", "text": extra_text}]
+        return message.model_copy(
+            update={"content": new_content, "tool_calls": kept, "invalid_tool_calls": []}
+        ), True
+    # 未知正文形态：放弃转换，保留原调用
+    return message, False
+
+
+def _extract_protocol_payload(args: dict[str, Any]) -> str:
+    """从 todo 幻影调用的 args 里提取计划数组的 JSON 文本（尽力而为）。
+
+    兼容三种实测形态：
+        1. {"todo": "[{...}]"}       —— 计划被字符串化塞进某个字段（主流）
+        2. {"todos": [{...}]}        —— 字段直接是列表
+        3. 整个 args 无法识别        —— 返回空串（保留原调用走失败路径）
+    """
+    if not isinstance(args, dict):
+        return ""
+    # 1.任一字符串字段的内容是 JSON 数组文本
+    for value in args.values():
+        if isinstance(value, str) and value.strip().startswith("["):
+            return value.strip()
+    # 2.任一字段直接是列表
+    for value in args.values():
+        if isinstance(value, list):
+            try:
+                return json.dumps(value, ensure_ascii=False)
+            except (TypeError, ValueError):
+                return ""
+    return ""
 
 
 def repair_history(messages: list[Any] | None) -> list[Any] | None:

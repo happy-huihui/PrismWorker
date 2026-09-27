@@ -162,6 +162,9 @@ const WriteDoc: IconNode = [
 ]
 
 export { PanelCollapse, PanelExpand, PaletteLine, SkillBook, WriteDoc }
+
+// 技能图标组件形态（菜单/按钮直接 <Skill className=.../> 用）
+export const Skill = makeIcon(SkillBook)
 export { AtomTemplate as AtomMark }
 
 /**

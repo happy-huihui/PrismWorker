@@ -61,7 +61,9 @@ def _decode_text(data: bytes, path: str) -> str | None:
     if Path(path).suffix.lower() not in _TEXT_EXTENSIONS and b"\x00" in data:
         return None
     try:
-        return data.decode("utf-8")
+        # 统一换行为 \n：Windows 落盘的 CRLF 会让 frontmatter 正则
+        # （要求 \n---\n）失配，导致整个包被误判为无 frontmatter
+        return data.decode("utf-8").replace("\r\n", "\n")
     except UnicodeDecodeError:
         return None
 

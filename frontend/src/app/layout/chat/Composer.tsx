@@ -1,5 +1,6 @@
 import { ChatInput } from '@/components/chat/ChatInput'
 import { ThinkingToggle } from '@/components/chat/ThinkingToggle'
+import { type SkillOut } from '@/core/skills'
 
 /**
  * 输入区（Composer）
@@ -26,6 +27,8 @@ interface ComposerProps {
   onThinkingChange: (enabled: boolean) => void
   /** 当前模型是否支持深度思考 */
   thinkingSupported?: boolean
+  /** 技能清单（透传给 ChatInput 的斜杠浮层；未传则不启用） */
+  skills?: SkillOut[]
 }
 
 export function Composer({
@@ -40,6 +43,7 @@ export function Composer({
   thinking,
   onThinkingChange,
   thinkingSupported,
+  skills,
 }: ComposerProps) {
   // 运行中禁用参数修改（避免中途切思考）
   const controlsDisabled = isRunning || disabled
@@ -55,6 +59,7 @@ export function Composer({
         isRunning={isRunning}
         disabled={disabled}
         placeholder={placeholder}
+        skills={skills}
         toolbar={
           <ThinkingToggle
             enabled={thinking}

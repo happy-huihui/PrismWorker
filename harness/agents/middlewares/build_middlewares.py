@@ -101,6 +101,11 @@ def build_middlewares(
                 auto_extract=(memory.mode == "middleware"),
             )
         )
+    # 自定义指令中间件：把用户 agent.md 追加到系统消息末尾（排在记忆之后注册，
+    # 洋葱内层后执行，保证 <agent_md> 块位于所有注入内容的最末尾）。
+    from harness.agents.middlewares.agent_md import AgentMdMiddleware
+
+    middlewares.append(AgentMdMiddleware())
     middlewares += [
         SkillActivationMiddleware(skills_dir=skills_dir),
         SkillToolPolicyMiddleware(),
