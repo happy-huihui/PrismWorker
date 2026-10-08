@@ -17,13 +17,14 @@ from harness.models.strategy import ChatModelStrategy
 
 """DeepSeek 模型创建策略
 
-    职责：负责 deepseek 这一家的模型怎么造。
-    流程：先去掉 base_url（DeepSeek 自定义模型类不认这个参数），
-         再按模型标识精确对应——只认 deepseek-v4-pro / deepseek-v4-flash 两款。
-    思考：开思考时下发 reasoning_effort=high（实测 thinking={...} 会被 openai SDK
-         拒为未知参数，reasoning_effort 可走通；代价是明显变慢，只在用户显式
-         开思考时付）。两款模型默认都会返回 reasoning_content，真实思考链
-         由 langchain_deepseek 放进 additional_kwargs，供运行层取用。
+    职责：负责 deepseek 这一家的模型怎么造
+        - 去掉 base_url（DeepSeek 自定义模型类不认该参数）
+        - 只认 deepseek-v4-pro / deepseek-v4-flash 两款
+        - 开思考时下发 reasoning_effort=high
+
+    对外暴露：
+        - DeepSeekChatModelStrategy   provider="deepseek" 的策略
+        - THINKING_REASONING_EFFORT   开思考时的推理强度
 """
 
 # 开启深度思考时的推理强度（实测 deepseek-v4 接受该参数）
@@ -57,27 +58,27 @@ class DeepSeekChatModelStrategy(ChatModelStrategy):
         异常：
             模型标识不在支持的两款之内时抛 ValueError
         """
-        # 移除 base_url，避免传给 DeepSeek 自定义模型类
+        # 1.移除 base_url，避免传给 DeepSeek 自定义模型类（它不认这个参数）
         settings.pop("base_url", None)
 
-        # 开思考：直接上推理强度字段（BaseChatOpenAI 自带，会进请求体；
-        # 塞进 model_kwargs 会被提醒“应显式传参”），不覆盖调用方显式给的值
+        # 2.开思考：直接上推理强度字段（BaseChatOpenAI 自带，会进请求体；
+        #    塞进 model_kwargs 会被提醒「应显式传参」），不覆盖调用方显式给的值
         if thinking_enabled:
             settings.setdefault("reasoning_effort", THINKING_REASONING_EFFORT)
 
-        # 取模型标识，统一转成字符串再精确匹配
+        # 3.取模型标识，统一转成字符串再精确匹配
         model_id = settings.get("model")
         model_id_str = str(model_id) if model_id is not None else None
 
-        # Pro（deepseek-v4-pro）：走带思考链修复的实现类
+        # 4.Pro（deepseek-v4-pro）：走带思考链修复的实现类
         if is_deepseek_pro_model(model_id_str):
             return DeepSeekProChatModel(**settings, **kwargs)
 
-        # Flash（deepseek-v4-flash）：走普通实现类
+        # 5.Flash（deepseek-v4-flash）：走普通实现类
         if is_deepseek_flash_model(model_id_str):
             return DeepSeekFlashChatModel(**settings, **kwargs)
 
-        # 只认这两款，其余直接报错
+        # 6.只认这两款，其余直接报错
         raise ValueError(
             f"不支持的 DeepSeek 模型: {model_id!r}"
             f"（仅支持 {DEEPSEEK_FLASH_MODEL_ID} / {DEEPSEEK_PRO_MODEL_ID}）"

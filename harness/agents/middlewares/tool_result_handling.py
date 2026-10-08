@@ -9,21 +9,15 @@ from langchain_core.messages.utils import count_tokens_approximately
 
 from harness.agents.middlewares.input_sanitization_middleware import neutralize_untrusted_tags
 
-"""
-    工具结果处理中间件（tool_result_handling）——工具输出的安全与预算两道闸。
+"""工具结果处理中间件
 
-    ToolResultSanitizationMiddleware（净化）：
-      工具/子代理的返回内容属于「不可信」输入（可能来自网络、用户文件、
-      外部系统），中间件在每次模型调用后扫描本轮新增的 ToolMessage，
-      对其中文本内容做 neutralize_untrusted_tags 转义，防止工具输出里夹带
-      的伪 <system> / <memory> 等标签冒充框架上下文实施提示注入。
-      实现：返回同 id 的新 ToolMessage（add_messages 按 id 原地覆盖），
-      只重写文本块；非文本块与结构化字段原样保留。
+    职责：对工具返回内容做安全净化与长度预算两道处理
+        - ToolResultSanitizationMiddleware  转义工具输出里的伪造标签（返回同 id 新 ToolMessage 覆盖）
+        - ToolOutputBudgetMiddleware        超长结果保头截断并附说明
 
-    ToolOutputBudgetMiddleware（预算）：
-      防止个别工具吐出超长结果挤爆上下文——对每条新增 ToolMessage 做近似
-      token 估算，超过 max_output_tokens 时保头截断、附加「已截断」说明，
-      并按 80% 水位提前打印一条中文进度提示。
+    对外暴露：
+        - ToolResultSanitizationMiddleware
+        - ToolOutputBudgetMiddleware
 """
 
 logger = logging.getLogger(__name__)
@@ -39,11 +33,13 @@ class ToolResultSanitizationMiddleware(AgentMiddleware):
         self, state: Any, runtime: Any  # type: ignore[override]
     ) -> dict[str, Any] | None:
         """模型调用后：净化新增的 ToolMessage 文本内容。"""
+        # 1.遍历本轮消息，挑出工具消息做净化
         messages = (state or {}).get("messages") or []
         changed: list[ToolMessage] = []
         for message in messages:
             if message is None or getattr(message, "type", "") != "tool":
                 continue
+            # 2.净化文本；内容有变化才重建同 id 的 ToolMessage（原地覆盖语义）
             sanitized = _sanitize_tool_content(message.content)
             if sanitized != message.content:
                 new_message = ToolMessage(
@@ -53,6 +49,7 @@ class ToolResultSanitizationMiddleware(AgentMiddleware):
                 )
                 new_message.id = message.id
                 changed.append(new_message)
+        # 3.无变化 → 不干预
         if not changed:
             return None
         return {"messages": changed}
@@ -76,15 +73,18 @@ class ToolOutputBudgetMiddleware(AgentMiddleware):
         for message in messages:
             if message is None or getattr(message, "type", "") != "tool":
                 continue
+            # 1.估算 token 数；估算失败就不做预算干预
             try:
                 tokens = count_tokens_approximately([message])
             except Exception:  # noqa: BLE001 —— 估算失败就不做预算干预
                 continue
+            # 2.达到 80% 水位但未超限 → 提前打印一条进度提示
             if tokens > self._max_tokens * 0.8 and tokens <= self._max_tokens:
                 prints.append(
                     f"注意：工具 {getattr(message, 'name', '')} 输出已达"
                     f"{tokens} token（预算 {self._max_tokens}）"
                 )
+            # 3.超限 → 保头截断，重建同 id ToolMessage 并提示
             if tokens > self._max_tokens:
                 truncated = _truncate_content(
                     message.content, self._max_tokens
@@ -100,6 +100,7 @@ class ToolOutputBudgetMiddleware(AgentMiddleware):
                     f"工具 {getattr(message, 'name', '')} 输出超预算，已截断"
                     f"至 {len(truncated)} 字符"
                 )
+        # 4.汇总更新；两者都无则返回 None
         updates: dict[str, Any] = {}
         if changed:
             updates["messages"] = changed

@@ -17,32 +17,15 @@ from harness.uploads.manager import is_upload_staging_file
 from harness.utils.file_outline import extract_outline_for_file
 
 
-"""
-    列出历史上传文件工具（list_uploaded_files）。
+"""历史上传文件清单工具
 
-    让 Agent 按需发现之前对话上传过的历史文件。(排除符号连接 + 暂存文件 + .md转换产物)
-    用户说"分析我之前上传的那些 PDF"、或刚进一个线程想看看有哪些可用数据时，用它扫描上传目录给出文件清单。
+    职责：扫描线程上传目录，列出「之前几轮」上传过的文件供模型按需发现
+        - 排除符号链接 / 暂存文件 / 本次运行上传的文件 / .md 转换产物
+        - 可按需附带文档大纲（标题 + 预览）
+        - 所有回填文本都过 neutralize_untrusted_tags，防注入
 
-    输出示例（JSON dict）：
-    {
-      "files": [
-        {"filename": "data.csv", 
-         "size": 2048,
-         "path": "/mnt/user-data/uploads/data.csv", 
-         "extension": ".csv"
-        },
-        {"filename": "report.pdf", 
-         "size": 512,
-         "path": "/mnt/user-data/uploads/report.pdf", 
-         "extension": ".pdf",
-         "outline": [{"title": "Introduction", "line": 1}, ...],
-         "outline_preview": ["# Report", "", "This is a report about..."]}
-      ],
-      "total_count": 4,
-      "truncated": true,
-      "omitted_summary": "1 .md, 1 .png",
-      "message": "Found 5 historical file(s)."
-    }
+    对外暴露：
+        - list_uploaded_files   工具本体
 """
 
 logger = logging.getLogger(__name__)
@@ -52,11 +35,13 @@ _MAX_MAX_RESULTS = 100
 
 
 def _extension_label(file_path: Path) -> str:
+    # 取小写后缀当分组标签；无后缀给个占位
     suffix = file_path.suffix.lower()
     return neutralize_untrusted_tags(suffix) or "(no extension)"
 
 
 def _format_omitted_summary(omitted: list[str]) -> str:
+    # 按后缀计数，拼成「3 .pdf, 1 .csv」这类摘要
     counts = Counter(_extension_label(Path(f)) for f in omitted)
     parts = [f"{count} {ext}" for ext, count in sorted(counts.items())]
     return neutralize_untrusted_tags(", ".join(parts))
@@ -65,14 +50,17 @@ def _format_omitted_summary(omitted: list[str]) -> str:
 def _resolve_thread_id(runtime: Runtime) -> str | None:
     """解析当前线程 ID（thread_id），从 runtime 上下文或 RunnableConfig 里取。"""
 
+    # 1.优先 runtime.context
     thread_id = runtime.context.get("thread_id") if runtime.context else None
     if thread_id:
         return thread_id
+    # 2.退到 runtime.config.configurable
     runtime_config = getattr(runtime, "config", None) or {}
     thread_id = runtime_config.get("configurable", {}).get("thread_id")
     if thread_id:
         return thread_id
 
+    # 3.再退到图全局 config（无运行时上下文时抛 RuntimeError）
     try:
         return get_config().get("configurable", {}).get("thread_id")
     except RuntimeError:
@@ -93,9 +81,11 @@ def _list_uploaded_files_impl(
 ) -> dict:
     """核心实现——不依赖 @tool 包装也能独立测试。"""
 
+    # 1.无 runtime 直接空结果（独立测试时可能没有上下文）
     if runtime is None:
         return {"files": [], "message": "No runtime context available."}
 
+    # 2.线程解析不出来就不给结果（无法定位上传目录）
     thread_id = _resolve_thread_id(runtime)
     if thread_id is None:
         return {"files": [], "message": "Thread not found."}
@@ -103,9 +93,11 @@ def _list_uploaded_files_impl(
     paths = _paths or get_paths()
     uploads_dir = paths.sandbox_uploads_dir(thread_id, user_id=user_id)
 
+    # 3.目录不存在 = 该线程没上传过文件
     if not uploads_dir.exists():
         return {"files": [], "message": "No uploads directory for this thread."}
 
+    # 4.先收集「本次运行上传」的文件名，稍后从结果里排除
     current_run_filenames: set[str] = set()
     try:
         state = runtime.state
@@ -120,8 +112,10 @@ def _list_uploaded_files_impl(
             exc_info=True,
         )
 
+    # 5.把 max_results 钳到 [1, 100]
     max_results = max(1, min(max_results, _MAX_MAX_RESULTS))
 
+    # 6.include_outline 支持 bool（全部 / 全不）与文件名列表（按名单）
     if isinstance(include_outline, bool):
         outline_for_all: bool = include_outline
         outline_filenames: set[str] = set()
@@ -133,12 +127,15 @@ def _list_uploaded_files_impl(
 
     candidates: list[tuple[float, Path, int]] = []
     try:
+        # 7.只收普通文件：排除目录、符号链接与暂存文件
         entries = [e for e in os.scandir(uploads_dir) if e.is_file() and not e.is_symlink() and not is_upload_staging_file(e.name)]
         all_names: set[str] = {e.name for e in entries}
 
         for entry in entries:
+            # 8.本次运行上传的文件不算「历史」
             if entry.name in current_run_filenames:
                 continue
+            # 9.排除 .md 转换产物：存在同名非 .md 兄弟文件即说明它是派生出来的
             if entry.name.endswith(".md"):
                 stem = entry.name[:-3]
                 non_md_siblings = {n for n in all_names if n != entry.name and Path(n).stem == stem}
@@ -151,9 +148,11 @@ def _list_uploaded_files_impl(
 
     """ 判断是否有历史文件；若有，按修改时间倒序排列，再按 max_results 截断 """
 
+    # 10.没有候选就直接空结果
     if not candidates:
         return {"files": [], "message": "No historical uploaded files in this thread."}
 
+    # 11.按修改时间倒序，取前 max_results，其余记入省略摘要
     candidates.sort(key=lambda item: item[0], reverse=True)
     total_count = len(candidates)
     truncated = total_count > max_results
@@ -171,6 +170,7 @@ def _list_uploaded_files_impl(
             "path": neutralize_untrusted_tags(f"/mnt/user-data/uploads/{filename}"),
             "extension": neutralize_untrusted_tags(file_path.suffix),
         }
+        # 12.命中名单（或全开）才提取大纲，避免无谓的转 .md
         should_include_outline = outline_for_all or filename in outline_filenames
         if should_include_outline:
             outline, preview = extract_outline_for_file(file_path)
@@ -187,6 +187,7 @@ def _list_uploaded_files_impl(
         "files": files,
         "total_count": total_count,
     }
+    # 13.有截断才附上被省略文件的后缀摘要
     if truncated:
         result["truncated"] = True
         result["omitted_summary"] = _format_omitted_summary(omitted_paths)
@@ -227,6 +228,7 @@ def list_uploaded_files(
     - 用户指名了具体文件——直接带路径用 read_file 或 grep
     - 文件是本次运行上传的——它已在 <current_uploads>
     """
+    # 实现委托给 _list_uploaded_files_impl，便于脱离 @tool 包装单测
     return _list_uploaded_files_impl(
         include_outline=include_outline,
         max_results=max_results,

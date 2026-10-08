@@ -8,15 +8,12 @@ from typing import Any, Callable
 
 from harness.runtime.events import get_dispatch_sink
 
-"""Lead Agent 装配注册表（graph.registry）
+"""Lead Agent 装配注册表
 
-    职责：按配置构建并缓存编译好的 Lead Agent 图，供 run 编排取用。
-    背景：harness 的 event_sink（工具事件唯一出口）是注入式的、装配期固定，
-         而工具事件本身不带 run 标识；为让 agent 能被安全缓存、又支持并发
-         多 run 事件各归各位，这里把「进程级分发 sink」作为所有缓存 agent 的
-         event_sink，事件归属由 run 上下文变量决定（见 events.routing）。
-    缓存：按配置 key 做 LRU，key 含 模型名 / 思考开关 / 技能目录 / 沙箱与
-         checkpointer 身份 / 配置摘要——任一项变化都会自动重建。
+    职责：按配置构建并缓存编译好的 Lead Agent 图，供 run 编排取用
+        - 缓存 key = 模型名 / 思考开关 / 技能目录 / 沙箱身份 / checkpointer 身份 / 配置摘要，任一变化即重建
+        - 进程级分发 sink 作为所有缓存 agent 的 event_sink，事件归属由 run 上下文变量决定
+        - 沙箱实例**不缓存**：每次装配现问 provider，让活跃 / 热池状态机如实流转
 
     对外暴露：
         - AgentRegistry        装配注册表（build_agent / get_agent / sandbox）
@@ -58,12 +55,14 @@ class AgentRegistry:
             builder: 覆盖图构建器（默认 harness build_lead_agent）
             max_size: LRU 容量
         """
+        # 装配输入：配置 + 沙箱来源 + 缓存路径共享的 checkpointer
         self._app_config = app_config
         self._sandbox = sandbox
         self._sandbox_provider = sandbox_provider
         self._checkpointer = checkpointer
         self._skills_dir = skills_dir
         self._builder = builder
+        # LRU：OrderedDict 尾部是最近使用（命中即挪到尾部）
         self._cache: OrderedDict[str, Any] = OrderedDict()
         self._max_size = max(1, max_size)
         self._lock = threading.Lock()
@@ -101,9 +100,11 @@ class AgentRegistry:
     @property
     def sandbox(self) -> Any | None:
         """当前装配用的沙箱实例（每次调用都向 provider 取一次）。"""
+        # 每次现取：沙箱实例不能缓存（原因见 _resolve_sandbox 的实测缺陷说明）
         return self._resolve_sandbox()
 
 
+        # repr 做摘要足够：只要配置内容变，key 就变，缓存自动失效
     def _config_hash(self) -> str:
         """配置摘要：AppConfig 内容变化 → 哈希变化 → 触发重建。"""
         try:
@@ -121,6 +122,7 @@ class AgentRegistry:
         返回：
             用于 LRU 命中的字符串键
         """
+        # 六要素拼 key：模型 / 思考 / 技能目录 / 沙箱身份 / checkpointer 身份 / 配置摘要
         resolved_model = model_name or "auto"
         actual = self._resolve_sandbox()
         parts = [
@@ -155,6 +157,7 @@ class AgentRegistry:
         的 checkpointer 每次都是新实例 → 缓存无法复用，只能现场装配。仍走
         同一构建路径（builder/沙箱/技能/事件分发），保证装配一致性。
         """
+        # 与 get_agent 走同一构建路径，只是既不查缓存也不写缓存
         builder = self._builder or _default_builder
         return builder(
             self._app_config,
@@ -202,16 +205,19 @@ class AgentRegistry:
     def reset_all(self) -> None:
         """清空全部缓存（测试隔离 / 配置整体重建用）。"""
         with self._lock:
+            # 只清缓存表；已发出的图不回收，在跑的 run 继续用旧图收尾
             self._cache.clear()
 
     def __len__(self) -> int:
         """当前缓存条目数。"""
         with self._lock:
+            # 加锁读，避免与并发装配交错
             return len(self._cache)
 
 
 def _default_builder(*args: Any, **kwargs: Any) -> Any:
     """默认构建器：委托 harness 官方入口 build_lead_agent。"""
+    # 延迟导入：import 本模块时不拉起整条 agents 装配链
     from harness.agents.lead_agent.agent import build_lead_agent
 
     return build_lead_agent(*args, **kwargs)
@@ -241,6 +247,7 @@ def get_agent_registry(
     返回：
         对应 app_config 的 AgentRegistry 单例
     """
+    # 以 app_config 实例身份为键：同一配置复用同一注册表，缓存才有意义
     key = id(app_config)
     with _registry_lock:
         registry = _registries.get(key)
@@ -260,6 +267,7 @@ def get_agent_registry(
 
 
 def reset_agent_registry() -> None:
+    # 整体换新字典：避免持锁期间被并发读看到半空状态
     """清空注册表单例（测试隔离用）。"""
     global _registries
     with _registry_lock:

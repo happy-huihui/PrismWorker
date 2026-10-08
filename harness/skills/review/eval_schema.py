@@ -5,22 +5,15 @@ import json
 from harness.skills.review.models import make_finding
 
 
-"""
-技能包 eval 清单的结构检查与统计。
-    - 一个技能包除了 SKILL.md 和资源文件外，可能还有一个 evals/ 目录，里面放了一些测试用例（给定 query，期望该技能是否被触发）。
-    - 本模块对它们做确定性（非模型驱动）检查，不依赖 LLM：
-        1. 是不是合法 UTF-8 文本 JSON（不是文本 / JSON 语法坏了 → warning）；
-        2. 识别它是哪种 schema 书写风格（versioned / skill-creator-evals / trigger-eval-list / unknown）；
-        3. 统计每个清单的正/负触发 case 数量（should_trigger 字段）。
-    # evals/trigger_evals.json
-    {
-      "schema_version": "1.0",
-      "cases": [
-        {"name": "case1", "query": "...", "should_trigger": true},
-        {"name": "case2", "query": "...", "should_trigger": false}
-      ]
-    }
-    - analyzer 在资源图分析之后调用本模块，把 findings 汇总进全局审查结果。
+"""eval 清单检查
+
+    职责：对技能包 evals/*.json 做确定性检查与统计（不依赖 LLM）
+        - 识别书写风格：versioned / skill-creator-evals / trigger-eval-list / unknown
+        - 统计正 / 负触发用例数（should_trigger）
+        - 非文本或 JSON 坏了报 warning
+
+    对外暴露：
+        - analyze_eval_manifests   返回 (聚合统计, findings)
 """
 
 
@@ -31,6 +24,7 @@ def _classify_manifest(payload: object) -> str:
     返回 versioned / skill-creator-evals / trigger-eval-list / unknown
     """
 
+    # dict 带 schema_version + cases → versioned；带 evals → skill-creator；顶层就是列表 → trigger-eval-list
     if isinstance(payload, dict):
         if isinstance(payload.get("schema_version"), str) \
                 and isinstance(payload.get("cases"), list):
@@ -51,6 +45,7 @@ def _case_stats(schema: str, cases: list) -> dict:
     统计结果会和 schema 一起塞进该清单的 manifest 记录。
     """
 
+    # 正 / 负触发按 should_trigger 布尔值分开统计
     positive = sum(1 for c in cases if isinstance(c, dict) and c.get("should_trigger") is True)
     negative = sum(1 for c in cases if isinstance(c, dict) and c.get("should_trigger") is False)
 
@@ -85,11 +80,13 @@ def analyze_eval_manifests(
     findings: list[dict] = []
     for entry in snapshot["files"]:
         path: str = entry["path"]
+        # 只看 evals/ 下的 .json
         if not (path.startswith("evals/") and path.endswith(".json")):
             continue
 
         manifest: dict = {"path": path, "valid": True}
 
+        # 非文本（二进制）直接判无效
         if entry.get("kind") != "text":
             manifest["valid"] = False
             findings.append(make_finding(
@@ -102,6 +99,7 @@ def analyze_eval_manifests(
             manifests.append(manifest)
             continue
 
+        # JSON 坏了判无效，并把出错行号带进 evidence
         try:
             payload = json.loads(entry.get("content") or "")
         except json.JSONDecodeError as exc:
@@ -117,6 +115,7 @@ def analyze_eval_manifests(
             manifests.append(manifest)
             continue
 
+        # 按风格取出 case 列表
         schema = _classify_manifest(payload)
         if schema == "skill-creator-evals":
             cases = payload["evals"]
@@ -130,6 +129,7 @@ def analyze_eval_manifests(
         manifest.update(_case_stats(schema, cases))
         manifests.append(manifest)
 
+    # 没有清单：valid=None 表示「无从判断」
     if not manifests:
         aggregate = {
             "schema": None,
@@ -141,6 +141,7 @@ def analyze_eval_manifests(
         }
         return aggregate, findings
 
+    # 聚合风格：多种风格并存标 mixed，单一风格取该风格
     schemas = {m.get("schema") for m in manifests if m.get("schema")}
     if len(schemas) > 1:
         aggregate_schema = "mixed"
@@ -151,6 +152,7 @@ def analyze_eval_manifests(
 
     aggregate = {
         "schema": aggregate_schema,
+        # valid 取「全部清单都有效」
         "valid": all(m["valid"] for m in manifests),
         "case_count": sum(m.get("case_count", 0) for m in manifests),
         "positive_trigger_cases": sum(

@@ -25,18 +25,15 @@ from harness.runtime.serialization import messages_preview
 from harness.runtime.sse_stream import get_event_bus
 from harness.runtime.threads_data import get_thread_store
 
-"""run 编排管理（runs.manager）
+"""run 编排管理
 
-    职责：一次 agent run 的对外编排入口——创建 / 取消 / 查询 / 等待，并做
-         同线程并发互斥；把真正的后台执行交给 worker.run_worker。
-    流程：create_run 校验并发冲突 → 落 pending 记录 + 发 run_started/run_meta
-         → 后台启动 run_worker；run_worker 收尾后由本类清理活动句柄与并发槽。
-    依赖：全部构造注入（registry / bus / threads / store），runtime 不自己 new
-         （组装由 harness.runtime.assembly 负责）。
+    职责：一次 agent run 的对外编排入口——创建 / 取消 / 查询 / 等待，并做同线程并发互斥
+        - create_run 校验并发冲突 → 落 pending 记录 + 发 run_started / run_meta → 后台启动 run_worker
+        - run_worker 收尾后由本类清理活动句柄与并发槽
+        - 依赖全部构造注入（registry / bus / threads / store），组装由 runtime.assembly 负责
 
-    输出数据示例（create_run 返回 RunHandle 关键公开字段）：
-        {run_id:"9f3a…", thread_id:"t-1", user_id:"u", status:"pending",
-         model_name:"deepseek-v4-pro", input_preview:"帮我查天气", created_at:1.7e9}
+    对外暴露：
+        - RunManager
 """
 
 logger = logging.getLogger(__name__)
@@ -52,11 +49,13 @@ def _thinking_degraded(model_name: str | None, thinking_enabled: bool) -> bool:
     返回：
         True 表示已降级（工厂会忽略思考开关继续跑）；能力查不到时按 False 处理
     """
+    # 1.没开思考，不存在降级
     if not thinking_enabled:
         return False
     try:
         from harness.models.capabilities import supports_thinking
 
+        # 2.不支持思考即视为已降级（工厂会静默忽略该开关继续跑）
         return not bool(supports_thinking(model_name))
     except Exception:  # noqa: BLE001 —— 能力探测失败不影响 run，仅少一个提示
         return False
@@ -83,6 +82,7 @@ def _route_model(
         （即改造前的行为），只记一条 warning。
     """
     try:
+        # 1.延迟导入路由模块，避开 runtime 包初始化期的导入环
         from harness.models.routing import get_model_router
 
         decision = get_model_router().decide(
@@ -90,6 +90,7 @@ def _route_model(
             thinking_enabled=thinking_enabled,
             explicit_model=model_name,
         )
+        # 2.模型名真的变了才记 info（没变就不刷日志）
         if decision.model_name != model_name:
             logger.info(
                 "模型路由：%s -> %s（%s）",
@@ -98,8 +99,10 @@ def _route_model(
                 decision.reason,
             )
         return decision.model_name, decision.to_meta()
+    # 3.路由不可用时退回调用方给的名字（等价改造前行为），只记一条 warning
     except Exception:  # noqa: BLE001 —— 路由失败不阻断 run，退回原始行为
         logger.warning("模型路由决策失败，使用调用方指定的模型", exc_info=True)
+        # 4.补一份 fallback 决策元信息，保证 run_meta.routing 结构始终完整
         return model_name, {
             "model_name": model_name or "",
             "source": "fallback",
@@ -146,9 +149,17 @@ class RunManager:
         异常：
             registry 未注入时抛 RuntimeError
         """
+        # 1.registry 必须由 assembly 注入，缺失说明组装链断了
         if self._registry is None:
             raise RuntimeError("RunManager 需要注入 registry（由 assembly 组装）")
+        # 2.建 runs 表（与 checkpointer 同库，独立连接）
         await self._store.connect()
+        # 3.启动恢复：上次进程若非正常退出（硬杀/崩溃），会留下 running/pending 的
+        #    孤儿 run，永远卡在「运行中」。这里统一标记为 error，避免观测台误报。
+        recovered = await self._store.mark_stale_runs_interrupted(now=time.time())
+        if recovered:
+            logger.warning("启动恢复：%d 个未完成 run 被标记为「服务重启中断」", recovered)
+        # 4.标记已启动
         self._started = True
 
     async def close(self) -> None:
@@ -213,6 +224,11 @@ class RunManager:
         )
 
         run_id = uuid.uuid4().hex
+        # trace_id：优先继承 HTTP 请求的 trace 上下文（TraceMiddleware 已绑定），
+        # 无上下文（直连/测试）则新生成，保证每条 run 都有 trace 可聚合
+        from harness.observability import context as obs_context
+
+        trace_id = obs_context.current_trace_id() or obs_context.new_trace_id()
         created_at = time.time()
         preview = messages_preview(messages)
         # 线程元数据：缺省按开关自动建或报错
@@ -231,6 +247,7 @@ class RunManager:
             run_id=run_id,
             thread_id=thread_id,
             user_id=user_id,
+            trace_id=trace_id,
             model_name=resolved_model or "",
             thinking_enabled=thinking_enabled,
             input_preview=preview,
@@ -245,6 +262,16 @@ class RunManager:
             model_name=resolved_model or "",
             input_preview=preview,
             created_at=created_at,
+            trace_id=trace_id,
+        )
+        # 结构化日志：run 已创建（观测中台按 trace_id/run_id 聚合）
+        from harness.observability import get_observability_logger
+
+        get_observability_logger("prism.run").info(
+            "run_created",
+            run_id=run_id,
+            thread_id=thread_id,
+            model_name=resolved_model or "",
         )
         # 开跑先发 run_started 与 run_meta（事件会被总线录制，订阅晚一步也能回放拿到）
         await self._bus.publish(
@@ -294,11 +321,30 @@ class RunManager:
                 threads=self._threads,
             )
         finally:
-            # worker 收尾后清并发槽与句柄（与旧 _finish 末尾等价）
+            # 1.worker 收尾后清并发槽与句柄（与旧 _finish 末尾等价）
             self._handles.pop(handle.run_id, None)
             with self._lock:
                 if self._active.get(handle.thread_id) == handle.run_id:
                     self._active.pop(handle.thread_id, None)
+            # 2.持久化本 run 采集到的 span（落 spans 表；失败不阻断收尾）
+            try:
+                from harness.observability import get_span_collector
+
+                spans = await get_span_collector().flush(handle.run_id)
+                # 3.按 span 汇总 token 总量与成本，回写 runs 表（观测中台展示用）
+                if spans:
+                    from harness.observability.cost import summarize_spans
+
+                    summary = summarize_spans(spans)
+                    await self._store.update(
+                        handle.run_id,
+                        fields={
+                            "total_tokens": summary["total_tokens"],
+                            "cost": summary["cost"],
+                        },
+                    )
+            except Exception:  # noqa: BLE001 —— span 落库/汇总失败不影响 run 结果
+                logger.warning("run %s span 落库失败（忽略）", handle.run_id, exc_info=True)
 
 
     async def _record_from_handle(self, handle: RunHandle) -> RunRecord:
@@ -310,11 +356,13 @@ class RunManager:
         返回：
             运行中走内存快路径；已终态回读库拿完整字段
         """
+        # 1.已终态：回读库拿完整字段（内存句柄可能缺收尾信息）
         if handle.status in (RUN_STATUS_FINISHED, RUN_STATUS_CANCELLED, RUN_STATUS_ERROR):
             if self._store.connected:
                 row = await self._store.fetch_row(handle.run_id)
                 if row is not None:
                     return row_to_record(row)
+        # 2.运行中：走内存快路径，不为一次查询打库
         return RunRecord(
             run_id=handle.run_id,
             thread_id=handle.thread_id,
@@ -357,14 +405,17 @@ class RunManager:
             run_id: 目标 run
 
         返回：
+        # 1.活动句柄优先——运行中的 run 尚未落全字段，读库拿不到最新态
             RunRecord 或 None
         """
         handle = self._handles.get(run_id)
         if handle is not None:
             return await self._record_from_handle(handle)
+        # 2.库未就绪只能返回 None（不为此专门建连接）
         if not self._store.connected:
             return None
         row = await self._store.fetch_row(run_id)
+        # 3.行 → 记录；查不到返回 None，由上层决定是否报错
         return row_to_record(row) if row is not None else None
 
     async def list_runs(
@@ -383,6 +434,7 @@ class RunManager:
         返回：
             内存活动句柄（最新在前）+ 库中已完成记录（补足 limit）
         """
+        # 1.先取内存里的活动 run（reversed：最新创建的排最前）
         records: list[RunRecord] = []
         for handle in reversed(list(self._handles.values())):
             if user_id is not None and handle.user_id != user_id:
@@ -392,17 +444,94 @@ class RunManager:
             records.append(await self._record_from_handle(handle))
             if len(records) >= limit:
                 break
+        # 2.活动 run 不够 limit 时，再从库补已完成记录
         if self._store.connected and len(records) < limit:
             rows = await self._store.fetch_rows(
                 user_id=user_id,
                 thread_id=thread_id,
                 limit=limit - len(records),
             )
+        # 3.按 run_id 去重：同一个 run 可能既在内存又刚落库
             seen = {r.run_id for r in records}
             records.extend(
                 row_to_record(row) for row in rows if row["run_id"] not in seen
             )
         return records[:limit]
+
+    async def list_observability_runs(
+        self,
+        *,
+        user_ids: list[str] | None = None,
+        status: str | None = None,
+        model_name: str | None = None,
+        q: str | None = None,
+        from_ts: float | None = None,
+        to_ts: float | None = None,
+        limit: int = 50,
+        offset: int = 0,
+    ) -> list[RunRecord]:
+        """观测中台运行列表：按用户（可多/可全）+ 状态/模型/关键词/时间分页查 runs。
+
+        参数：
+            user_ids: 归属用户列表（None = 全部，管理员）
+            status / model_name / q / from_ts / to_ts: 可选过滤
+            limit / offset: 分页
+
+        返回：
+            RunRecord 列表（含 token/成本观测字段）
+        """
+        # 1.库未连接先连（幂等）
+        if not self._store.connected:
+            await self._store.connect()
+        # 2.查表并逐行转记录
+        rows = await self._store.fetch_runs(
+            user_ids=user_ids,
+            status=status,
+            model_name=model_name,
+            q=q,
+            from_ts=from_ts,
+            to_ts=to_ts,
+            limit=limit,
+            offset=offset,
+        )
+        return [row_to_record(row) for row in rows]
+
+    async def count_observability_runs(
+        self,
+        *,
+        user_ids: list[str] | None = None,
+        status: str | None = None,
+        model_name: str | None = None,
+        q: str | None = None,
+        from_ts: float | None = None,
+        to_ts: float | None = None,
+    ) -> int:
+        """统计符合条件的 run 总数（供观测列表分页）。"""
+        # 1.库未连接先连（幂等）
+        if not self._store.connected:
+            await self._store.connect()
+        return await self._store.count_runs(
+            user_ids=user_ids,
+            status=status,
+            model_name=model_name,
+            q=q,
+            from_ts=from_ts,
+            to_ts=to_ts,
+        )
+
+    async def get_run_events(self, run_id: str) -> list[dict[str, Any]]:
+        """取某 run 的思考链事件（供观测中台详情页「思考链回放」）。
+
+        参数：
+            run_id: 目标 run
+
+        返回：
+            事件列表 [{event, data}, ...]
+        """
+        # 1.库未连接先连（幂等）
+        if not self._store.connected:
+            await self._store.connect()
+        return await self._store.fetch_events(run_id)
 
     async def get_thread_chains(
         self, *, user_id: str, thread_id: str, limit: int = 100
@@ -419,18 +548,21 @@ class RunManager:
         """
         import json
 
+        # 1.库未就绪直接返回空（历史回放是可选能力，不阻断）
         if not self._store.connected:
             return []
         rows = await self._store.fetch_chains(
             user_id=user_id, thread_id=thread_id, limit=limit
         )
         chains: list[dict[str, Any]] = []
+        # 2.逐行反序列化 events；坏数据当空列表，不让一条脏行毁掉整段历史
         for row in rows:
             item = dict(row)
             try:
                 events = json.loads(item.get("events") or "[]")
             except (json.JSONDecodeError, TypeError):
                 events = []
+            # 3.只暴露前端渲染需要的字段
             chains.append(
                 {
                     "run_id": item["run_id"],
@@ -454,6 +586,7 @@ class RunManager:
             （任务收尾由 worker 的 except CancelledError 分支完成）。
         """
         try:
+        # 任务被取消时 await 方也会收到 CancelledError，这里吞掉（收尾由 worker 负责）
             await task
         except asyncio.CancelledError:
             pass
@@ -472,7 +605,9 @@ class RunManager:
             超时抛 asyncio.TimeoutError；找不到抛 RunNotFoundError
         """
         handle = self._handles.get(run_id)
+        # 1.有活动任务就等它结束（timeout=None 表示不设上限）
         if handle is not None and handle.task is not None:
+        # 2.任务结束后回读最终记录（内存或库）；查不到说明 run_id 根本不存在
             if timeout is None:
                 await self._await_task_quiet(handle.task)
             else:

@@ -12,15 +12,15 @@ from harness.models.strategy import ChatModelStrategy
 
 """模型包统一出口
 
-    职责：外面要用的东西都从这里拿，不用记一堆子文件路径。
-    结构：接口在 strategy，openai / deepseek 的实现在各自 strategy，
-         DeepSeek 的模型类在 deepseek_models，用哪个策略查 registry，
-         能力探测在 capabilities，造模型的入口在 factory。
+    职责：汇总模型子系统的对外能力，外部只需 from harness.models import X
+        - 工厂入口与策略接口
+        - 能力探测
+        - provider 策略注册表
 
     对外暴露：
-        - create_chat_model               工厂入口，要造模型就找它
-        - supports_vision / supports_thinking   查模型支不支持看图 / 思考
-        - ChatModelStrategy               策略接口
+        - create_chat_model                     工厂入口，按 provider 造模型
+        - supports_vision / supports_thinking   查模型是否支持看图 / 思考
+        - ChatModelStrategy                     模型创建策略接口
 """
 
 __all__ = [

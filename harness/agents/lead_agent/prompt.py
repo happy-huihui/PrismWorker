@@ -4,14 +4,15 @@ from typing import Any, Iterable
 
 from harness.prompt import load_text, render_text
 
-"""Lead Agent 系统提示词组装（agents.lead_agent.prompt）
+"""Lead Agent 系统提示词组装
 
-    职责：把各提示词模板 + 运行时信息，装配成模型每轮看到的系统提示。
-    模板：全部集中在 harness.prompt（templates/lead_agent/system.md 主模板、
-         sandbox_note.md 沙箱段、subagents/routing.md 子代理分节）；本模块只做
-         「变量装配」——拼工具清单、按开关取沙箱段、按注册表生成子代理分节。
-    边界：技能清单 / 记忆 / 被禁工具等随人随轮变化的内容，仍由各自中间件运行时
-         注入（见 skill/memory/deferred 中间件），不在此写死。
+    职责：把提示词模板与运行时信息装配成模型每轮看到的系统提示
+        - 拼工具清单、按开关取沙箱段、按注册表生成子代理分节
+        - 只做变量装配，模板集中在 harness.prompt
+        - 技能 / 记忆 / 被禁工具等随人随轮变化的内容由各自中间件注入，不在此写死
+
+    对外暴露：
+        - format_system_prompt  模板填充，产出系统提示字符串
 """
 
 

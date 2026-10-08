@@ -3,30 +3,23 @@ from __future__ import annotations
 import re
 from typing import Any
 
-"""序列化与文本抽取（serialization）
+"""序列化与文本抽取
 
-    职责：把 LangChain / LangGraph 的对象与 state 通道值，转成运行编排
-         需要的朴素 Python 结构（列表 / 纯文本 / 预览 / 角色名），并剥离
-         输入防注入中间件加的用户文本包裹标记。
-    背景：run 编排（解析 astream 帧）与会话历史读取都要「从消息里抠文本、
-         判角色、去安全标记」；把这些纯函数收敛到一处，避免各处重复实现。
+    职责：把 LangChain / LangGraph 对象转成编排层要的朴素结构，并剥离防注入包裹标记
+        - 通道值归一为列表
+        - 消息内容抽纯文本 / 思考文本
+        - 消息 type 映射为 API 角色名
+        - 去除 input_sanitization 的边界标记
 
     对外暴露：
-        - MAX_INPUT_PREVIEW / MAX_MESSAGE_PREVIEW   预览截断长度
-        - as_list                 state 通道值 → 列表（兼容 None/列表/元组/字符串）
-        - extract_text_content    消息 content → 纯文本（兼容 str 与内容块列表）
-        - extract_reasoning_content  消息 → 模型真实思考文本（reasoning_content）
-        - to_role                 LangChain 消息 type → API 角色名
-        - strip_user_input_wrapper 去除防注入包裹标记，还原纯用户文本
-        - messages_preview        取首条用户消息文本作为输入预览（截断）
-        - convert_messages        dict 形式消息 → BaseMessage
-
-    输出数据示例：
-        - extract_text_content("hi")                    -> "hi"
-        - extract_text_content([{type:"text",text:"a"},{type:"text",text:"b"}]) -> "ab"
-        - extract_reasoning_content(chunk_with_reasoning)          -> "用户想要…"
-        - to_role("human") / to_role("ai")              -> "user" / "assistant"
-        - messages_preview([{type:"human",content:"帮我查天气…"}]) -> "帮我查天气…"(<=160 字)
+        - MAX_INPUT_PREVIEW / MAX_MESSAGE_PREVIEW  预览截断长度
+        - as_list                   state 通道值 → 列表（兼容 None / 元组 / 字符串）
+        - extract_text_content      消息 content → 纯文本（兼容 str 与内容块列表）
+        - extract_reasoning_content 消息 → 模型思考文本（reasoning_content）
+        - to_role                   LangChain 消息 type → API 角色名（未知归 message）
+        - strip_user_input_wrapper  去除防注入包裹标记，还原纯用户文本
+        - messages_preview          取首条用户消息文本作输入预览（截断）
+        - convert_messages          dict 形式消息 → BaseMessage
 """
 
 # 预览截断长度：输入取首条用户消息、输出取模型最终文本

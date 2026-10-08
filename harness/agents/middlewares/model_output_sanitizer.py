@@ -15,30 +15,17 @@ ModelRequest = types.ModelRequest
 ModelResponse = types.ModelResponse
 ExtendedModelResponse = types.ExtendedModelResponse
 
-"""
-    模型输出净化中间件（model_output_sanitizer）——模型调用边界的双向消毒。
+"""模型输出净化中间件
 
-    背景（2026-09-26 线上实锤）：MiMo 会把工具调用退化成正文文本
-    `<tool_call><function=NAME .../>`，API 层解析失败后原文泄漏进 content，
-    同时在流里留下一个幻影 tool_call（name=""、id=None）。后果链：
-      ToolNode 构造错误 ToolMessage 时 pydantic 拒绝 tool_call_id=None
-      → 兜底 ToolMessage(tool_call_id="") 入历史
-      → 下轮请求体出现 `"id": null` → MiMo 400「`id` is null」→ run 终止。
-
-    两个方向（洋葱最外层注册，入向最先跑、出向最后跑）：
-      入向（历史→模型）：丢弃幻影 tool_call、补齐缺失 id、清扫孤儿 ToolMessage、
-        剥离历史正文里的 `<tool_call>` 壳。只 rebuild 受影响的消息对象，
-        不写回 checkpoint（非破坏）。**永不**给旧消息新增 tool_call——
-        旧调用没有 ToolMessage 配对，会造出新的 400。
-      出向（模型→state）：同样净化 tool_calls；壳剥离时可恢复调用意图——
-        activate_skill 变体归一化回 `<activate_skill name="X" />` 标签协议
-        （SkillActivationMiddleware 照常激活），真实工具名 + 可解析参数
-        （XML 属性对 / JSON 体）→ 还原成真 tool_call（合成 id，本轮照常执行）。
+    职责：在模型调用边界双向净化 tool_calls，修 MiMo 的退化调用
+        - 入向（历史 → 模型）：丢弃幻影 tool_call、补齐缺失 id、清扫孤儿 ToolMessage
+        - 出向（模型 → state）：净化 tool_calls，壳剥离时还原调用意图
+        - 入向只修历史，永不给旧消息新增 tool_call（会造出新的 400）
 
     对外暴露：
         - ModelOutputSanitizerMiddleware  净化中间件
         - sanitize_tool_calls             纯函数：净化一条 AI 消息的 tool_calls
-        - clean_tool_call_shells          纯函数：剥离正文 `<tool_call>` 壳
+        - clean_tool_call_shells          纯函数：剥离正文 <tool_call> 壳
         - repair_history                  纯函数：入向历史修复（无需修时返回 None）
 """
 
@@ -381,6 +368,7 @@ def repair_history(messages: list[Any] | None) -> list[Any] | None:
     if not messages:
         return None
 
+    # 1.逐条净化 AI 消息（入向 recover=False：只丢幻影/补 id/剥壳，绝不恢复调用）
     repaired: list[Any] = []
     changed = False
     for message in messages:
@@ -389,8 +377,8 @@ def repair_history(messages: list[Any] | None) -> list[Any] | None:
             changed = True
         repaired.append(fixed)
 
-    # 孤儿 ToolMessage 清扫（无条件）：id 为空、或配不到任何 AI 消息的调用 → 丢弃。
-    # 留着必炸——服务端要求 tool 消息必须紧跟配对的 tool_calls（否则 400）。
+    # 2.孤儿 ToolMessage 清扫（无条件）：id 为空、或配不到任何 AI 消息的调用 → 丢弃。
+    #    留着必炸——服务端要求 tool 消息必须紧跟配对的 tool_calls（否则 400）。
     valid_ids = {
         str(call.get("id") or "")
         for message in repaired
@@ -412,6 +400,7 @@ def repair_history(messages: list[Any] | None) -> list[Any] | None:
         kept.append(message)
     repaired = kept
 
+    # 3.完全干净时返回 None（调用方据此走零拷贝快路径）
     return repaired if changed else None
 
 

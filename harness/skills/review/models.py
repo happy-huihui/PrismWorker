@@ -7,16 +7,18 @@ import re
 from dataclasses import dataclass
 from typing import Any, Literal
 
-"""技能包审查 —— 数据结构与通用工具。
+"""审查数据结构与工具
 
-本模块是整个技能审查系统的“字典定义文件”，不包含任何业务逻辑，
-只负责三件事：
-  1. 定义三套数据的 schema 版本号（snapshot / facts / report）
-  2. 定义常量（严重级别、审查 Profile、限制参数）
-  3. 提供通用的工厂函数（创建 finding、排序、统计、确定性序列化、路径净化）
+    职责：技能审查系统的字典定义与通用工具，不依赖任何项目内模块
+        - 三套 schema 版本号（snapshot / facts / report）
+        - 严重级别、Profile、读取围栏等常量
+        - 工厂函数：finding / 排序 / 统计 / 确定性序列化 / 路径净化
 
-所有下游文件（readers / analyzer / renderer / tool）都会 import 这里的定义，
-但本模块不依赖任何项目内文件，位于依赖树最底部。
+    对外暴露：
+        - PACKAGE_SNAPSHOT_SCHEMA_VERSION / FACTS_SCHEMA_VERSION / REPORT_SCHEMA_VERSION
+        - Severity / ProfileName / SEVERITY_RANK / PackageLimits / DEFAULT_PACKAGE_LIMITS
+        - stable_json_dumps / normalize_relative_path / make_finding
+        - sort_findings / summarize_findings
 """
 
 
@@ -96,13 +98,18 @@ def normalize_relative_path(value: str) -> str:
     if not isinstance(value, str):
         raise ValueError(f"Path must be a string, got {type(value).__name__}")
 
+    # 1.统一分隔符并去掉首尾空白
     path = value.replace("\\", "/").strip()
+    # 2.空路径无意义
     if not path:
         raise ValueError("Path cannot be empty")
+    # 3.绝对路径（含盘符）一律拒
     if _ABSOLUTE_PATH_RE.match(path):
         raise ValueError(f"Path must be relative, got absolute path: {value!r}")
 
+    # 4.折叠重复斜杠并去掉首尾斜杠
     path = _EMPTY_SEGMENT_RE.sub("/", path).strip("/")
+    # 5.任何一段是 .. 都拒（安全红线）
     if _TRAVERSAL_RE.search(path):
         raise ValueError(f"Path must not contain '..': {value!r}")
 
@@ -136,6 +143,7 @@ def make_finding(
 
     用工厂函数而非手写 dict：保证所有 finding 结构一致，绝不少字段。
     """
+    # 统一字段集合：用工厂保证所有 finding 结构一致、绝不少字段
     return {
         "rule_id": rule_id,
         "source": source,
@@ -155,6 +163,7 @@ def sort_findings(findings: list[dict[str, Any]]) -> list[dict[str, Any]]:
     保证同样的输入永远产生同样的顺序（确定性输出），
     这样两次审查的结果可比对，不会被列表顺序干扰。
     """
+    # 排序键顺序即展示优先级：先严重级别，再定位，最后规则与文案
     return sorted(
         findings,
         key=lambda f: (
@@ -174,6 +183,7 @@ def summarize_findings(findings: list[dict[str, Any]]) -> dict[str, int]:
     供 report 的 summary 字段使用，方便一眼看出整体健康状况。
     """
     summary = {"blockers": 0, "errors": 0, "warnings": 0, "infos": 0}
+    # rank → 计数字段名的映射（与 SEVERITY_RANK 一一对应）
     rank_to_key = {0: "blockers", 1: "errors", 2: "warnings", 3: "infos"}
     for f in findings:
         severity = str(f.get("severity"))

@@ -4,14 +4,18 @@ import time
 from dataclasses import dataclass, field
 from typing import Any
 
-"""run 数据模型（runs.models）
+"""run 数据模型
 
-    职责：定义 run 编排用到的数据结构与状态常量、错误类型。
-    内容：
-        - 状态常量  pending / running / finished / cancelled / error（落 runs 表的字符串）
-        - RunRecord  一次 run 的持久化记录（runs 表行映射，对外只读）
-        - RunHandle  内存里的活动 run 句柄（运行期生命周期载体，含帧解析游标）
+    职责：定义 run 编排用到的数据结构、状态常量与错误类型
+        - 状态常量  pending / running / finished / cancelled / error
+        - RunRecord  落 runs 表的持久化记录（对外只读）
+        - RunHandle  内存里的活动 run 句柄（含帧解析游标）
         - RunConflictError / RunNotFoundError  并发冲突 / 未找到
+
+    对外暴露：
+        - RUN_STATUS_PENDING / RUNNING / FINISHED / CANCELLED / ERROR
+        - RunRecord / RunHandle
+        - RunConflictError / RunNotFoundError
 """
 
 # run 状态字符串（与 runs 表 status 列一致）
@@ -42,6 +46,9 @@ RUN_COLUMNS = (
     "created_at",
     "started_at",
     "finished_at",
+    "trace_id",
+    "total_tokens",
+    "cost",
 )
 
 
@@ -70,6 +77,10 @@ class RunRecord:
     created_at: float = 0.0
     started_at: float | None = None
     finished_at: float | None = None
+    # 观测字段（trace_id / token 总量 / 成本，观测中台展示用；行查询时填充）
+    trace_id: str = ""
+    total_tokens: int = 0
+    cost: float = 0.0
     # 思考链事件回放流（仅历史回放路径填充；常规行查询不取此列，默认空）
     events: list[dict[str, Any]] = field(default_factory=list)
 
@@ -86,6 +97,8 @@ class RunHandle:
     run_id: str
     thread_id: str
     user_id: str
+    # trace_id：一次 HTTP 请求的观测关联 id（TraceMiddleware 生成/透传，run 归属它）
+    trace_id: str = ""
     status: str = RUN_STATUS_PENDING
     model_name: str = ""
     thinking_enabled: bool = False

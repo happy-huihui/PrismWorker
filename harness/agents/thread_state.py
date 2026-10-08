@@ -20,15 +20,19 @@ from harness.config.database_config import DEFAULT_CHECKPOINT_SNAPSHOT_FREQUENCY
 from harness.subagents.status_contract import SUBAGENT_STATUS_VALUES
 
 
-"""
-    线程会话状态（ThreadState）——整个 Agent 运行期间的"记忆格式"蓝图。
+"""线程会话状态
 
-    每轮对话、每次工具调用后，LangGraph 都会把这一份状态持久化到 checkpoint。
-    所有 agent / tool / middleware 读写会话上下文，都以这里的字段当作标准字典。
-    本项目学习 DeerFlow 的 thread_state，按约定采用两个简化：
-      1. 字段一个不删，完整保留 DeerFlow 全部字段与 reducer
-      2. Delta 模式用"方案B"：保留 merge_message_writes + DeltaThreadState 核心，
-         砍掉按 cadence / 模式动态生成 schema 的路由工厂（单例项目写死即可）
+    职责：定义会话状态的全部字段与合并规则，是读写上下文的统一字典
+        - 状态蓝图：ThreadState / DeltaThreadState / SandboxState / ThreadDataState
+        - 字段 reducer：artifacts / todos / prints / delegations / skill_context / viewed_images 等
+        - 消息合并：merge_message_writes（Delta 模式核心）
+        - 字段一个不删，完整保留 DeerFlow 全部字段
+
+    对外暴露：
+        - ThreadState / DeltaThreadState   状态蓝图（LangGraph AgentState 子类）
+        - 各字段 merge_*                   字段合并语义（追加 / 覆盖 / 按 id 合并 / 清空）
+        - merge_message_writes             消息写入的合并入口
+        - THREAD_STATE_REDUCER_FIELDS      需要 reducer 的字段清单
 """
 
 
@@ -56,20 +60,24 @@ def merge_sandbox(
       - 两者 sandbox_id 不同但旧沙箱已不在当前进程（后端重启后容器重建、
         或容器被回收）→ 旧状态已失效，允许迁移到新沙箱（fail-open for stale）
     """
+    # 1.new 为空 → 本轮没写，保留现有
     if new is None:
         return existing
+    # 2.existing 为空 → 首次写入，直接采用
     if existing is None:
         return new
 
     existing_id = existing.get("sandbox_id")
     new_id = new.get("sandbox_id")
+    # 分支一：id 相同 → 幂等写入，保留现有（避免无谓地换对象）
     if existing_id == new_id:
         return existing
+    # 分支二：旧状态还没记 id → 视为空槽，直接采用新值
     if existing_id is None:
         return new
 
-    # 旧沙箱若已不在当前进程沙箱管理器（重启/回收），视为失效状态，
-    # 允许覆盖到新沙箱；查询失败或旧沙箱仍存活则保守报错。
+    # 分支三：旧沙箱若已不在当前进程沙箱管理器（后端重启 / 容器被回收），
+    # 说明这份状态已失效，允许迁移到新沙箱；查询失败则保守按「仍存活」处理。
     try:
         from harness.sandbox.lifecycle import get_sandbox_manager
 
@@ -77,6 +85,7 @@ def merge_sandbox(
             return new
     except Exception:  # noqa: BLE001 —— 查询失败保守 fail-closed
         pass
+    # 分支四：旧沙箱仍存活却要换成另一个 → 并发隔离出了问题，宁可报错也不偷偷二选一
     raise ValueError(
         f"Conflicting sandbox state updates: {existing_id!r} != {new_id!r}"
     )
@@ -117,12 +126,16 @@ def merge_viewed_images(
       - new 是空 dict {} → 清空整个池（供中间件“看完后清理”的特殊约定）
       - 否则 → dict 合并，同 key（图片路径）用新的覆盖新的
     """
+    # 1.existing 为空 → 以 new 为底（None 归一成空字典）
     if existing is None:
         return new or {}
+    # 2.new 为空 → 本轮没新增，保留现有
     if new is None:
         return existing
+    # 3.new 是空 dict → 约定为「清空整池」（供中间件看完后清理用）
     if len(new) == 0:
         return {}
+    # 4.按图片路径合并，同一路径用新元数据覆盖
     return {**existing, **new}
 
 
@@ -138,10 +151,13 @@ def merge_artifacts(
     dict.fromkeys 既去重又保留首次出现的顺序
     （结果：新元素追加、重复元素只留最前一次）。
     """
+    # 1.existing 为空 → 直接用 new（None 归一成空列表）
     if existing is None:
         return new or []
+    # 2.new 为空 → 本轮没新增成品，保留现有
     if new is None:
         return existing
+    # 3.拼接后去重：dict.fromkeys 既去重又保留首次出现的顺序
     return list(dict.fromkeys(existing + new))
 
 
@@ -157,10 +173,13 @@ def merge_archived_messages(
     归档到这里——模型上下文（messages）保持精简，但对话展示历史
     （history reader）可以从本字段完整取回，二者从此解耦。
     """
+    # 1.existing 为空 → 复制一份 new（不共享调用方列表，避免被后续原地修改污染）
     if existing is None:
         return list(new) if new else []
+    # 2.new 为空 → 本轮没归档，保留现有
     if new is None:
         return existing
+    # 3.追加归档：只增不减、保序（归档是历史回看的唯一来源，不能丢）
     return existing + list(new)
 
 
@@ -172,10 +191,13 @@ def merge_prints(existing: list[str] | None, new: list[str] | None) -> list[str]
     运行层用 astream(stream_mode="values") 每次迭代取出增量推给前端。
     规则：纯追加、保序、不去重（流水日志语义，重复说明重复发生）。
     """
+    # 1.existing 为空 → 用 new（None 归一成空列表）
     if existing is None:
         return new or []
+    # 2.new 为空 → 本轮没有新进度，保留现有
     if new is None:
         return existing
+    # 3.纯追加、保序、不去重（流水日志语义：重复即说明事情重复发生了）
     return existing + new
 
 
@@ -189,8 +211,10 @@ def merge_todos(existing: list | None, new: list | None) -> list | None:
       - new 是一个列表（哪怕空）→ 明确更新，整体替换 existing
     这是“全量替换”语义，不是追加。
     """
+    # 1.new 为 None → 本轮没碰 todos，保留旧清单
     if new is None:
         return existing
+    # 2.new 是列表（哪怕是空列表）→ 明确更新，整体替换（不是追加）
     return new
 
 
@@ -218,13 +242,17 @@ def merge_promoted(
         裸名在当前目录下指向另一个工具，目录漂移防护）
       - catalog_hash 相同 → 合并 names，去重保序
     """
+    # 1.new 为空 → 本轮没碰提升名单，保留现有
     if not new:
         return existing
+    # 2.首次提升、或工具目录哈希已变 → 旧名单整体作废，按新目录重建
+    #   （目录漂移防护：旧目录下的裸名在当前目录可能指向另一个工具）
     if existing is None or existing.get("catalog_hash") != new["catalog_hash"]:
         return {
             "catalog_hash": new["catalog_hash"],
             "names": list(dict.fromkeys(new["names"])),
         }
+    # 3.目录未变 → 合并 names，去重且保留首次出现顺序
     return {
         "catalog_hash": existing["catalog_hash"],
         "names": list(dict.fromkeys(existing["names"] + new["names"])),
@@ -241,14 +269,18 @@ def merge_goal(
     goal 是这次会话的终极目标 + 推进账本（见 goal_state.py）。
     通常由系统/用户一次性设置，后续整体覆盖，不需要合并。
     """
+    # 1.new 为 None → 本轮没碰目标，保留现有
     if new is None:
         return existing
+    # 2.有显式更新 → 整体覆盖（目标不做字段级合并）
     return new
 
 
 
+# 子代理的「终止态」集合：一旦进入终止态就不允许被非终止态覆盖（防状态回退）
 TERMINAL_STATUSES: frozenset[str] = frozenset(SUBAGENT_STATUS_VALUES)
 
+# 委托账本最多保留多少条（长会话只留最近记录，防止无限增长）
 _DELEGATION_LEDGER_MAX_ENTRIES = 50
 
 
@@ -283,14 +315,17 @@ def merge_delegations(
       - 复用信息：已有条目带 created_at/run_id 时，新版本补上缺失的
       - 上限裁剪：超 _DELEGATION_LEDGER_MAX_ENTRIES 时只保留最新的
     """
+    # 1.new 为空 → 本轮没记委托，保留现有账本
     if not new:
         return existing or []
 
+    # 2.按 id 归并：先铺旧账本再铺新条目，同 id 后者生效，但保留首次出现顺序
     by_id: dict[str, DelegationEntry] = {}
     order: list[str] = []
     for entry in [*(existing or []), *new]:
         entry_id = entry["id"]
         previous = by_id.get(entry_id)
+        # 2.1 终止态保护：已终止的条目不能被非终止态覆盖（防状态回退）
         if (
             previous is not None
             and previous["status"] in TERMINAL_STATUSES
@@ -300,20 +335,25 @@ def merge_delegations(
         if entry_id not in by_id:
             order.append(entry_id)
         else:
+            # 2.2 新条目补上旧条目已有的 created_at / run_id：保留「首次创建」信息
             if previous.get("created_at"):
                 entry = {**entry, "created_at": previous["created_at"]}
                 if previous.get("run_id") and not entry.get("run_id"):
                     entry["run_id"] = previous["run_id"]
         by_id[entry_id] = entry
 
+    # 3.按首次出现顺序还原成列表
     merged = [by_id[entry_id] for entry_id in order]
+    # 4.上限裁剪：只保留最新的 N 条，防长会话把账本撑到无限大
     if len(merged) > _DELEGATION_LEDGER_MAX_ENTRIES:
         merged = merged[-_DELEGATION_LEDGER_MAX_ENTRIES:]
     return merged
 
 
 
+# 技能缓存池最多保留多少条（只留最近读过的技能元数据）
 _SKILL_CONTEXT_MAX_ENTRIES = 8
+# 技能描述写入状态前的截断长度（防长描述把 checkpoint 撑大）
 _SKILL_DESCRIPTION_MAX_CHARS = 500
 
 
@@ -334,8 +374,10 @@ def _normalize_skill_entry(entry: Mapping[str, object]) -> SkillEntry:
     description 去掉多余空白并截断到 _SKILL_DESCRIPTION_MAX_CHARS；
     loaded_at 非 int 时兜底为 0。防止脏数据写坏 skill_context。
     """
+    # 1.取原始字段（name/path 强制转字符串；path 缺键会 KeyError，说明调用方写坏了数据）
     description = entry.get("description")
     loaded_at = entry.get("loaded_at")
+    # 2.按 SkillEntry 形状重建：description 压成单行并截断，loaded_at 非 int 一律兜底 0
     return {
         "name": str(entry.get("name") or ""),
         "path": str(entry["path"]),
@@ -361,10 +403,13 @@ def merge_skill_context(
       - 上限 _SKILL_CONTEXT_MAX_ENTRIES：只保留最近读的几条
       - loaded_at 只是观察值（消息索引在压缩后会重置，不能当唯一依据）
     """
+    # 1.旧条目先归一化，顺手清掉历史遗留的脏 key（防止脏数据继续传播）
     normalized_existing = [_normalize_skill_entry(entry) for entry in existing or []]
+    # 2.new 为空 → 只返回归一化后的旧池
     if not new:
         return normalized_existing
 
+    # 3.旧池按 path 建索引，并记住首次出现顺序
     by_path: dict[str, SkillEntry] = {}
     order: list[str] = []
     for entry in normalized_existing:
@@ -373,6 +418,7 @@ def merge_skill_context(
             order.append(path)
         by_path[path] = entry
 
+    # 4.新读到的技能：已在池中就挪到队尾（刷新「最近使用」），再写入最新元数据
     for entry in (_normalize_skill_entry(entry) for entry in new):
         path = entry["path"]
         if path in by_path:
@@ -380,6 +426,7 @@ def merge_skill_context(
         order.append(path)
         by_path[path] = entry
 
+    # 5.按顺序还原，并裁到上限（只保留最近读过的几条）
     merged = [by_path[path] for path in order]
     if len(merged) > _SKILL_CONTEXT_MAX_ENTRIES:
         merged = merged[-_SKILL_CONTEXT_MAX_ENTRIES:]
@@ -388,24 +435,38 @@ def merge_skill_context(
 
 
 class ThreadState(AgentState):
+    # 会话绑定的沙箱（reducer 保证并发写只认「幂等」或「旧沙箱已失效」两种情况）
     sandbox: SandboxStateField
+    # 工作区 / 上传目录 / 产出目录三个宿主路径（初始化一次性写入，无需 reducer）
     thread_data: NotRequired[ThreadDataState | None]
+    # 会话标题（TitleMiddleware 生成后写入）
     title: NotRequired[str | None]
+    # 已提交给用户的成品清单（跨轮累加、去重保序）
     artifacts: Annotated[list[str], merge_artifacts]
+    # 任务清单（整体替换语义，不是追加）
     todos: Annotated[list | None, merge_todos]
     # 模型最近一次产出/更新任务计划的墙钟时刻（time.time()）。
     # 用途：run 收尾判断「本轮模型有没有碰过 todo」——没碰过就把 todos 清空
     # （用户语义：新问题没有计划就不该挂着上一轮的旧清单）。
     # plain 字段即 last-value-wins，无需 reducer。
     todos_touched_at: NotRequired[float]
+    # 会话长期目标 + 推进账本（见 goal_state.py）
     goal: Annotated[GoalState | None, merge_goal]
+    # 本轮上传的文件（UploadsMiddleware 写入）
     uploaded_files: NotRequired[list[dict] | None]
+    # 已看过的图片元数据（图片字节按需从磁盘读，不塞进 checkpoint）
     viewed_images: Annotated[dict[str, ViewedImageData], merge_viewed_images]
+    # 本会话「提升」给模型用的工具名单（按工具目录哈希作用域，防目录漂移）
     promoted: Annotated[PromotedTools | None, merge_promoted]
+    # 子代理委托账本（谁派了什么、结果如何）
     delegations: Annotated[list[DelegationEntry], merge_delegations]
+    # 已读技能缓存（只存元数据，避免每轮重复加载技能正文）
     skill_context: Annotated[list[SkillEntry], merge_skill_context]
+    # 摘要文本（压缩后写入，供展示与续接）
     summary_text: NotRequired[str | None]
+    # 被压缩归档的原始消息（模型上下文精简，但对话历史仍可完整回看）
     archived_messages: Annotated[list[AnyMessage], merge_archived_messages]
+    # 思考链进度消息（各中间件追加，运行层按增量推给前端）
     prints: Annotated[list[str], merge_prints]
 
 
@@ -418,11 +479,14 @@ def _normalize_messages(value: Any) -> list[AnyMessage]:
     - 分片消息（BaseMessageChunk）会物化为完整消息
     - id 缺失的补齐 uuid，保证每条都有稳定 id（覆盖/删除依赖它）
     """
+    # 1.单条消息也包成列表，后面统一按列表处理
     values = value if isinstance(value, list) else [value]
+    # 2.分片（BaseMessageChunk）物化成完整消息：写入状态前必须是完整消息
     messages = [
         message_chunk_to_message(cast(BaseMessageChunk, message))
         for message in convert_to_messages(values)
     ]
+    # 3.补齐缺失 id：覆盖与删除都靠 id 定位，不能为空
     for message in messages:
         if message.id is None:
             message.id = str(uuid.uuid4())
@@ -438,9 +502,11 @@ def _index_messages(
     - positions_by_id:  message_id → 所有出现位置列表
     返回后调用方可据此替换或置空被删的消息槽位。
     """
+    # 1.一次遍历同时记「最后位置」与「全部位置」两套索引
     latest_position: dict[str, int] = {}
     positions_by_id: dict[str, list[int]] = {}
     for position, message in enumerate(messages):
+        # 2.已置空的槽位（之前被删过）跳过
         if message is None:
             continue
         message_id = cast(str, message.id)
@@ -455,6 +521,7 @@ def _raise_null_write(has_messages: bool) -> None:
     对应 add_messages(left, None) 的语义：非空时只用 left，空时只用 right，
     这里把两种误用统一抛成明确的错误，方便定位。
     """
+    # 有 left 说明是 writes[0] 为空，反之是 state 为空 —— 报错时点名是哪一侧，便于定位
     received = "left" if has_messages else "right"
     raise ValueError(
         f"Must specify non-null arguments for both 'left' and 'right'. Only received: '{received}'."
@@ -473,14 +540,18 @@ def merge_message_writes(state: list[AnyMessage], writes: Sequence[Any]) -> list
     - RemoveMessage 删除对应 id；REMOVE_ALL_MESSAGES 清空全部后重来
     - 删除不存在的 id 抛错（add_messages 语义）
     """
+    # 1.没有写入 → 原样返回当前折叠状态（DeltaChannel 会频繁空写）
     if not writes:
         return list(state)
+    # 2.首条写入为 None → 非法 null 写（add_messages 语义），直接报错
     if writes[0] is None:
         _raise_null_write(bool(state))
 
+    # 3.把当前状态物化成消息列表并建索引，后续覆盖/删除都能 O(1) 定位
     messages: list[AnyMessage | None] = _normalize_messages(state)
     latest_position, positions_by_id = _index_messages(messages)
 
+    # 4.逐条写入折叠（保持 add_messages 的线性语义）
     for write in writes:
         if write is None:
             _raise_null_write(bool(latest_position))
@@ -490,16 +561,19 @@ def merge_message_writes(state: list[AnyMessage], writes: Sequence[Any]) -> list
             if isinstance(message, RemoveMessage) and message.id == REMOVE_ALL_MESSAGES:
                 remove_all_idx = position
 
+        # 4.1 出现 REMOVE_ALL_MESSAGES → 整表清空，只保留它之后的新消息
         if remove_all_idx is not None:
             messages = list(normalized_write[remove_all_idx + 1:])
             latest_position, positions_by_id = _index_messages(messages)
             continue
 
+        # 4.2 常规写入：按 id 命中则「覆盖或标记删除」，未命中则追加
         ids_to_remove: set[str] = set()
         for message in normalized_write:
             message_id = cast(str, message.id)
             existing_position = latest_position.get(message_id)
             if existing_position is not None:
+                # 4.2.1 同 id 已存在：RemoveMessage 记为待删，普通消息原地覆盖
                 if isinstance(message, RemoveMessage):
                     ids_to_remove.add(message_id)
                 else:
@@ -507,6 +581,7 @@ def merge_message_writes(state: list[AnyMessage], writes: Sequence[Any]) -> list
                     messages[existing_position] = message
                 continue
 
+            # 4.2.2 同 id 不存在却要删 → 按 add_messages 语义报错（删不存在的 id 是调用方 bug）
             if isinstance(message, RemoveMessage):
                 raise ValueError(
                     f"Attempting to delete a message with an ID that doesn't exist ('{message_id}')"
@@ -516,11 +591,13 @@ def merge_message_writes(state: list[AnyMessage], writes: Sequence[Any]) -> list
             latest_position[message_id] = position
             positions_by_id[message_id] = [position]
 
+        # 4.3 统一处理本轮标记的删除：槽位置空 + 清掉两套索引
         for message_id in ids_to_remove:
             for position in positions_by_id.pop(message_id):
                 messages[position] = None
             del latest_position[message_id]
 
+    # 5.过滤掉被删的空槽位，返回折叠后的全量消息
     return [message for message in messages if message is not None]
 
 
@@ -531,6 +608,7 @@ class DeltaThreadState(ThreadState):
     不再存全量，而是只存增量、每 DEFAULT_CHECKPOINT_SNAPSHOT_FREQUENCY 步
     折叠一次完整快照。需要省存储时用本类作为 LangGraph 的 state schema。
     """
+    # 只存增量、每 N 步折叠一次全量快照：牺牲一点重放成本换存储体积
     messages: Annotated[
         list[AnyMessage],
         DeltaChannel(
@@ -541,6 +619,7 @@ class DeltaThreadState(ThreadState):
 
 
 
+# 所有带 reducer（即需要 LangGraph 合并仲裁）的字段名；外部据此判断某字段是否走 reducer
 THREAD_STATE_REDUCER_FIELDS = frozenset(
     {
         "messages",

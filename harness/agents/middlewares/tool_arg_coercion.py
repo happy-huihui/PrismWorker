@@ -10,27 +10,15 @@ from langchain.agents.middleware import types
 ToolCallRequest = types.ToolCallRequest
 
 
-"""
-    工具参数容错中间件（tool_arg_coercion）——修「嵌套参数被模型写成 JSON 字符串」。
+"""工具参数容错中间件
 
-    背景（实测 2026-09-25，MiMo mimo-v2.6-pro）：
-      ask_clarification 的 `fields` 是嵌套数组，模型却把它**双编码成 JSON 字符串**
-      （形如 `'[{"name": "style", ...}]'`）。langgraph 的 ToolNode 在真正执行工具前
-      会用 Pydantic 校验参数，字符串不是 list → 抛 ToolInvocationError → 兜成一条
-      `status="error"` 的 ToolMessage。表现：思考链里该工具步骤标红「失败」，
-      且这条错误消息会随 checkpoint 进对话历史，污染下一轮上下文。
-
-    做法：在工具执行**之前**，只对「schema 不接受字符串、但字符串是合法 JSON 且
-      解析后 schema 接受」的参数做还原。判定完全交给 Pydantic（TypeAdapter），
-      不做启发式猜测——这样 `content: str` 这类正常字符串参数不会被误伤
-      （比如 write_file 写一段看起来像 JSON 的文本）。
-
-    为什么不用「放宽工具签名」：把 `fields: list[...]` 改成 `list[...] | str` 会改变
-      暴露给模型的 JSON schema，等于默许它继续传字符串。这里保持契约严格、
-      只在运行时容错。
+    职责：工具执行前把「被双编码成 JSON 字符串」的嵌套参数还原成真实结构
+        - 只还原「schema 不接受字符串、但字符串是合法 JSON 且解析后 schema 接受」的参数
+        - 判定交给 Pydantic，不做启发式猜测，避免误伤正常字符串参数
+        - 保持工具签名严格，只在运行时容错
 
     对外暴露：
-        - ToolArgCoercionMiddleware  工具参数容错中间件
+        - ToolArgCoercionMiddleware
 """
 
 logger = logging.getLogger(__name__)

@@ -8,20 +8,15 @@ from typing import Any
 from harness.runtime.events.types import RunEventType, make_event
 from harness.runtime.sse_stream import get_event_bus
 
-"""事件路由（routing）
+"""事件路由
 
-    职责：把 harness 注入式 event_sink 收到的工具事件，路由到「当前 run」
-         对应的 EventBus 上。
-    背景：harness 的 event_sink 是装配期固定的、且工具事件本身不带 run 标识；
-         为了让 agent 能被安全缓存、又支持并发多 run 事件各归各位，采用
-         「进程级分发 sink + run 上下文变量」：
-           1. DispatchEventSink 是进程级单例，作为所有缓存 agent 的 event_sink；
-           2. run 执行期间（run_worker 内）设置 _CURRENT_RUN 上下文，工具事件
-              据此路由到对应 run 的 EventBus；
-           3. 没有 run 上下文时（测试 / 直连场景）事件被忽略，不产生副作用。
+    职责：把 harness 注入式 event_sink 收到的工具事件，路由到「当前 run」对应的 EventBus
+        - DispatchEventSink 是进程级单例，作为所有缓存 agent 的 event_sink
+        - run 执行期间设置 _CURRENT_RUN 上下文，工具事件据此各归各位
+        - 无 run 上下文（测试 / 直连）时事件被忽略，不产生副作用
 
     对外暴露：
-        - run_context          进入/退出一次 run 的上下文（contextmanager）
+        - run_context          进入 / 退出一次 run 的上下文（contextmanager）
         - DispatchEventSink    进程级分发 sink（harness event_sink）
         - get_dispatch_sink    分发 sink 单例
 """
@@ -64,6 +59,7 @@ class DispatchEventSink:
         参数：
             bus: 显式事件总线；None 时用 get_event_bus() 单例
         """
+        # 只存注入的总线（可为 None，发布时再回退到单例）
         self._bus = bus
 
     async def __call__(self, event: dict[str, Any]) -> None:
@@ -121,9 +117,11 @@ _dispatch_sink_lock = threading.Lock()
 
 def get_dispatch_sink() -> DispatchEventSink:
     """返回进程级事件分发 sink 单例（懒构造，线程安全）。"""
+    # 快路径：已建好直接返回，不进锁
     global _dispatch_sink
     if _dispatch_sink is not None:
         return _dispatch_sink
+    # 慢路径：加锁双检，避免并发各建一个
     with _dispatch_sink_lock:
         if _dispatch_sink is None:
             _dispatch_sink = DispatchEventSink()

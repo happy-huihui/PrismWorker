@@ -1,21 +1,3 @@
-"""技能路由（skills）——技能清单查询、用户黑名单与 .skill 上传安装端点。
-
-职责：①GET /skills 返回「公共 + 当前用户自定义」合并清单并合入 blocked 标记
-     （同名时用户版 shadow 公共版；设置面板开关与前端 / 技能列表共用）；
-     ②PUT /skills/blacklist 全量覆盖写当前用户的技能黑名单；
-     ③POST /skills/install 接收上传的 .skill（ZIP）归档——安全解压 → 纯静态审查
-     （publish_candidate 才放行）→ 同名覆盖装入 users/{uid}/skills/<name>/。
-     鉴权沿用 deps.get_user_id（Bearer token 换 user_id）。
-
-处理者说明：安装/清单/黑名单都是 API 层能力（user_id 来自 token，与会话线程无关）；
-真正的技能装配发生在 run 线程内 lead_agent 的 SkillActivationMiddleware。
-
-端点：
-  GET  /skills            → {skills: [{name, description, blocked, source}]}
-  PUT  /skills/blacklist  {blocked: [name, ...]}      → {blocked: [...]}
-  POST /skills/install    multipart: file=<x.skill>   → 安装/审查结果
-"""
-
 from __future__ import annotations
 
 import asyncio
@@ -32,6 +14,17 @@ from harness.config.skills import SkillsConfig
 from harness.runtime.skill_prefs import get_skill_blacklist_store
 from harness.skills.installer import MAX_ARCHIVE_TOTAL_BYTES, SkillArchiveError
 from harness.skills.user_skills import install_skill_from_archive, list_user_skills
+
+"""技能路由
+
+    职责：技能清单查询、用户黑名单与 .skill 上传安装
+        - GET /skills 合并「公共 + 用户自定义」（同名用户版 shadow 公共版）并合入 blocked
+        - PUT /skills/blacklist 全量覆盖写黑名单
+        - POST /skills/install 安全解压 → 静态审查（publish_candidate 才放行）→ 装入用户目录
+
+    对外暴露：
+        - router
+"""
 
 router = APIRouter(prefix="/skills", tags=["skills"])
 
@@ -85,8 +78,10 @@ class SkillInstallOut(BaseModel):
 @router.get("", response_model=SkillListOut)
 async def list_skills(user_id: str = Depends(get_user_id)) -> SkillListOut:
     """合并「公共 + 当前用户自定义」技能并合入 blocked 标记（同名用户版优先）。"""
+    # 1.先取黑名单，稍后逐条打 blocked 标记
     blocked = get_skill_blacklist_store().load(user_id)
     # 先填公共，再让用户自定义同名 shadow（source 变 custom）
+    # 2.先填公共技能
     merged: dict[str, SkillOut] = {}
     for entry in scan_skills_dir(SkillsConfig().public_skills_dir()):
         merged[entry["name"]] = SkillOut(
@@ -96,6 +91,7 @@ async def list_skills(user_id: str = Depends(get_user_id)) -> SkillListOut:
             source="public",
         )
     # 用户目录读取失败降级为仅公共，不阻断清单
+    # 3.再让用户自定义同名 shadow 公共版（source 变 custom）
     try:
         for entry in list_user_skills(user_id):
             merged[entry["name"]] = SkillOut(
@@ -104,8 +100,10 @@ async def list_skills(user_id: str = Depends(get_user_id)) -> SkillListOut:
                 blocked=entry["name"] in blocked,
                 source="custom",
             )
+    # 4.用户目录读失败降级为仅公共，不阻断清单
     except Exception:  # noqa: BLE001 —— 用户技能目录异常不阻断清单
         pass
+    # 5.按名称排序，保证前端列表稳定
     return SkillListOut(skills=sorted(merged.values(), key=lambda s: s.name))
 
 
@@ -123,6 +121,7 @@ async def install_skill(
 ) -> SkillInstallOut:
     """接收上传的 .skill（ZIP）归档：安全解压 → 审查 → 同名覆盖装入用户技能目录。"""
     # 1.扩展名校验（防误装普通文件）
+    # 1.扩展名校验（防误装普通文件）
     filename = file.filename or ""
     if not filename.lower().endswith(".skill"):
         raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="只支持 .skill 技能包文件")
@@ -130,6 +129,7 @@ async def install_skill(
     tmp_name: str | None = None
     try:
         # 2.流式落地到临时文件（总量围栏，防超大上传拖垮内存）
+        # 2.流式落地到临时文件（边读边累计总量，防超大上传拖垮内存）
         with tempfile.NamedTemporaryFile(suffix=".skill", delete=False) as tmp:
             tmp_name = tmp.name
             total = 0
@@ -142,6 +142,7 @@ async def install_skill(
                     )
                 tmp.write(chunk)
 
+        # 3.解压 + 审查 + 落位是阻塞的 CPU/磁盘活，放线程池不卡事件循环
         # 3.解压 + 审查 + 落位是阻塞的 CPU/磁盘活，放线程池不卡事件循环
         try:
             result = await asyncio.to_thread(install_skill_from_archive, user_id, tmp_name)
@@ -161,6 +162,7 @@ async def install_skill(
         )
     finally:
         # 4.无论成败都清理上传临时文件
+        # 5.关掉上传流；临时文件能删就删，删不掉也不影响响应
         await file.close()
         if tmp_name:
             try:

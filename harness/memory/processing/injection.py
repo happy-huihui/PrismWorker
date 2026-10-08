@@ -3,13 +3,15 @@ from __future__ import annotations
 import math
 from typing import Any
 
-"""记忆注入渲染（processing.injection）
+"""记忆注入渲染
 
-    职责：把 memory.json 文档渲染成可注入系统提示的纯文本（User Context /
-         History / Facts 三段），按 token 预算裁剪；guaranteed 类别事实优先占位。
-    定位：这是「输出渲染」，不是「模型指令模板」，所以留在 memory 子系统，
-         不放 harness/prompt。（提示词模板本身已上收到 harness.prompt。）
-    无依赖：字符估算 token（CJK 友好），不联网、无外部调用。
+    职责：把 memory.json 文档渲染成可注入系统提示的纯文本，并按 token 预算裁剪
+        - 三段：User Context / History / Facts
+        - guaranteed 类别事实走独立预算优先占位
+        - 字符估算 token（CJK 友好），无外部调用
+
+    对外暴露：
+        - format_memory_for_injection
 """
 
 
@@ -18,6 +20,7 @@ def _est_tokens(text: str) -> int:
     # 空串 0；否则按长度一半向上取整
     if not text:
         return 0
+    # 约 2 字符 = 1 token（中英混排折中，只用于预算估算）
     return math.ceil(len(text) / 2)
 
 
@@ -45,7 +48,58 @@ def _coerce_confidence(value: Any, default: float = 0.5) -> float:
 
 def _escape_summary(text: str) -> str:
     """注入文本转义（把换行/连续空白压成单空格，防止破坏三段结构）。"""
+    # 压成单行：换行会破坏注入文本的分段结构
     return " ".join(text.strip().split())
+
+
+# 注入时最少保留的事实条数（兜底阈值：预算被 user/history 摘要挤光也至少注入这么多条）
+_MIN_INJECTION_FACTS = 10
+
+
+def _fact_line(fact: dict[str, Any]) -> str:
+    """单条事实渲染成「- [类别] 内容」一行。"""
+    # 正文压成单行；类别缺失归 context
+    content = _escape_summary(fact["content"])
+    category = fact.get("category") or "context"
+    return f"- [{category}] {content}"
+
+
+def _ensure_min_facts(
+    lines: list[str],
+    candidates: list[dict[str, Any]],
+    min_facts: int,
+) -> list[str]:
+    """兜底：已注入事实不足 min_facts 条时，无视预算按置信度降序补齐。
+
+    为什么需要兜底：
+        user / history 摘要不占预算裁剪、全量注入，会把 used 初始值撑得很高，
+        极端时事实按预算一条都塞不进（必保类别也可能进不去）。结果「记忆库里
+        明明存着事实，注入时却一条都读不到」，长期记忆形同虚设。兜底保证至少
+        注入 min_facts 条，让模型至少能读到置信度最高的一批核心事实。
+
+    参数：
+        lines: 预算内已注入的事实渲染行（顺序保持不变）
+        candidates: 全量候选事实（须已按置信度降序）
+        min_facts: 最少注入条数
+
+    返回：
+        补齐到 min_facts 条的事实行列表（兜底的行追加在尾部）
+    """
+    # 1.已达最少条数，直接原样返回
+    if len(lines) >= min_facts:
+        return lines
+    # 2.已注入行按文本判重，防兜底把预算内已有的事实重复塞一遍
+    existing = set(lines)
+    # 3.按置信度降序补足：无视预算，塞够 min_facts 即停
+    for fact in candidates:
+        if len(lines) >= min_facts:
+            break
+        line = _fact_line(fact)
+        if line in existing:
+            continue
+        lines.append(line)
+        existing.add(line)
+    return lines
 
 
 def format_memory_for_injection(
@@ -137,23 +191,17 @@ def format_memory_for_injection(
         guaranteed.sort(key=_coerce_confidence, reverse=True)
         regular.sort(key=_coerce_confidence, reverse=True)
 
-        def fact_line(fact: dict[str, Any]) -> str:
-            # 单条事实渲染成「- [类别] 内容」
-            content = _escape_summary(fact["content"])
-            category = fact.get("category") or "context"
-            return f"- [{category}] {content}"
-
-        # 5.3 已用预算 = user/history 文本 + "Facts:" 头
+        # 5.3 已用预算 = user/history 文本 + "Facts:" 头（摘要不占裁剪，基数可能很大）
         base_text = "\n\n".join(sections)
         used = _est_tokens(base_text) + _est_tokens("Facts:\n")
-        # 5.4 必保类别：独立预算内优先塞入（满则停）
+
+        # 5.4 必保类别：独立预算内优先塞入（装不下即停；至少 N 条由 5.6 兜底保证）
         g_lines: list[str] = []
         g_budget = max(50, guaranteed_token_budget)
         for fact in guaranteed:
-            line = fact_line(fact)
-            if used + _est_tokens(line) > g_budget and g_lines:
-                break
-            if used + _est_tokens(line) > g_budget and not g_lines:
+            line = _fact_line(fact)
+            # 超必保预算就停，不再硬塞（「最少条数」统一交给 5.6 兜底）
+            if used + _est_tokens(line) > g_budget:
                 break
             g_lines.append(line)
             used += _est_tokens(line)
@@ -162,13 +210,17 @@ def format_memory_for_injection(
         r_lines: list[str] = []
         total_budget = max(100, max_tokens)
         for fact in regular:
-            line = fact_line(fact)
+            line = _fact_line(fact)
             if used + _est_tokens(line) > total_budget:
                 break
             r_lines.append(line)
             used += _est_tokens(line)
 
+        # 5.6 兜底：摘要挤光预算导致事实不足最少条数时，无视预算补齐到 _MIN_INJECTION_FACTS 条
         all_lines = g_lines + r_lines
+        candidates = sorted(valid_facts, key=_coerce_confidence, reverse=True)
+        all_lines = _ensure_min_facts(all_lines, candidates, _MIN_INJECTION_FACTS)
+
         if all_lines:
             facts_block = "Facts:\n" + "\n".join(all_lines)
 

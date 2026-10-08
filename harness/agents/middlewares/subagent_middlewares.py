@@ -10,24 +10,15 @@ from langchain_core.messages import AIMessage, ToolMessage
 
 ModelRequest = types.ModelRequest
 
-"""
-    子代理中间件（subagent_middlewares）——委托账本与派发上限护栏。
+"""子代理中间件
 
-    DelegationLedgerMiddleware（委托账本）：
-      用 ThreadState.delegations 记录每一次子代理派发的完整生命周期：
-        - abefore_model：扫最新 AIMessage 里对 task 工具的调用（tool_calls），
-          以 tool_call_id 为 id 写入一条 status="in_progress" 的账本条目
-          （merge_delegations 同 id 幂等合并，重复扫描不会重复记账）；
-        - aafter_model：扫本轮新增的 ToolMessage（name == "task"），解析其
-          结果（内含子代理状态/结果摘要），把对应条目更新为终止状态。
-      status 取值：in_progress（进行中，非终止态）与 SUBAGENT_STATUS_VALUES
-      （completed / failed / cancelled / timed_out / polling_timed_out）。
+    职责：记录每次子代理派发的生命周期，并限制单次运行的派发总量
+        - DelegationLedgerMiddleware  以 tool_call_id 记账，状态由结果回填
+        - SubagentLimitMiddleware     默认每次 run 最多 10 次，达上限则剔除 task 工具
 
-    SubagentLimitMiddleware（派发上限）：
-      每次运行（run）允许的子代理总调用数上限 max_total_per_run（默认 10）。
-      精简单线程计数：统计 state.delegations 里已进入终止态的条数，达到上限后
-      把 task 工具从本次模型调用的工具列表里剔除，并注入系统提示说明已达上限
-      （跨轮次由 checkpoint 持久化，近似“本次运行上限”语义）。
+    对外暴露：
+        - DelegationLedgerMiddleware
+        - SubagentLimitMiddleware
 """
 
 logger = logging.getLogger(__name__)
@@ -45,6 +36,7 @@ class DelegationLedgerMiddleware(AgentMiddleware):
         self, state: Any, runtime: Any  # type: ignore[override]
     ) -> dict[str, Any] | None:
         """模型调用前：把待派发的 task 工具调用入账（in_progress）。"""
+        # 1.找最新 AI 消息里的 task 工具调用；无 → 返回
         messages = (state or {}).get("messages") or []
         latest_ai = _latest_ai_message(messages)
         calls = (latest_ai.tool_calls if latest_ai is not None else None) or []
@@ -52,8 +44,10 @@ class DelegationLedgerMiddleware(AgentMiddleware):
         if not task_calls:
             return None
 
+        # 2.解析运行上下文（thread_id / run_id）
         thread_id, run_id = _resolve_run_context(runtime)
 
+        # 3.逐条入账为 in_progress（merge_delegations 同 id 幂等合并，重复扫描不重复记账）
         now = time.time()
         entries = []
         for call in task_calls:
@@ -76,6 +70,7 @@ class DelegationLedgerMiddleware(AgentMiddleware):
         self, state: Any, runtime: Any  # type: ignore[override]
     ) -> dict[str, Any] | None:
         """模型调用后：把本轮新增的 task 工具结果结账（终止状态）。"""
+        # 1.挑出本轮新增的 task 工具结果；无 → 返回
         messages = (state or {}).get("messages") or []
         task_results = [
             m for m in messages
@@ -85,6 +80,7 @@ class DelegationLedgerMiddleware(AgentMiddleware):
         if not task_results:
             return None
 
+        # 2.逐条解析结果，把对应账本条目更新为终止状态
         entries = []
         prints: list[str] = []
         for result in task_results:
@@ -113,14 +109,17 @@ class SubagentLimitMiddleware(AgentMiddleware):
         handler: Callable[[ModelRequest[Any]], Awaitable[Any]],
     ) -> Any:
         """包装模型调用：已达上限则移除 task 工具并提示。"""
+        # 1.统计已进入终止态的子代理条数
         state = request.state or {}
         delegations = state.get("delegations") or []
         terminal_count = sum(
             1 for entry in delegations
             if isinstance(entry, dict) and entry.get("status") not in (_IN_PROGRESS_STATUS, None)
         )
+        # 2.未达上限 → 放行
         if terminal_count < self._max_total_per_run:
             return await handler(request)
+        # 3.从工具列表里剔除 task 工具（没剔到则置 None，避免空列表歧义）
         tools = request.tools
         if tools:
             kept = [tool for tool in tools if _tool_name(tool) != _TASK_TOOL_NAME]
@@ -128,6 +127,7 @@ class SubagentLimitMiddleware(AgentMiddleware):
                 tools = kept
             else:
                 tools = None
+        # 4.注入「已达上限」提示
         prompt_text = (
             "注意：本次运行已达子代理派发上限"
             f"（{self._max_total_per_run} 次）。请直接基于已有结果继续作答，"

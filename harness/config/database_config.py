@@ -7,7 +7,11 @@ from pydantic import BaseModel, Field
 
 """数据库配置
 
-    职责：定义 PostgreSQL 连接参数，供 checkpoint 持久化与记忆后端共用。
+    职责：管理 PostgreSQL 连接参数（checkpoint 持久化与记忆后端共用）
+        - 连接串与 schema
+        - 连接池大小与回收间隔
+        - 命令超时
+        - SQL 日志开关
 
     对外暴露：
         - CheckpointChannelMode  checkpoint 通道模式（full=全量快照 / delta=增量）
@@ -43,10 +47,11 @@ class DatabaseConfig(BaseModel):
 
     def resolved_url(self) -> str:
         """返回实际连接串：环境变量 DATABASE_URL 优先，其次配置值。"""
-        # 环境变量优先，便于容器/CI 覆盖
+        # 1.环境变量优先，便于容器/CI 覆盖
         env_url = os.getenv("DATABASE_URL")
         if env_url:
             return env_url
+        # 2.回退到配置值（空串兜底）
         return self.postgres_url or ""
 
     @property

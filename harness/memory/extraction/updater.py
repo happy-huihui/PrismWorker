@@ -25,19 +25,16 @@ from harness.prompt import load_chat
 
 logger = logging.getLogger(__name__)
 
-"""记忆更新器（extraction.updater）
+"""记忆更新器
 
-    职责：把清洗后的对话增量提取为长期记忆——水位线切分、LLM 提取、
-         确定性门控应用、乐观写回，以及 fact CRUD / 文档级管理 op。
-    流程（update_memory 主干）：
-        1. 水位线切分：只喂「上次成功提取之后」的新消息（找不到则全量）；
-        2. 组装提示词：当前记忆 + 对话文本 + 信号 hint → chat 模板；
-        3. LLM 提取：同步 invoke，解析出更新 JSON；
-        4. 门控应用：scope/durability/authority 分类门控 → 置信度阈值 →
-           内容去重 → 矛盾移除（依赖替代事实校验）→ 事实上限裁剪；
-        5. 乐观写回 + 推进水位线；失败一律返回 False 不推进，下轮自动重喂。
-    模型：优先 PrismMemConfig.model，否则复用主模型 create_chat_model(name=None)。
-    边界：全程 best-effort，任何异常只记日志，绝不扩散到对话主链路。
+    职责：把清洗后的对话增量提取为长期记忆，并做确定性门控与乐观写回
+        - 水位线切分：只喂上次成功提取之后的新消息（定位不到则全量）
+        - 组装提示词 → 同步 LLM 提取 → 解析更新 JSON
+        - 门控：scope / durability / authority 分类 → 置信度阈值 → 去重 → 矛盾移除 → 上限裁剪
+        - 乐观写回并推进水位线；任何失败返回 False 不推进（下轮重喂）
+
+    对外暴露：
+        - MemoryUpdater  提取器（update_memory / fact CRUD / 文档级 op）
 """
 
 # 事实分类三个门控字段（提取元数据，不落库）
@@ -82,6 +79,7 @@ def _normalize_gate_label(value: Any) -> str | None:
     """归一化模型产出的门控标签（去空白小写；非字符串返回 None）。"""
     if not isinstance(value, str):
         return None
+    # 去空白 + 小写；空串视同「没有标签」，由门控判为 missing
     normalized = value.strip().lower()
     return normalized or None
 
@@ -217,6 +215,7 @@ def _parse_memory_update_response(response_content: Any) -> dict[str, Any]:
 
 def _fact_content_key(content: str) -> str:
     """事实内容归一化键（去空白小写），用于去重。"""
+    # 折叠空白 + 小写，让「同义不同写法」的内容能判重
     return " ".join(content.strip().lower().split())
 
 
@@ -234,6 +233,7 @@ def _trim_facts_to_max(facts: list[dict[str, Any]], max_facts: int) -> list[dict
         return facts
 
     # 置信度安全取值（异常/越界归 0.5）
+        # 安全取值：None / bool / 非数值 / 越界 / 非有限数一律归 0.5
     def confidence(fact: dict[str, Any]) -> float:
         raw = fact.get("confidence")
         if raw is None or isinstance(raw, bool):
@@ -260,6 +260,7 @@ def _message_identity(msg: Any) -> tuple[str, str] | None:
     msg_type = getattr(msg, "type", None)
     if not msg_type:
         return None
+    # 只取前 80 字符当指纹：内容一变就视为新消息
     text = extract_message_text(msg).strip()[:80]
     return (str(msg_type), text)
 
@@ -308,14 +309,17 @@ class MemoryUpdater:
     def get_memory_data(self, user_id: str | None) -> dict[str, Any]:
         """读取用户记忆文档（不存在返回空文档）。"""
         # 未指定用户归 default 桶
+        # 未指定用户归 default 桶（与写入侧同一约定）
         return self._storage.load(user_id or "default")
 
     def reload_memory_data(self, user_id: str | None) -> dict[str, Any]:
         """强制重读记忆文档。"""
+        # 强制走磁盘重读，丢弃调用方手里的旧视图
         return self._storage.reload(user_id or "default")
 
     def clear_memory_data(self, user_id: str | None) -> dict[str, Any]:
         """清空用户记忆文档。"""
+        # 清空 = 原子写回一份空文档（不是删文件）
         return self._storage.clear(user_id=user_id or "default")
 
     def import_memory_data(
@@ -445,6 +449,7 @@ class MemoryUpdater:
         """按 id 删除一条事实。"""
         document = self.get_memory_data(user_id)
         # 过滤掉目标 id 后写回
+        # 过滤掉目标 id 后整文档写回（乐观锁用当前 revision）
         document["facts"] = [f for f in document["facts"] if f.get("id") != fact_id]
         self._storage.save(
             document,
@@ -483,12 +488,14 @@ class MemoryUpdater:
     # ── 水位线 ──────────────────────────────────────────────────────────
     def _watermark_key(self, thread_id: str | None, user_id: str | None) -> tuple[str | None, str | None]:
         """水位线键：(thread_id, user_id)。"""
+        # 水位线按 (线程, 用户) 分桶，各自独立推进
         return (thread_id, user_id)
 
     def _watermark_get(self, key: tuple[str | None, str | None]) -> tuple[str, str] | None:
         """读水位线并标记 LRU 最近使用。"""
         if key not in self._watermarks:
             return None
+        # 命中即标记为最近使用（LRU 逐出时优先淘汰最旧）
         self._watermarks.move_to_end(key)
         return self._watermarks[key]
 
@@ -496,6 +503,7 @@ class MemoryUpdater:
         """写水位线（LRU 超限逐出最旧；cap=0 表示不限）。"""
         self._watermarks[key] = identity
         self._watermarks.move_to_end(key)
+        # 超上限就逐出最久未用的键（cap=0 表示不限）
         cap = self._config.watermark_max_keys
         if cap > 0 and len(self._watermarks) > cap:
             self._watermarks.popitem(last=False)
@@ -535,6 +543,7 @@ class MemoryUpdater:
         返回：
             拼进提示词的 hint 文本（可为空串）
         """
+        # 每类信号对应一段英文约束：只记「用户级 + 长期」的事实，任务级不记
         hints: list[str] = []
         # 每命中一类信号，追加一段「只有 durable/user-level 才记」的约束提示
         if "correction" in signals:
@@ -663,6 +672,7 @@ class MemoryUpdater:
         bypass_watermark: bool = False,
     ) -> bool:
         """异步更新记忆：把同步 LLM 调用丢到线程池，不阻塞事件循环。"""
+        # 同步 LLM 调用丢线程池，避免阻塞事件循环
         return await asyncio.to_thread(
             self._do_update_memory_sync,
             messages,
@@ -772,6 +782,7 @@ class MemoryUpdater:
         # 门控拒绝计数（末尾汇总日志）
         rejected: dict[str, int] = {}
 
+            # 记一次门控拒绝（末尾汇总成一条日志，避免刷屏）
         def reject(kind: str) -> None:
             rejected[kind] = rejected.get(kind, 0) + 1
 

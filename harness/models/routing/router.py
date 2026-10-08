@@ -1,28 +1,3 @@
-"""模型动态路由（router）。
-
-职责：给定「这一轮的输入 + 可选配置」，决定该用哪个模型，并说明原因。
-       是「挑选模型」的唯一决策点，取代了原先由前端下拉框人工选模型的做法。
-
-为什么放在 harness 而不是 app 层：
-    路由结果直接喂给 harness 的模型工厂（create_chat_model），
-    且需要读 harness 的 AppConfig；放同一层避免 app → harness 反向依赖。
-
-与 factory 的分工：
-    - router  决定「用哪个 name」（策略层，可解释、可单测）
-    - factory 决定「这个 name 怎么造成实例」（构造层，带缓存）
-
-对外暴露：
-    - ModelRouter        路由决策器
-    - get_model_router   进程级单例
-    - reset_model_router 重置单例（测试隔离）
-
-用法示例：
-    router = get_model_router(app_config)
-    decision = router.decide(messages, thinking_enabled=False)
-    decision.model_name   # "deepseek-flash"
-    decision.reason       # "使用默认模型 deepseek-flash"
-"""
-
 from __future__ import annotations
 
 import logging
@@ -33,6 +8,19 @@ from harness.config.app_config import AppConfig, get_app_config
 from harness.config.routing_config import RoutingConfig
 from harness.models.routing.decision import RoutingDecision, RoutingSignals
 from harness.models.routing.rules import RULES, build_signals, rule_default
+
+"""模型动态路由
+
+    职责：给定本轮输入与配置，决定用哪个模型并说明原因
+        - 唯一决策点，取代前端下拉框人工选模型
+        - 只决定「用哪个 name」，怎么造成实例由 factory 负责
+        - 放 harness 层：结果直接喂模型工厂，且要读 AppConfig，避免 app 反向依赖
+
+    对外暴露：
+        - ModelRouter        路由决策器
+        - get_model_router   进程级单例
+        - reset_model_router 重置单例（测试隔离）
+"""
 
 logger = logging.getLogger(__name__)
 
@@ -81,9 +69,10 @@ class ModelRouter:
         降级：路由关闭（routing.enabled=False）时直接用调用方给的名字
             （或 None），并标注 source="fallback"，行为与改造前完全一致。
         """
+        # 1.取路由子配置
         config = self.routing
 
-        # 路由关闭：保持旧行为，不猜、不升档
+        # 2.路由关闭：保持旧行为，不猜、不升档
         if not config.enabled:
             return RoutingDecision(
                 model_name=explicit_model,
@@ -92,19 +81,20 @@ class ModelRouter:
                 requested=explicit_model,
             )
 
+        # 3.从本轮输入抽取路由信号（纯文本 / 有无图片 / 显式模型）
         signals: RoutingSignals = build_signals(
             messages,
             explicit_model=explicit_model,
             thinking_enabled=thinking_enabled,
         )
 
-        # 逐条试规则，先命中先返回
+        # 4.逐条试规则，先命中先返回
         for rule in RULES:
             decision = rule(signals, config)
             if decision is not None:
                 return self._validate(decision)
 
-        # 规则表全部未命中 → 走兜底默认档（同样要校验配置里的模型名）
+        # 5.规则表全部未命中 → 走兜底默认档（同样要校验配置里的模型名）
         return self._validate(rule_default(signals, config))
 
     def _validate(self, decision: RoutingDecision) -> RoutingDecision:
@@ -119,10 +109,13 @@ class ModelRouter:
         返回：
             原决策（校验通过）或退回激活模型的 fallback 决策
         """
+        # 1.没指定模型名 → 无需校验，原样返回
         if not decision.model_name:
             return decision
+        # 2.模型名真实存在 → 校验通过
         if self._model_exists(decision.model_name):
             return decision
+        # 3.不存在 → 记警告并退回激活模型（不打断整轮会话）
         logger.warning(
             "路由指向的模型 %s 不在 config.models 中，退回激活模型",
             decision.model_name,
@@ -161,9 +154,11 @@ def get_model_router(app_config: AppConfig | None = None) -> ModelRouter:
             （配置热重载走 reset_model_router）
     """
     global _router
+    # 1.快路径：已初始化直接返回，不加锁
     if _router is not None:
         return _router
     with _router_lock:
+        # 2.慢路径：拿到锁后二次确认，避免并发重复构造
         if _router is None:
             _router = ModelRouter(app_config)
         return _router

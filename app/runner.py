@@ -1,32 +1,23 @@
-"""PrismWorker 后端启动入口（runner）—— `python -m app.runner`。
-
-阶段16 部署硬化：把「手动敲 uvicorn」变成可配置、可校验、有日志落盘的
-正式启动入口。
-
-功能：
-  1. 可选加载项目根 `.env`（KEY=VALUE 手写解析，不覆盖已有环境变量）
-  2. 启动前配置校验：配置缺失 / 模型为空 / active_model 指向不存在等
-     问题给出中文指引；致命项直接退出（exit 1）
-  3. 统一日志：控制台 + 滚动文件 `{log_dir}/app.log`（默认 5MB × 3 份）
-  4. 委托 uvicorn 启动 `app.api.main:app`（lifespan 负责启动初始化与关闭
-     回收——含真实沙箱容器 stop、在跑 run 取消）
-
-用法：
-  python -m app.runner                                  # 0.0.0.0:8000
-  python -m app.runner --host 127.0.0.1 --port 8080
-  python -m app.runner --reload                         # 仅开发
-  python -m app.runner --config ./config.yaml --log-dir ./logs
-"""
-
 from __future__ import annotations
 
 import argparse
-import logging
 import os
 import sys
-from logging.handlers import RotatingFileHandler
 from pathlib import Path
 from typing import Iterable
+
+"""后端启动入口
+
+    职责：把「手动敲 uvicorn」变成可配置、可校验、有日志落盘的正式入口
+        - 可选加载项目根 .env（不覆盖已有环境变量）
+        - 启动前配置校验：致命项直接退出，警告项只提示
+        - 统一日志：控制台 + 结构化文件（委托 harness.observability）
+        - 委托 uvicorn 启动 app.api.main:app
+
+    对外暴露：
+        - build_parser  命令行参数解析器（独立出来便于测试）
+        - main          启动入口，返回进程退出码
+"""
 
 _DEFAULT_BASE_HINT = os.getenv("PRISM_WORKER_HOME") or str(Path.cwd() / ".prism-worker")
 _DEFAULT_LOG_DIR = os.getenv("PRISM_LOG_DIR") or str(Path(_DEFAULT_BASE_HINT) / "logs")
@@ -38,58 +29,42 @@ def _load_dotenv(path: str | Path | None = None) -> None:
     path 缺省 = 项目根 `.env`（与 config.yaml 同级）。文件不存在静默跳过。
     支持 # 注释与空行；`KEY=value` 与 `KEY="value"` 两种写法。
     """
+    # 1.文件不存在静默跳过（.env 是可选的）
     env_file = Path(path) if path else Path.cwd() / ".env"
     if not env_file.is_file():
         return
     for raw_line in env_file.read_text(encoding="utf-8").splitlines():
         line = raw_line.strip()
+        # 2.跳过空行 / 注释 / 不含 = 的行
         if not line or line.startswith("#") or "=" not in line:
             continue
+        # 3.按第一个 = 切成 key/value（值里允许含 =）
         key, _, value = line.partition("=")
         key = key.strip()
         value = value.strip()
+        # 4.去掉值两端的成对引号
         if (value.startswith('"') and value.endswith('"')) or (
             value.startswith("'") and value.endswith("'")
         ):
             value = value[1:-1]
+        # 5.已存在的环境变量优先，不覆盖
         if key and key not in os.environ:
             os.environ[key] = value
 
 
 def _setup_logging(log_dir: str | Path, level: str) -> Path:
-    """配置根日志：控制台 + 滚动文件。返回日志文件路径。"""
-    log_path = Path(log_dir)
-    log_path.mkdir(parents=True, exist_ok=True)
-    log_file = log_path / "app.log"
+    """配置根日志（委托观测包）：控制台 pretty + 文件 JSON。返回结构化日志路径。"""
+    # 委托观测包装配：把 stdlib 根日志无痛升级为 structlog 结构化双输出
+    from harness.observability import setup_observability_logging
 
-    root = logging.getLogger()
-    root.setLevel(getattr(logging, level.upper(), logging.INFO))
-    for handler in list(root.handlers):
-        root.removeHandler(handler)
-
-    fmt = logging.Formatter(
-        "%(asctime)s %(levelname)-7s [%(name)s] %(message)s", "%Y-%m-%d %H:%M:%S"
-    )
-
-    console = logging.StreamHandler(sys.stderr)
-    console.setFormatter(fmt)
-    root.addHandler(console)
-
-    file_handler = RotatingFileHandler(
-        str(log_file), maxBytes=5 * 1024 * 1024, backupCount=3, encoding="utf-8"
-    )
-    file_handler.setFormatter(fmt)
-    root.addHandler(file_handler)
-
-    for noisy in ("uvicorn.access", "httpcore", "httpx", "urllib3"):
-        logging.getLogger(noisy).setLevel(logging.WARNING)
-    return log_file
+    return setup_observability_logging(log_dir, level=level)
 
 
 def _validate_and_report(config_path: str | None) -> bool:
     """启动前配置校验（返回 True=可启动 / False=致命错误应退出）。"""
     from app.core.config import validate_app_config
 
+    # 1.显式给了 --config：先解析并注入单例（失败给中文指引并退出）
     if config_path:
         from harness.config.app_config import AppConfig
 
@@ -103,17 +78,21 @@ def _validate_and_report(config_path: str | None) -> bool:
             print("  请检查 YAML 语法与环境变量（${VAR} 引用）。")
             return False
 
+    # 2.跑一遍配置校验，取问题清单
     problems = validate_app_config()
+    # 3.按前缀识别致命项（其余算警告）
     fatal_patterns = ("models 为空", "active_model=", "无法加载")
     fatal = [p for p in problems if any(p.startswith(k) for k in fatal_patterns)]
     warning = [p for p in problems if p not in fatal]
 
+    # 4.有致命项：打印修复指引，让调用方退出
     if fatal:
         print("[配置错误] 以下问题导致服务无法启动：")
         for item in fatal:
             print(f"  - {item}")
         print("  修复指引：复制 config.example.yaml 为 config.yaml 后按需修改。")
         return False
+    # 5.警告只提示，不阻断启动
     if warning:
         print("[配置提示] （不影响启动，但请注意）：")
         for item in warning:
@@ -148,14 +127,17 @@ def main(argv: Iterable[str] | None = None) -> int:
     """启动入口（返回进程退出码）。"""
     args = build_parser().parse_args(list(argv) if argv is not None else None)
 
+    # 1.先加载 .env（配置校验要读环境变量）
     _load_dotenv()
 
+    # 2.配置不可用直接退出，不进入服务
     if not _validate_and_report(args.config):
         return 1
 
+    # 3.reload 模式下 uvicorn 自己管进程，重复配置日志没意义
     if not args.reload:
         log_file = _setup_logging(args.log_dir, args.log_level)
-        print(f"日志文件: {log_file}")
+        print(f"结构化日志文件: {log_file}")
 
     import uvicorn
 
@@ -166,6 +148,7 @@ def main(argv: Iterable[str] | None = None) -> int:
         host=args.host,
         port=args.port,
         reload=args.reload,
+        # 不让 uvicorn 覆盖我们已经配好的日志
         log_config=None,
     )
     return 0

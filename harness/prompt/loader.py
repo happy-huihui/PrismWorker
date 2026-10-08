@@ -10,23 +10,17 @@ from langchain_core.messages import BaseMessage, HumanMessage, SystemMessage
 
 logger = logging.getLogger(__name__)
 
-"""提示词加载与渲染（prompt.loader）
+"""提示词加载与渲染
 
-    职责：全项目「模型指令模板」的统一读取与渲染入口——定位模板文件、
-         按 $var 填充、chat 模板渲染成消息序列。只认文本与结构化，不含任何
-         子系统的业务变量装配（那是各调用方的事）。
-    存放：模板默认在本包 templates/ 下，一文件一模板，按域分子目录：
-        - 纯文本模板：<name>.md      （如 lead_agent/system、summarizer/summary）
-        - chat 多角色：<name>.chat.yaml（如 memory/memory_update）
-    语法：string.Template 的 $var —— JSON 里的 {} 无需转义（相比 .format 的净收益）。
-    覆盖：base_dir 可指向外部目录整体替换内置模板（memory 的 prompts_dir 就靠它）。
-    缓存：原文按 (name, base_dir) 缓存；渲染每次执行（变量不同）。
+    职责：模型指令模板的统一读取与渲染入口（定位文件 / $var 填充 / chat 渲染成消息）
+        - 模板在 templates/ 下按域分子目录：.md 纯文本、.chat.yaml 多角色
+        - 语法用 string.Template 的 $var（JSON 里的 {} 无需转义）
+        - base_dir 可整体替换内置模板；原文按 (name, base_dir) 缓存
 
-    输出数据示例：
-        render_text("summarizer/summary", {"messages": "A/B"})
-          -> "你是对话摘要助手。请把下面的对话历史压缩成...：\n<历史消息>\nA/B\n</历史消息>\n直接输出摘要正文..."
-        load_chat("memory/memory_update", {"current_memory": "{}", "conversation": "C", "correction_hint": ""})
-          -> [SystemMessage(...), HumanMessage(...)]
+    对外暴露：
+        - TEMPLATES_DIR
+        - load_text / render_text / load_chat
+        - PromptError / PromptNotFound / PromptConfigurationError
 """
 
 # 内置模板根目录
@@ -142,12 +136,14 @@ def load_chat(
         文件缺失 / YAML 非法 / messages 结构错 / 占位符非法 → 相应错误
     """
     cache_key = (name, str(base_dir) if base_dir else None)
+    # 1.命中缓存：复用未渲染模板，只做本次变量替换
     cached = _CHAT_CACHE.get(cache_key)
     # 1.命中缓存：复用未渲染模板，只做本次变量替换
     if cached is not None:
         raw_templates, source_path = cached
         return _render_chat(raw_templates, variables, source_path)
 
+    # 2.定位并读取 .chat.yaml
     # 2.定位并读取 .chat.yaml
     base = _resolve_base(base_dir)
     path = base / f"{name}.chat.yaml"
@@ -159,6 +155,7 @@ def load_chat(
         raise PromptConfigurationError(f"chat 模板 YAML 非法 {path}: {exc}") from exc
 
     # 3.校验：format=chat + 非空 messages 列表
+    # 3.校验 format=chat 且 messages 是非空列表
     if data.get("format", "chat") != "chat":
         raise PromptConfigurationError(f"{path} 不是 chat 格式（format != 'chat'）")
     msg_list = data.get("messages")
@@ -166,6 +163,7 @@ def load_chat(
         raise PromptConfigurationError(f"{path} 缺少非空 messages 列表")
 
     # 4.规整成 {role, content} 原始模板并缓存（缓存未渲染模板，非渲染结果）
+    # 4.规整成 {role, content} 并缓存「未渲染」模板
     raw_templates: list[dict[str, str]] = []
     for msg in msg_list:
         content = msg.get("content", "")
@@ -174,6 +172,7 @@ def load_chat(
         raw_templates.append({"role": msg.get("role", "user"), "content": content})
     _CHAT_CACHE[cache_key] = (raw_templates, str(path))
 
+    # 5.渲染本次变量
     # 5.渲染本次变量
     return _render_chat(raw_templates, variables, str(path))
 
@@ -196,6 +195,7 @@ def _render_chat(
     messages: list[BaseMessage] = []
     for tmpl in raw_templates:
         # 1.每条正文用 string.Template 替换（JSON 的 {} 不受影响）
+        # 1.每条正文用 string.Template 替换（JSON 的 {} 不受影响）
         try:
             content = Template(tmpl["content"]).substitute(dict(variables or {}))
         except (KeyError, ValueError) as exc:
@@ -203,6 +203,7 @@ def _render_chat(
                 f"{source_path} 存在非法/缺失占位符（role={tmpl['role']!r}）: {exc}"
             ) from exc
         # 2.role 分流：system→SystemMessage，其余→HumanMessage
+        # 2.role 分流：system → SystemMessage，其余 → HumanMessage
         if tmpl["role"] == "system":
             messages.append(SystemMessage(content=content))
         else:

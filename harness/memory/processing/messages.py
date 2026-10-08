@@ -11,19 +11,18 @@ import yaml
 
 logger = logging.getLogger(__name__)
 
-"""对话消息清洗（processing.messages）
+"""对话消息清洗
 
-    职责：把原始消息流清洗成「值得记忆」的输入，属于无状态纯变换层。
-    内容：
-        1. filter_messages_for_memory  只留用户输入 + 最终助手回复（剔除 hidden/上传占位/纯工具轮）
-        2. filter_trivial              剔除纯应声用户轮（「嗯/ok/谢谢」）及其回复
-        3. detect_signals              在最近用户消息上跑六类信号正则，产出提取 hint
-        4. extract_message_text        消息 content → 纯文本
-        5. format_conversation_for_update  把对话渲染成「用户: … / 助手: …」文本
-        6. load_patterns               信号模式外部化（YAML + 编译缓存）
+    职责：把原始消息流清洗成「值得记忆」的输入，全部为无状态纯函数
+        - filter_messages_for_memory 只留用户输入 + 最终助手回复
+        - filter_trivial 剔除纯应声用户轮及其回复
+        - detect_signals 在最近 6 条用户消息上跑六类信号正则
+        - extract_message_text / format_conversation_for_update / load_patterns
 
-    说明：全部为纯函数，只依赖标准消息对象，可独立单测；
-         内置信号模式目录固定在 harness/memory/pattern/。
+    对外暴露：
+        - SIGNAL_NAMES / load_patterns / extract_message_text
+        - filter_messages_for_memory / filter_trivial
+        - detect_signals / format_conversation_for_update
 """
 
 # 上传块占位标签（被剥离后若整轮只剩标签则整轮剔除）

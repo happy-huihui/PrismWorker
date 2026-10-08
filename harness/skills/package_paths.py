@@ -2,13 +2,14 @@
 from __future__ import annotations
 from pathlib import PurePath
 
-"""评测夹具（fixture）路径判断工具。
+"""评测夹具路径判断
 
-技能包可以携带 evals/ 评测目录，其中 evals/fixtures/ 存放测试数（非法的 SKILL.md、恶意脚本等）
+    职责：判断路径是否落在 evals/fixtures 夹具目录下，供 analyzer 豁免检查
+        - 夹具里的 SKILL.md 是测试输入，不是真嵌套，不该报 blocker
 
-analyzer 在检查包内是否存在嵌套 SKILL.md 这一 blocker 规则时，
-必须豁免夹具目录里的 SKILL.md，否则会把正常技能误判为失败。
-本模块就是给 analyzer 提供这条豁免判断的依据。
+    对外暴露：
+        - is_eval_fixture_path       是否位于夹具目录之下
+        - is_eval_fixture_skill_md   是否夹具内的 SKILL.md
 """
 
 _EVAL_FIXTURES = ("evals", "fixtures")
@@ -23,6 +24,7 @@ def is_eval_fixture_path(path: PurePath | str) -> bool:
       "evals/fixtures/my-test/SKILL.md"  → True
       "references/guide.md"              → False
     """
+    # 相邻两段恰好是 evals / fixtures 才算夹具目录
     segments = tuple(PurePath(path).parts)
     return any(
         segments[i] == _EVAL_FIXTURES[0] and segments[i + 1] == _EVAL_FIXTURES[1]
@@ -41,4 +43,5 @@ def is_eval_fixture_skill_md(path: PurePath | str) -> bool:
       "SKILL.md"                          → False（根目录主文件，需正常检查）
       "references/sub/SKILL.md"           → False（真嵌套，需报错）
     """
+    # 既要位于夹具目录，文件名又必须是 SKILL.md
     return is_eval_fixture_path(path) and PurePath(path).name.lower() == "skill.md"

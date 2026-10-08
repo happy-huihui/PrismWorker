@@ -5,39 +5,18 @@ from dataclasses import dataclass, field
 from enum import Enum
 from typing import Any
 
-"""事件模型（types）
+"""事件模型
 
-    职责：定义一次 agent run 的思考链统一消息格式 RunEvent。
-    背景：工具调用、进度、任务清单、产物、思考/答复文本、结束/错误都抽象成
-         RunEvent，经事件总线发布，由 SSE 推送端等订阅；事件本身不落盘，
-         持久化交给 runs 表。
+    职责：定义一次 agent run 的思考链统一消息格式 RunEvent
+        - 工具调用 / 进度 / 任务清单 / 产物 / 思考与答复文本 / 结束与错误都抽象成 RunEvent
+        - 事件本身不落盘，持久化交给 runs 表
+        - 文本事件带 message_id：前端按它归并，才能做到「逐 token + 事后定性」
 
     对外暴露：
         - RunEventType           事件类型枚举（值即 SSE 的 event 字段）
-        - RunEvent               一条事件（type/run_id/thread_id/ts/seq/payload）
+        - RunEvent               一条事件（type / run_id / thread_id / ts / seq / payload）
         - TERMINAL_EVENT_TYPES   终端事件集合（run_finished / run_error，必达不丢）
         - make_event             构造一个不带 seq 的事件（seq 由总线覆盖）
-
-    输出数据示例（各事件真实 payload）：
-        - run_started                 {"run_id": "…", "thread_id": "…"}
-        - run_meta                    {"model_name": "deepseek-v4-pro",
-                                       "thinking_enabled": true, "thinking_degraded": false}
-        - tool_start                  {"tool": "read_file", "tool_call_id": "…",
-                                       "args": {"path": "/mnt/…/a.html", "description": "读取页面模板"},
-                                       "description": "读取页面模板", "args_preview": "{…}", "ts": 1710000000.0}
-        - tool_end                    {"tool": "web_search", "tool_call_id": "…", "duration_seconds": 1.2, "ok": true, "error": null, "ts": 1710000001.2}
-        - reasoning_chunk             {"message_id": "lc_…", "text": "…"}   # 模型真实思考（逐 token）
-        - message_chunk               {"message_id": "lc_…", "text": "…"}   # 本轮文本（先按答复流式）
-        - message_retract             {"message_id": "lc_…"}                # 同轮出现工具 → 文本降级为叙述
-        - thinking_chunk              {"text": "…"}                         # 旧版整轮叙述（仅历史兼容）
-        - prints                      {"prints": ["…", "…"]}          # 增量进度行
-        - todos                       {"todos": […]}                  # 全量任务清单
-        - artifacts                   {"artifacts": ["outputs/a.md"]} # 增量产物路径
-        - run_finished                {"status": "finished", "message_count": 3, "artifacts": […], "finished_at": 1710000009.0}
-        - run_error                   {"status": "error", "message_count": 0, "artifacts": [], "error": "…"}
-
-    文本事件为何带 message_id：模型一轮输出是一个固定 id 的流，前端按它归并才能
-    做到「逐 token + 事后定性」（见到工具就把该条文本从答复气泡降级进思考步骤）。
 """
 
 # 终端事件：总线保证必达（队列满也不丢），消费端据此收尾

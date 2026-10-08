@@ -12,27 +12,17 @@ from langchain_core.messages import AIMessage, RemoveMessage, SystemMessage
 
 ModelRequest = types.ModelRequest
 
-"""
-    流程控制中间件（flow_control）——三项最小护栏合集。
+"""流程控制中间件
 
-    LoopDetectionMiddleware（循环检测）：
-      检测模型反复调用同一个工具 + 相同参数（签名指纹相同）。最近窗口中
-      同一签名出现 ≥ min_repeat_times（默认 3）次即判为循环：awrap_model_call
-      注入系统提示引导模型换方案；abefore_model 补一条中文进度消息。
+    职责：识别并缓解「模型空转 / 状态脏 / 指令稀释」三类流程问题
+        - LoopDetectionMiddleware           同一工具 + 参数重复 ≥3 次 → 注入提示
+        - DanglingToolCallMiddleware        检测孤立 tool_calls → 注入提示
+        - SystemMessageCoalescingMiddleware 多条 SystemMessage 合并为一条
 
-    DanglingToolCallMiddleware（孤立工具调用）：
-      最新 AIMessage 声明的 tool_calls 在下游没有对应 ToolMessage（说明这
-      些调用要么被护栏拦截、要么与已执行的一轮不一致）。检测到时注入提示，
-      提醒模型不要依赖未执行成功的调用。
-
-    SystemMessageCoalescingMiddleware（系统消息合并）：
-      多条 SystemMessage 会稀释指令强度。发现 >1 条 system 时把它们合并为
-      排在最前的一条（同 id 覆盖 + RemoveMessage 删除其余），保持上下文
-      干净。summary 消息（name == "summary"）不参与合并。
-
-    已移除：SafetyFinishReasonMiddleware（“模型已完成本轮输出”进度行）——
-      它唯一作用是往 prints 写一行内部信号，而“本轮结束”已由 run 终端事件
-      （run_finished）承担，留在思考链里只是噪声。
+    对外暴露：
+        - LoopDetectionMiddleware
+        - DanglingToolCallMiddleware
+        - SystemMessageCoalescingMiddleware
 """
 
 logger = logging.getLogger(__name__)
@@ -60,15 +50,18 @@ class LoopDetectionMiddleware(AgentMiddleware):
         handler: Callable[[ModelRequest[Any]], Awaitable[Any]],
     ) -> Any:
         """包装模型调用：存在循环签名时注入系统提示。"""
+        # 1.检测最近窗口内重复的工具签名；无重复 → 放行
         repeated = _find_repeated_signatures(request.state, self._window, self._min_repeat)
         if not repeated:
             return await handler(request)
+        # 2.拼出循环警告文案
         names = ", ".join(f"「{name}」" for name in repeated)
         loop_notice = (
             f"警告：检测到对工具 {names} 的重复调用（参数一致）。"
             "这可能是循环。请停止重复，分析已有结果并尝试完全不同的方法，"
             "或直接基于现有信息给出最终回答。"
         )
+        # 3.把警告注入系统消息（无系统消息则直接作为系统消息）
         system_message = request.system_message
         if system_message is None:
             system_message = SystemMessage(content=loop_notice)
@@ -124,15 +117,18 @@ class SystemMessageCoalescingMiddleware(AgentMiddleware):
         self, state: Any, runtime: Any  # type: ignore[override]
     ) -> dict[str, Any] | None:
         """模型调用前：合并多余的系统消息。"""
+        # 1.挑出所有 system 消息（summary 消息是压缩摘要，不参与合并）
         messages = (state or {}).get("messages") or []
         system_messages = [
             m for m in messages
             if m is not None and getattr(m, "type", "") == "system"
             and getattr(m, "name", None) != "summary"
         ]
+        # 2.不超过一条 → 无需合并
         if len(system_messages) <= 1:
             return None
 
+        # 3.全部拼到第一条（同 id 覆盖），其余用 RemoveMessage 删除
         first = system_messages[0]
         merged_text = "\n\n".join(_extract_text(m) for m in system_messages)
         new_first = SystemMessage(content=merged_text)
@@ -192,11 +188,13 @@ def _find_dangling_calls(state: Any) -> list[str]:
     if state is None:
         return []
     messages = (state or {}).get("messages") or []
+    # 1.收集已执行的 tool_call_id（即已有对应 ToolMessage 的）
     executed_ids = {
         str(getattr(m, "tool_call_id", ""))
         for m in messages
         if m is not None and getattr(m, "type", "") == "tool"
     }
+    # 2.从后往前找最新一条 AI 消息
     latest_ai = None
     for message in reversed(messages):
         if message is not None and getattr(message, "type", "") == "ai":
@@ -204,6 +202,7 @@ def _find_dangling_calls(state: Any) -> list[str]:
             break
     if latest_ai is None:
         return []
+    # 3.最新 AI 消息里，凡是没有对应 ToolMessage 的调用即孤立调用
     dangling: list[str] = []
     for call in getattr(latest_ai, "tool_calls", None) or []:
         if not isinstance(call, dict):

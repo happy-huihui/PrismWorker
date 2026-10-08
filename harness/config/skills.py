@@ -8,12 +8,10 @@ from harness.skills.review.readers import parse_skill_uri
 
 """技能配置
 
-    职责：确定技能根目录（宿主侧唯一真源）、容器内挂载点，以及 skill:// URI 的路径解析。
-
-    解析规则：统一走 resolve_skills_root()
-        - 默认 {项目根}/skills（项目根由本模块位置反推，与 CWD 无关，
-          避免服务从别的目录启动时解析到错误位置）
-        - 可用环境变量 PRISM_WORKER_SKILLS_ROOT 覆盖（便于测试与部署）
+    职责：管理技能根目录、容器挂载点与 skill:// URI 解析
+        - 技能根目录（默认 {项目根}/skills，可被环境变量 PRISM_WORKER_SKILLS_ROOT 覆盖）
+        - 容器内挂载点（只读、全线程共享）
+        - skill:// URI 到本地路径的解析
 
     对外暴露：
         - PUBLIC_CATEGORY   技能类别目录名
@@ -51,13 +49,13 @@ class SkillsConfig:
         返回：
             技能根目录的绝对路径
         """
-        # 环境变量优先，其次用配置值
+        # 1.环境变量优先，其次用配置值
         raw = os.getenv(_SKILLS_ROOT_ENV) or self.skills_root
         path = Path(raw).expanduser()
-        # 绝对路径直接归一化
+        # 2.绝对路径直接归一化返回
         if path.is_absolute():
             return path.resolve()
-        # 相对路径一律以项目根为基准
+        # 3.相对路径一律以项目根为基准（不是 CWD，避免服务从别处启动时漂移）
         return (_PROJECT_ROOT / path).resolve()
 
     def public_skills_dir(self) -> Path:
@@ -87,6 +85,7 @@ class SkillsConfig:
         返回：
             Path("{技能根}/public/skill-reviewer")
         """
-        # 拆出类别与相对路径（校验与防穿越都在 parse_skill_uri 内）
+        # 1.拆出类别与相对路径（校验与防穿越都在 parse_skill_uri 内）
         category, rel_path = parse_skill_uri(target)
+        # 2.拼接成技能根下的真实绝对路径
         return self.resolve_skills_root() / category / rel_path

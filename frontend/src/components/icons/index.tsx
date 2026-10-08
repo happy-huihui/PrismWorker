@@ -109,6 +109,7 @@ export const Globe2 = makeIcon(L.Globe)
 export const Wand2 = makeIcon(L.Wand2)
 export const ImagePlus = makeIcon(L.ImagePlus)
 export const ChevronUp = makeIcon(L.ChevronUp)
+export const Activity = makeIcon(L.Activity)
 
 // ── 模板自绘图标（取自 explore/index.html 的内联 SVG，与模板观感 1:1）───────
 

@@ -1,14 +1,18 @@
-"""沙箱相关异常。
-
-统一沙箱层的错误类型：
-    - SandboxError              —— 所有沙箱异常的基类
-    - SandboxConnectionError    —— 连不上沙箱（容器没起 / base_url 配错 / 网络不通）
-    - SandboxCommandError       —— 沙箱内命令执行失败（非零退出码）
-    - SandboxFileError          —— 沙箱内文件操作失败
-"""
-
 from __future__ import annotations
 
+"""沙箱异常体系
+
+    职责：统一沙箱层的错误类型，异常可携带结构化 details 供上层转成模型友好提示
+        - 基类 + 按失败来源细分（连接 / 命令 / 文件 / 路径）
+        - 连接类属基础设施错误；命令非零退出不算致命
+
+    对外暴露：
+        - SandboxError            异常基类（message + details）
+        - SandboxConnectionError  连不上沙箱（容器未起 / 端口错 / 网络不通）
+        - SandboxCommandError     容器内命令非零退出
+        - SandboxFileError        容器内文件操作失败
+        - SandboxPathError        路径越界或含 .. 穿越（继承 SandboxFileError）
+"""
 
 class SandboxError(Exception):
     """所有沙箱错误的基类。
@@ -18,6 +22,7 @@ class SandboxError(Exception):
     """
 
     def __init__(self, message: str, details: dict | None = None) -> None:
+        # 统一保存一份 message 与结构化 details，供上层拼模型友好提示
         super().__init__(message)
         self.message = message
         self.details = details or {}
@@ -31,6 +36,7 @@ class SandboxConnectionError(SandboxError):
     """
 
     def __init__(self, message: str = "无法连接沙箱", base_url: str | None = None, cause: Exception | None = None) -> None:
+        # 有 base_url 才放进 details，避免无意义的空字段
         details = {"base_url": base_url} if base_url else None
         super().__init__(message, details)
         self.base_url = base_url
@@ -52,6 +58,7 @@ class SandboxCommandError(SandboxError):
         exit_code: int | None = None,
         output: str | None = None,
     ) -> None:
+        # 只收录实际提供的字段，缺省的留空不塞 null
         details: dict = {}
         if command is not None:
             details["command"] = command
@@ -78,6 +85,7 @@ class SandboxFileError(SandboxError):
         path: str | None = None,
         operation: str | None = None,
     ) -> None:
+        # 同上：只收录实际提供的字段
         details: dict = {}
         if path is not None:
             details["path"] = path

@@ -18,13 +18,15 @@ from harness.memory.storage import MemoryStorage
 
 logger = logging.getLogger(__name__)
 
-"""PrismMem 记忆管理器（manager.prism）
+"""PrismMem 记忆管理器
 
-    职责：本项目唯一的 MemoryManager 实现——装配 storage / updater / queue
-         三件套，并在写入口统一做「过滤 → trivial 过滤 → 双方校验 → 信号
-         检测 → 入队」。
-    异常契约：队列背压（QueueFull）、存储异常全在内部消化为日志，绝不向
-         Agent 主链路扩散（记忆是 best-effort）。
+    职责：本项目唯一的 MemoryManager 实现，装配 storage / updater / queue 三件套
+        - 写入口统一做「过滤 → trivial 过滤 → 双方校验 → 信号检测 → 入队」
+        - 读入口按 token 预算渲染注入文本；检索为子串匹配 + 置信度降序
+        - 背压与存储异常全部内部消化，绝不扩散到 Agent 主链路
+
+    对外暴露：
+        - PrismMemoryManager
 """
 
 # 缺省 agent 桶（单 Agent 架构下所有记忆按 user 分桶）
@@ -33,6 +35,7 @@ _DEFAULT_BUCKET = DEFAULT_AGENT_BUCKET
 
 def _resolve_agent_name(agent_name: str | None) -> str:
     """规范化 agent_name（本项目单 Agent，保留桶语义便于未来扩展）。"""
+    # 未指定就用缺省桶；指定则小写归一
     return agent_name.lower() if agent_name is not None else _DEFAULT_BUCKET
 
 
@@ -45,6 +48,7 @@ def _fact_confidence(fact: dict[str, Any]) -> float:
         value = float(raw)
     except (TypeError, ValueError):
         return 0.5
+    # 钳到 [0,1]，防模型 / 历史数据给出越界值
     return max(0.0, min(value, 1.0))
 
 
@@ -133,6 +137,7 @@ class PrismMemoryManager(MemoryManager):
         trace_id: str | None = None,
     ) -> None:
         """紧急入队立即处理（摘要压缩前调用，bypass 水位线）。"""
+        # 1.与 add 同样先做过滤 + trivial 过滤 + 信号检测
         prepared = self._prepare_update(messages)
         if prepared is None:
             return
@@ -146,6 +151,7 @@ class PrismMemoryManager(MemoryManager):
                 trace_id=trace_id,
                 signals=signals,
             )
+        # 2.背压满只告警丢弃（摘要冲刷不能反过来阻断压缩流程）
         except QueueFull as exc:
             logger.warning("记忆紧急冲刷被背压拒绝（thread=%s）: %s", thread_id, exc)
 
@@ -230,6 +236,7 @@ class PrismMemoryManager(MemoryManager):
         agent_name: str | None = None,
     ) -> dict[str, Any]:
         """返回用户记忆完整文档。"""
+        # 直接透传 updater 的读取（含防御性归一化）
         return self._updater.get_memory_data(user_id)
 
     def import_memory(
@@ -240,6 +247,7 @@ class PrismMemoryManager(MemoryManager):
         agent_name: str | None = None,
     ) -> dict[str, Any]:
         """导入记忆文档（合并语义，交给 updater 落库）。"""
+        # 合并语义（新 facts 去重追加、非空分区覆盖）在 updater 里实现
         return self._updater.import_memory_data(memory_data, user_id=user_id)
 
     def clear_memory(
@@ -249,6 +257,7 @@ class PrismMemoryManager(MemoryManager):
         agent_name: str | None = None,
     ) -> dict[str, Any]:
         """清空用户记忆文档。"""
+        # 清空即写回空文档，用户下次仍拿到合法结构
         return self._updater.clear_memory_data(user_id)
 
     def create_fact(
@@ -260,14 +269,17 @@ class PrismMemoryManager(MemoryManager):
         user_id: str | None = None,
         agent_name: str | None = None,
         key: str | None = None,
+        source: str = "manual",
     ) -> tuple[dict[str, Any], str | None]:
         """手动新增事实（转交 updater，key 稳定语义由 updater 处理）。"""
+        # 转交 updater：同 key 覆盖 / 否则新建的语义在那边实现（source 标记来源）
         return self._updater.create_fact(
             content,
             category=category,
             confidence=confidence,
             user_id=user_id,
             key=key,
+            source=source,
         )
 
     def delete_fact(
@@ -278,6 +290,7 @@ class PrismMemoryManager(MemoryManager):
         agent_name: str | None = None,
     ) -> dict[str, Any]:
         """删除事实（转交 updater）。"""
+        # 按 fact id 删除；调用方（工具）负责先用 key 定位 id
         return self._updater.delete_fact(fact_id, user_id=user_id)
 
     def update_fact(
@@ -291,6 +304,7 @@ class PrismMemoryManager(MemoryManager):
         agent_name: str | None = None,
     ) -> dict[str, Any]:
         """更新事实（转交 updater）。"""
+        # 只改传入的非 None 字段，其余保持原值
         return self._updater.update_fact(
             fact_id,
             content=content,
@@ -302,8 +316,10 @@ class PrismMemoryManager(MemoryManager):
     # ── 生命周期 ────────────────────────────────────────────────────────
     def shutdown_flush(self, timeout: float) -> bool:
         """优雅关闭：有界排空防抖队列（超时未完成返回 False 由调用方告警）。"""
+        # 有界排空防抖队列；超时未清完返回 False，由调用方告警
         return self._queue.flush_sync(timeout)
 
     def close(self) -> None:
         """释放存储资源（当前实现无外部连接，保持接口）。"""
+        # 当前存储无外部连接，close 仅保持接口一致
         self._storage.close()

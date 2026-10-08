@@ -10,28 +10,15 @@ from langchain_core.messages import ToolMessage
 
 ToolCallRequest = types.ToolCallRequest
 
-"""
-    沙箱保护中间件（sandbox_protection）——写前读与命令审计两道闸。
+"""沙箱保护中间件
 
-    ReadBeforeWriteMiddleware（写前读）：
-      防止 Agent 在未读取目标文件的情况下盲目覆盖写文件（可能覆盖掉
-      用户数据或不知情的内容）。对写类工具（write_file / append_file /
-      overwrite_file / edit_file…）做检查：目标 path 必须出现在历史
-      读取记录（read_file / view_file 的调用参数）里，否则拦截该调用并
-      返回一条提示"先 read 再 write"的 ToolMessage。
+    职责：对文件写入与沙箱命令执行加护栏
+        - ReadBeforeWriteMiddleware  未读过目标文件就拦写；目标不存在（新建）直接放行
+        - SandboxAuditMiddleware     记录命令摘要 / 成败 / 时间
 
-      两道放行口（2026-09-25 修订）：
-        1. 目标**已存在性探测**（exists_probe）判为「不存在」→ 直接放行。
-           新建文件没有可覆盖的内容，拦下来只会让模型白折腾：实测模型被拦后
-           反复重试，整轮被拖死。
-        2. allow_unread_creates=True 时，允许模型显式声明 create=true 绕过
-           （默认关闭；注意这条**必须**与工具 schema 里的 create 参数同时存在，
-           否则提示会让模型去传一个根本不存在的参数——旧版就是这么写的）。
-
-    SandboxAuditMiddleware（命令审计）：
-      对沙箱命令执行工具（exec_command / bash / shell…）的每次调用做
-      审计记录：命令摘要、是否成功、时间戳。记录写入 self.audit_log
-      （进程内列表，运行层可读取），同时向 prints 写一行中文进度。
+    对外暴露：
+        - ReadBeforeWriteMiddleware
+        - SandboxAuditMiddleware
 """
 
 logger = logging.getLogger(__name__)
@@ -83,23 +70,28 @@ class ReadBeforeWriteMiddleware(AgentMiddleware):
         handler: Callable[[ToolCallRequest[Any]], Awaitable[Any]],
     ) -> Any:
         """包装写工具调用：未先读则拦截并提示（新建文件除外）。"""
+        # 1.非写工具 → 放行
         name = str(request.tool_call.get("name") or "")
         if name not in self._write_tools:
             return await handler(request)
+        # 2.取目标路径；取不到 → 放行
         args = request.tool_call.get("args") or {}
         target = _extract_path(args)
         if not target:
             return await handler(request)
+        # 3.目标已出现在历史读取记录里 → 放行
         read_paths = _collect_read_paths(request.state)
         if _path_matches(target, read_paths):
             return await handler(request)
 
-        # 目标不存在 = 新建：没有可覆盖的内容，直接放行（避免把模型拦进重试死循环）
+        # 4.目标不存在 = 新建：没有可覆盖的内容，直接放行（避免把模型拦进重试死循环）
         if self._exists_probe is not None and await self._probe_exists(target) is False:
             return await handler(request)
 
+        # 5.显式声明 create=true 且开关打开 → 放行
         if self._allow_unread_creates and (args.get("create") is True or args.get("create_new") is True):
             return await handler(request)
+        # 6.拦截：返回「先 read 再 write」的提示 ToolMessage
         message = (
             f"写文件被拦截：目标 {target} 已存在且尚未被读取。为避免覆盖未知内容，"
             "请先用 read_file 读取该路径，确认内容后再写。"
@@ -155,18 +147,22 @@ class SandboxAuditMiddleware(AgentMiddleware):
         handler: Callable[[ToolCallRequest[Any]], Awaitable[Any]],
     ) -> Any:
         """包装命令工具调用：执行前后记录审计日志。"""
+        # 1.非命令工具 → 放行
         name = str(request.tool_call.get("name") or "")
         if name not in self._command_tools:
             return await handler(request)
+        # 2.取命令预览与调用 id
         command_preview = _command_preview(request.tool_call.get("args") or {})
         call_id = str(request.tool_call.get("id") or "")
 
+        # 3.执行；异常记失败审计后再抛出（交给错误中间件兜底）
         try:
             result = await handler(request)
         except Exception as exc:  # noqa: BLE001 —— 审计记录后再抛给上层
             self._record_audit(name, command_preview, success=False, error=str(exc))
             raise
 
+        # 4.成功记审计
         self._record_audit(name, command_preview, success=True, call_id=call_id)
         return result
 

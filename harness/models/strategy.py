@@ -9,10 +9,10 @@ from harness.config.model_config import ModelConfig
 
 """模型创建策略接口
 
-    职责：定义模型接口，strategy.build(...) 拿策略实现
+    职责：定义各 provider 创建模型必须实现的接口
 
     对外暴露：
-        - ChatModelStrategy   策略接口，子类要实现 provider 标识和 build() 方法
+        - ChatModelStrategy   策略基类，子类实现 provider 标识与 build()
 """
 
 

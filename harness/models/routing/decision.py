@@ -1,17 +1,19 @@
-"""模型路由决策结果（decision）。
-
-路由的产出不是「一个模型名字符串」，而是「模型名 + 为什么选它」。
-把原因结构化带出来有两个用处：
-    1. 运行层写进 run_meta 事件，前端思考链可以如实告诉用户「已自动选择 X（因为 Y）」；
-    2. 排查「为什么这轮没升档」时不用加日志重跑，看事件流即可。
-
-source 用枚举而非自由字符串，前端据此决定用哪套文案渲染。
-"""
-
 from __future__ import annotations
 
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from typing import Literal
+
+"""模型路由决策结果
+
+    职责：定义路由的决策产物与判定输入
+        - RoutingDecision  模型名 + 来源 + 原因（结构化，供 run_meta 事件与排查用）
+        - RoutingSignals   判定输入：文本 / 有无图片 / 是否显式指定模型
+
+    对外暴露：
+        - RoutingDecision   决策结果（含 escalated 属性与 to_meta 方法）
+        - RoutingSignals    路由输入信号
+        - RoutingSource     决策来源的字面量联合类型
+"""
 
 """决策来源。
 
@@ -76,4 +78,3 @@ class RoutingSignals:
     thinking_enabled: bool = False
     explicit_model: str | None = None
     message_count: int = 0
-    extra_keywords: list[str] = field(default_factory=list)

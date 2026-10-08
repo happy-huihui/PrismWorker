@@ -9,19 +9,15 @@ from langgraph.types import Command
 
 from harness.tools.types import Runtime
 
-"""task 工具：把任务派发给子代理（subagent）执行。
+"""子代理派发工具
 
-按用户确认的接口壳设计：
-    - 本文件提供 @tool("task") 的完整签名与文档，作为「接口壳」；
-    - 真实执行逻辑由 subagents/executor.py（阶段5）实现，这里延迟导入，
-      避免阶段4 阶段顺序导致 ImportError；
-    - 若执行器模块尚未实现，返回明确的中文错误消息，不静默失败。
+    职责：把有界任务派给子代理，在独立上下文里执行后取回结果
+        - 延迟导入 executor（模块未就绪时回中文错误，而不是 ImportError）
+        - 按 subagent_type 查注册表；未知类型回可用列表
+        - 子代理不更新 todo，任务清单只由主线维护
 
-路由原则（参考实现语义）：
-    - 参数 organization：description / prompt / subagent_type，
-      由 SubagentExecutor 按 subagent_type 查注册表、创建子代理执行。
-    - 大任务、独立任务、适合并行/上下文隔离的任务 → 派发；
-      琐碎、依赖链、需要用户交互的任务 → 不要派发。
+    对外暴露：
+        - task_tool   工具本体
 """
 
 logger = logging.getLogger(__name__)
@@ -65,6 +61,7 @@ async def task_tool(
             - general_purpose: 通用子代理（复用主模型 + 精简工具集）
             若传入未知类型，将返回可用类型列表。
     """
+    # 1.延迟导入：子代理模块未就绪时给明确错误，而不是 ImportError 炸掉
     try:
         from harness.subagents.executor import SubagentExecutor
         from harness.subagents.builtins import (
@@ -85,6 +82,7 @@ async def task_tool(
             }
         )
 
+    # 2.查注册表；未知类型回可用列表，让模型自己改
     config = get_subagent_config(subagent_type)
     if config is None:
         available = ", ".join(get_available_subagent_names())
@@ -99,6 +97,7 @@ async def task_tool(
             }
         )
 
+    # 3.从 runtime 收集执行器需要的上下文（父模型 / 沙箱 / 线程 / 用户）
     executor_kwargs: dict[str, Any] = {
         "config": config,
         "parent_model": _parent_model_name(runtime),
@@ -122,6 +121,7 @@ async def task_tool(
             }
         )
 
+    # 4.执行并把结果转成统一 ToolMessage
     result = await executor.execute(prompt)
     return _result_command(tool_call_id=tool_call_id, result=result)
 
@@ -129,6 +129,7 @@ async def task_tool(
 def _result_command(*, tool_call_id: str, result: Any) -> Command:
     """把子代理结果转成统一 ToolMessage（接口壳：约定字段名供阶段5对齐）。"""
     status = getattr(result, "status", None)
+    # completed（或没有 status）当成功；其余当失败并带上 error
     if status in ("completed", None):
         body = getattr(result, "result", None) or "子代理任务已完成。"
         return Command(
@@ -154,6 +155,7 @@ def _result_command(*, tool_call_id: str, result: Any) -> Command:
 
 def _runtime_value(runtime: Runtime, key: str) -> Any:
     """从 runtime 状态取值（无状态返回 None）。"""
+    # runtime 没有 state（独立调用）时返回 None
     state = getattr(runtime, "state", None)
     if state is None:
         return None
@@ -164,6 +166,7 @@ def _parent_model_name(runtime: Runtime) -> str | None:
     """从 runtime 元数据里取父模型名（供子代理模型继承）。"""
     config = getattr(runtime, "config", None)
     if isinstance(config, dict):
+        # 父模型名放在 config.metadata.model_name，供子代理 inherit
         metadata = config.get("metadata") or {}
         if isinstance(metadata, dict):
             return metadata.get("model_name")
@@ -172,11 +175,13 @@ def _parent_model_name(runtime: Runtime) -> str | None:
 
 def _thread_id(runtime: Runtime) -> str | None:
     """从 runtime 上下文或 config 里解析线程 ID。"""
+    # 1.先 runtime.context
     context = getattr(runtime, "context", None)
     if isinstance(context, dict):
         thread_id = context.get("thread_id")
         if thread_id:
             return str(thread_id)
+    # 2.再 config.configurable
     config = getattr(runtime, "config", None)
     if isinstance(config, dict):
         configurable = config.get("configurable") or {}

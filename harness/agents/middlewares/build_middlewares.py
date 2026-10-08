@@ -33,6 +33,7 @@ from harness.agents.middlewares.summarization import SummarizationMiddleware
 from harness.agents.middlewares.thread_context import ThreadContextMiddleware
 from harness.agents.middlewares.title import TitleMiddleware
 from harness.agents.middlewares.todo import TodoMiddleware
+from harness.agents.middlewares.trace import SpanMiddleware
 from harness.agents.middlewares.token_usage import TokenBudgetMiddleware, TokenUsageMiddleware
 from harness.agents.middlewares.tool_arg_coercion import ToolArgCoercionMiddleware
 from harness.agents.middlewares.tool_progress import ToolProgressMiddleware
@@ -45,19 +46,14 @@ from harness.agents.middlewares.view_image import ViewImageMiddleware
 from harness.config.app_config import AppConfig
 
 
-"""
-    中间件组装器（build_middlewares）——按固定顺序装配全部启用的中间件。
+"""中间件组装器
 
-    挂载策略（与各钩子的执行语义对应）：
-      - "wrapper" 型（awrap_model_call / awrap_tool_call）是洋葱包裹：先注册的
-        在外层。因此把"最该先兜底/最外层"的净化、上下文、注入类放前面，
-        护栏、审计、收尾统计放后面；
-      - "before/after" 型按顺序先后执行，顺序即依赖顺序（如：先注入上下文，
-        再注入记忆/上传；先工具进度，后委托账本收账）。
+    职责：读配置，把全部启用的中间件按固定顺序装配成列表返回
+        - wrapper 型是洋葱包裹，先注册的在外层 → 净化 / 上下文 / 注入在前，护栏 / 审计 / 收尾在后
+        - before/after 型按顺序先后执行，顺序即依赖顺序
 
-    每个中间件从 app_config 读取自身配置；个别可选参数（如 tool_progress
-    的 event_sink）通过 kwargs 传入，None 时用默认值。返回按此顺序排列的
-    列表，供 lead_agent 组装时按序挂载。
+    对外暴露：
+        - build_middlewares(app_config, *, event_sink=..., skills_dir=...)
 """
 
 
@@ -85,6 +81,8 @@ def build_middlewares(
         # 边界净化必须排首位（洋葱最外层）：入向历史先于一切中间件修复，
         # 出向响应最后过净化，保证下游读到的是干净 tool_calls 与正文。
         ModelOutputSanitizerMiddleware(),
+        # span 采集紧随净化之后（净化后响应更干净、用量提取更稳）：只观测不改变结果
+        SpanMiddleware(),
         InputSanitizationMiddleware(),
         ThreadContextMiddleware(),
         DynamicContextMiddleware(),

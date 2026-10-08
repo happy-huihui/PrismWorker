@@ -11,9 +11,10 @@ from harness.models.reasoning import (
 
 """DeepSeek 模型实现类
 
-    职责：放 DeepSeek 到底用哪几个模型类，以及“思考链丢失”问题的修复代码。
-    背景：DeepSeek 推理模型多轮对话必须带着上一次的思考内容，
-         官方库会把它弄丢导致请求被拒，这里补回来。
+    职责：定义 DeepSeek 用哪几个模型类，并修复多轮思考链丢失
+        - Flash / Pro 两个实现类
+        - Pro 基类补回上一轮 reasoning_content（官方库会丢，导致请求被拒）
+        - 思考链还原已抽到 harness.models.reasoning，此处 re-export 保持导入路径
 
     对外暴露：
         - DeepSeekFlashChatModel     快速对话模型，不出思考链
@@ -21,9 +22,6 @@ from harness.models.reasoning import (
         - PatchedChatDeepSeek        Pro 用的修复基类
         - is_deepseek_pro_model      精确判断是不是 Pro（deepseek-v4-pro）
         - is_deepseek_flash_model    精确判断是不是 Flash（deepseek-v4-flash）
-
-    复用：思考链还原属通用能力，已抽到 harness.models.reasoning，
-         这里 re-export 保持既有导入路径可用。
 """
 
 # 兼容旧导入路径（内部实现已迁到 reasoning 模块）

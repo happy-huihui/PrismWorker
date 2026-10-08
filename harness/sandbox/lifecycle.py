@@ -1,34 +1,3 @@
-"""沙箱容器生命周期管理（docker CLI）+ 热池（Warm Pool）。
-
-通过宿主机 docker CLI 管理 all-in-one-sandbox 容器：
-    - start()        —— 取用沙箱：活跃缓存命中 → 热池提升 → 新建（带容量闸门）
-    - release()      —— run 结束后回源热池（容器保活，零冷启动复用）
-    - stop()         —— 停止并删除容器（auto 模式；覆盖活跃与热池）
-    - ensure_stopped —— 幂等地停止所有本项目容器
-
-热池机制（对齐参考实现的 warm pool 协议，单进程简化版）：
-    1. 确定性 sandbox_id：调用方传 sandbox_id（如按 thread_id 派生）时，
-       同 id 下次取用直接复用（活跃缓存 / 热池提升），容器不被重复创建；
-    2. 热池回源：release() 把沙箱从活跃摘除放入热池，容器与客户端实例
-       均保持运行（实例可原样复用），供同线程下轮快速取回；
-    3. idle 回收：idle checker 守护线程每 60s 清理闲置超过
-       idle_timeout 的**热池**条目并销毁容器（配置字段真正生效）；
-    4. 容量闸门：活跃 + 热池达到 replicas 上限时新取用先逐出最旧热池
-       条目；热池已空则「共享回退」——借用现有活跃容器（引用计数，
-       借用者在场时不允许回源销毁），保证 replicas=1 时进程内仍只有
-       一台容器（与旧共享语义一致）；
-    5. 孤儿收编：定期扫描运行中但未被本进程跟踪的同前缀容器
-       （进程崩溃遗留），健康后收编进热池复用。
-
-关键点：
-    1. docker 命令前缀可配置（docker_command），Windows 上 docker 在
-       WSL 内，通常需要 ["wsl", "-e", "docker"]。
-    2. 挂载统一用 `--mount type=bind,src=..,dst=..[,readonly]`（不用 `-v`：
-       `-v` 用冒号分隔，与 Windows 盘符路径 `E:\\...` 撞语义）。
-       工作区挂到 /mnt/user-data（可写，per-thread），技能根挂到 /mnt/skills
-       （只读，全线程共享同一份宿主目录）。
-"""
-
 from __future__ import annotations
 
 import logging
@@ -45,6 +14,20 @@ from harness.config.sandbox_config import SandboxConfig
 from harness.config.skills import SkillsConfig
 from harness.sandbox.aio_sandbox import AioSandbox, wait_for_sandbox_ready
 from harness.sandbox.warm_pool import WarmPool
+
+"""沙箱生命周期管理
+
+    职责：用宿主 docker CLI 管理容器生命周期，并维护热池保活复用与闲置治理
+        - 取用顺序：活跃缓存 → 热池提升 → 新建（容量闸门 / 共享回退）
+        - 回源保活与销毁回收
+        - bind 挂载（--mount 而非 -v，避开 Windows 盘符冒号）
+        - idle checker：闲置清理 + 孤儿收编
+        - docker 前缀探测（Windows 走 wsl）
+
+    对外暴露：
+        - SandboxManager       容器生命周期管理器（含热池）
+        - get_sandbox_manager  进程级单例（懒构造、线程安全）
+"""
 
 logger = logging.getLogger(__name__)
 
@@ -165,6 +148,7 @@ class SandboxManager:
         Returns:
             子进程结果
         """
+        # 拼上前缀后统一执行；check=True 时非零退出抛 CalledProcessError
         cmd = self._resolve_docker_cmd() + list(args)
         proc = subprocess.run(cmd, capture_output=True, text=text_output, timeout=300)
         if check and proc.returncode != 0:
@@ -180,6 +164,7 @@ class SandboxManager:
 
     def _make_sandbox(self, instance_id: str, base_url: str) -> AioSandbox:
         """构造 AioSandbox 实例（配置项统一注入点）。"""
+        # 配置项统一在这里注入，避免各处散落读 config
         return AioSandbox(
             id=instance_id,
             base_url=base_url,
@@ -194,6 +179,7 @@ class SandboxManager:
         probe = self._run_docker(
             "inspect", "-f", "{{.State.Running}}", name, check=False
         )
+        # inspect 失败（容器不存在）也算不在运行
         return probe.returncode == 0 and (probe.stdout or "").strip() == "true"
 
 
@@ -356,6 +342,7 @@ class SandboxManager:
         相对路径以**项目根**为基准（不是 CWD）—— 服务可能从任意目录启动，
         用 CWD 会让同一份配置在不同启动方式下挂到不同地方。
         """
+        # 相对路径以项目根为基准（服务可能从任意目录启动，用 CWD 会挂到不同地方）
         path = Path(source).expanduser()
         if not path.is_absolute():
             path = PROJECT_ROOT / path
@@ -491,10 +478,12 @@ class SandboxManager:
         proc = self._run_docker("port", name)
         out = (proc.stdout or "").strip()
         for line in out.splitlines():
+            # 只取容器 API 端口那一条映射
             if str(_CONTAINER_API_PORT) in line:
                 addr = line.split("->", 1)[-1].strip()
                 host, port = addr.rsplit(":", 1)
                 host = host.strip() or "127.0.0.1"
+                # 通配地址换回回环，否则 httpx 连不上
                 if host in ("0.0.0.0", "[::]", "::"):
                     host = "127.0.0.1"
                 return f"http://{host}:{port.strip()}"
@@ -555,6 +544,7 @@ class SandboxManager:
                 warm_targets = self._warm_pool.clear()
                 self._borrowers.clear()
 
+        # 锁内只做状态摘除，docker 调用放锁外（避免持锁跑慢命令）
         for sid in active_targets:
             sbx = self._sandboxes.pop(sid, None)
             self._destroy_container(sbx)
@@ -572,6 +562,7 @@ class SandboxManager:
         """销毁一个沙箱容器（docker rm -f + 实例 close，容错）。"""
         if sbx is None:
             return
+        # 先关客户端再 rm -f；任一步失败都不阻断销毁
         try:
             sbx.close()
         except Exception:  # noqa: BLE001 —— 客户端关闭失败不阻断销毁
@@ -584,6 +575,7 @@ class SandboxManager:
     # ── 闲置治理与孤儿收编（守护线程） ─────────────────────────────────
     def _ensure_idle_checker(self) -> None:
         """懒启动闲置回收守护线程（幂等）。"""
+        # 双检：无锁快路径 + 锁内复核，避免并发启动两个守护线程
         if self._checker_started:
             return
         with self._lock:
@@ -618,6 +610,7 @@ class SandboxManager:
                     self._warm_pool.remove(instance.id)
                     self._destroy_container(instance)
 
+                # 每轮清闲置；每 N 轮再扫一次孤儿（孤儿扫描要跑 docker ps，较贵）
                 self._checker_round += 1
                 if self._checker_round % _ORPHAN_SCAN_EVERY_N_ROUNDS == 0:
                     try:
@@ -644,6 +637,7 @@ class SandboxManager:
         )
         if proc.returncode != 0:
             return
+        # 活跃 + 热池里的都算已跟踪；其余同前缀运行中容器即孤儿
         with self._lock:
             tracked_ids = set(self._sandboxes)
             tracked_ids.update(self._warm_pool.snapshot_sandbox_ids())
@@ -652,6 +646,7 @@ class SandboxManager:
             name = line.strip()
             if not name:
                 continue
+            # 非本项目容器、或已跟踪的，跳过
             instance_id = self._extract_instance_id(name, prefix)
             if instance_id is None or instance_id in tracked_ids:
                 continue
@@ -670,6 +665,7 @@ class SandboxManager:
     @staticmethod
     def _extract_instance_id(container_name: str, prefix: str) -> str | None:
         """从容器名剥离前缀得到实例 id；非本项目容器返回 None。"""
+        # 名字必须以「前缀-」开头，否则不是本项目容器
         if not container_name.startswith(prefix + "-"):
             return None
         instance_id = container_name[len(prefix) + 1 :]
@@ -717,6 +713,7 @@ def get_sandbox_manager(config: SandboxConfig | None = None) -> SandboxManager:
     global _default_manager
     if _default_manager is not None:
         return _default_manager
+    # 双检锁：保证主代理与子代理拿到同一个管理器（子代理要按 id 取回同一容器实例）
     with _manager_lock:
         if _default_manager is None:
             if config is None:

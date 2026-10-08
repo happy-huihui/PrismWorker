@@ -18,6 +18,8 @@ import { clearToken, getToken, meRequest, loginRequest } from '@/core/auth'
 interface AuthContextValue {
   /** 当前登录用户 id（null = 未登录） */
   userId: string | null
+  /** 当前用户是否观测台管理员（显隐「观测台」入口用） */
+  isAdmin: boolean
   /** 启动自证是否进行中（避免闪烁：期间不渲染「未登录」态入口） */
   booting: boolean
   /** 登录弹窗是否打开 */
@@ -33,6 +35,7 @@ const AuthContext = createContext<AuthContextValue | null>(null)
 
 export function AuthProvider({ children }: { children: ReactNode }) {
   const [userId, setUserId] = useState<string | null>(null)
+  const [isAdmin, setIsAdmin] = useState(false)
   const [booting, setBooting] = useState<boolean>(() => !!getToken())
   const [loginOpen, setLoginOpen] = useState(false)
 
@@ -42,7 +45,10 @@ export function AuthProvider({ children }: { children: ReactNode }) {
     let cancelled = false
     meRequest()
       .then((me) => {
-        if (!cancelled) setUserId(me.user_id)
+        if (!cancelled) {
+          setUserId(me.user_id)
+          setIsAdmin(me.is_admin === true)
+        }
       })
       .catch(() => {
         // 401 时 client.ts 已清 token 并广播事件；这里只需收尾 booting
@@ -59,6 +65,7 @@ export function AuthProvider({ children }: { children: ReactNode }) {
   useEffect(() => {
     const onUnauthorized = () => {
       setUserId(null)
+      setIsAdmin(false)
       setLoginOpen(true)
     }
     window.addEventListener('prism:unauthorized', onUnauthorized)
@@ -68,6 +75,7 @@ export function AuthProvider({ children }: { children: ReactNode }) {
   const login = useCallback(async (username: string, password: string) => {
     const res = await loginRequest(username, password)
     setUserId(res.user_id)
+    setIsAdmin(res.is_admin === true)
     setLoginOpen(false)
     return true
   }, [])
@@ -75,14 +83,15 @@ export function AuthProvider({ children }: { children: ReactNode }) {
   const logout = useCallback(() => {
     clearToken()
     setUserId(null)
+    setIsAdmin(false)
   }, [])
 
   const openLogin = useCallback(() => setLoginOpen(true), [])
   const closeLogin = useCallback(() => setLoginOpen(false), [])
 
   const value = useMemo(
-    () => ({ userId, booting, loginOpen, openLogin, closeLogin, login, logout }),
-    [userId, booting, loginOpen, openLogin, closeLogin, login, logout],
+    () => ({ userId, isAdmin, booting, loginOpen, openLogin, closeLogin, login, logout }),
+    [userId, isAdmin, booting, loginOpen, openLogin, closeLogin, login, logout],
   )
   return <AuthContext.Provider value={value}>{children}</AuthContext.Provider>
 }

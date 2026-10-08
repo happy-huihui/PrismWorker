@@ -1,11 +1,3 @@
-"""run 路由（runs）——run 生命周期网关 + SSE 思考链流。
-
-全部委托 harness.runtime.runs.RunManager / harness.runtime.sse_stream.EventBus。
-SSE 桥：GET /runs/{run_id}/stream 订阅 EventBus，把 RunEvent 转成
-text/event-stream 帧（id=seq / event=type / data=json(payload)），
-run_finished / run_error / END 到达后自动收尾；run 已终结时订阅立即结束。
-"""
-
 from __future__ import annotations
 
 import asyncio
@@ -23,6 +15,17 @@ from harness.runtime.runs import (
     RunConflictError,
     RunNotFoundError,
 )
+
+"""run 路由
+
+    职责：run 生命周期网关 + SSE 思考链流
+        - 创建 / 列出 / 查询 / 取消，全部委托 RunManager
+        - GET /runs/{id}/stream 订阅 EventBus，把 RunEvent 转成 SSE 帧
+        - 已终结的 run 直接回一帧终态事件，不订阅
+
+    对外暴露：
+        - router
+"""
 
 router = APIRouter(tags=["runs"])
 
@@ -44,6 +47,7 @@ async def create_run(
 
     线程不存在 → 自动创建元数据（idle）；线程已有未结束 run → 409 冲突。
     """
+    # 1.线程不存在就先补一条元数据（前端可能直接带新 id 起 run）
     meta = store.get(user_id=user_id, thread_id=thread_id)
     if meta is None:
         store.create(user_id=user_id, thread_id=thread_id)
@@ -55,6 +59,7 @@ async def create_run(
             model_name=body.model_name,
             thinking_enabled=body.thinking_enabled,
         )
+    # 2.同线程已有未结束 run → 409；线程不存在 → 404
     except RunConflictError as exc:
         raise HTTPException(status_code=409, detail=str(exc))
     except RunNotFoundError as exc:
@@ -129,14 +134,17 @@ async def stream_run_events(
     补发一遍——前端是拿到 run_id 后才连流，不回放就永远错过首批事件。
     不缓存：响应头显式禁缓 + 禁代理缓冲，否则中间代理会把流式帧攒成一团。
     """
+    # 1.先确认 run 存在，避免订阅一个不存在的流
     record = await service.get_run(run_id)
     if record is None:
         raise HTTPException(status_code=404, detail=f"run 不存在: {run_id}")
 
+    # 2.延迟导入：SSE 库只在真正建流时才需要
     from sse_starlette.sse import EventSourceResponse
 
     async def event_generator():
         """把 EventBus 订阅流转成 SSE 帧。"""
+        # 3.已终结的 run 不订阅：总线录制已释放，直接补一帧终态事件
         if record.status in (RUN_STATUS_FINISHED, RUN_STATUS_CANCELLED, RUN_STATUS_ERROR):
             # 已终结的 run：总线录制已随 run 释放，历史思考链走 /threads/{id}/chains
             if record.status == RUN_STATUS_ERROR:
@@ -161,6 +169,7 @@ async def stream_run_events(
             }
             return
         try:
+        # 4.订阅总线：每个 RunEvent 转一帧（id=seq / event=type / data=json）
             async for event in bus.subscribe(run_id):
                 frame = {
                     "id": str(event.seq),
@@ -171,6 +180,7 @@ async def stream_run_events(
         except asyncio.CancelledError:
             raise
 
+    # 5.显式禁缓存与代理缓冲，否则中间代理会把流式帧攒成一团
     return EventSourceResponse(
         event_generator(),
         headers={
@@ -187,6 +197,7 @@ def _handle_to_record(handle: Any) -> Any:
     create_run 返回的是 RunHandle（内存句柄），响应只需要其公开信息；
     用轻量对象聚合这些字段，避免引入 core 内部类型到 API 层。
     """
+    # 用轻量对象聚合公开字段，避免把 core 内部类型引到 API 层
     from types import SimpleNamespace
 
     return SimpleNamespace(
@@ -202,4 +213,10 @@ def _handle_to_record(handle: Any) -> Any:
         created_at=handle.created_at,
         started_at=None,
         finished_at=None,
+        # 1.观测三字段必须补齐：run_out_from_record 会读 trace_id/total_tokens/cost，
+        #    缺一即 AttributeError（本句柄刚创建，token/成本尚未产生，取零值）。
+        #    trace_id 从 RunHandle 继承（create_run 时已由 TraceMiddleware 绑定）。
+        trace_id=getattr(handle, "trace_id", "") or "",
+        total_tokens=0,
+        cost=0.0,
     )

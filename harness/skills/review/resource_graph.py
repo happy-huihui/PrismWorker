@@ -8,15 +8,14 @@ from harness.skills.package_paths import is_eval_fixture_path
 from harness.skills.review.models import make_finding, normalize_relative_path
 
 
-"""
-    技能包资源引用关系图构建。
+"""技能包资源引用图
 
-    检查包内文本文件之间的引用完整性：
-    - 引用的文件是否存在（resource.missing）
-    - 引用是否越界出包（resource.escaping-link）
-    - 资源文件是否无人引用（resource.unreferenced）
+    职责：检查包内文本文件之间的引用完整性
+        - 引用缺失（resource.missing）/ 越界（resource.escaping-link）
+        - 无人引用的孤儿资源（resource.unreferenced）
 
-    analyzer 在结构检查之后调用此模块，产出资源关系图和检查发现findings，同时将 findings 追加到全局结果。
+    对外暴露：
+        - build_resource_graph   返回 (关系图, findings)
 """
 
 
@@ -65,6 +64,7 @@ def _is_platform_absolute(ref: str) -> bool:
     前缀必须按段边界匹配，避免 `/mnt/user-datafoo` 这类搭车路径蒙混过关。
     """
     for prefix in _PLATFORM_ABSOLUTE_PREFIXES:
+        # 前缀按段边界匹配，避免 /mnt/user-datafoo 蒙混；带 .. 段一律不放行
         if ref == prefix or ref.startswith(prefix + "/"):
             return ".." not in PurePosixPath(ref).parts
     return False
@@ -80,6 +80,7 @@ def _extract_references(content: str) -> set[str]:
     - 行内代码（含 / 的才视为路径）
     - 裸路径 token（以资源目录开头）
     """
+    # 三种来源叠加：Markdown 链接 / 行内代码（含斜杠才算路径）/ 裸路径 token
     refs: set[str] = set()
 
     for m in _MARKDOWN_LINK_RE.finditer(content):
@@ -111,19 +112,23 @@ def _resolve_reference(source_path: str, raw_ref: str) -> str | None:
         - 否则返回规范化后的路径
     """
 
+    # 1.去引号与空白
     ref = raw_ref.strip().strip("\"'")
     if not ref:
         return None
 
     # 提取噪音：`///`、` / ` 这类「只剩斜杠」的 token 不是路径，直接丢弃。
+    # 2.只剩斜杠的 token 不是路径
     if not ref.strip("/"):
         return None
 
+    # 3.锚点、URL、带协议的都不算包内引用
     if ref.startswith("#"):
         return None
     if re.match(r"^[A-Za-z][A-Za-z0-9.+-]*:", ref) or "://" in ref:
         return None
 
+    # 4.绝对路径：平台挂载点放行，其余判越界
     if ref.startswith("/"):
         # 平台刻意挂载的绝对路径（/mnt/user-data、/mnt/skills）属正当去向，不报越界；
         # 其余绝对路径（如 /etc/passwd）仍按越界报告。
@@ -131,6 +136,7 @@ def _resolve_reference(source_path: str, raw_ref: str) -> str | None:
             return None
         return "__ESCAPES__"
 
+    # 5.相对路径按源文件所在目录解析，再过安全净化
     base = PurePosixPath(source_path).parent
     candidate = (base / ref).as_posix()
 
@@ -187,6 +193,7 @@ def build_resource_graph(snapshot: dict) -> tuple[dict, list]:
 
     files: dict[str, dict] = {e["path"]: e for e in snapshot["files"]}
 
+    # 1.nodes：包内全部文件
     nodes = [
         {"path": p, "kind": e.get("kind", "unknown")}
         for p, e in files.items()
@@ -197,6 +204,7 @@ def build_resource_graph(snapshot: dict) -> tuple[dict, list]:
     escaping: set[str] = set()
     referenced: set[str] = set()
 
+    # 2.只分析有内容的文本文件
     for file_path, entry in files.items():
         if entry.get("kind") != "text" or not entry.get("content"):
             continue
@@ -210,12 +218,14 @@ def build_resource_graph(snapshot: dict) -> tuple[dict, list]:
             if resolved == "__ESCAPES__":
                 escaping.add(ref)
                 continue
+            # 3.命中包内文件 → 连边并标记被引用；否则算缺失
             if resolved in files:
                 edges.append({"source": file_path, "target": resolved})
                 referenced.add(resolved)
             else:
                 missing.add(resolved)
 
+    # 4.孤儿：资源目录下、无人引用、且不是 eval 清单或夹具
     orphans: list[str] = []
     for path in files:
         first_seg = path.split("/", 1)[0] if "/" in path else path
@@ -237,6 +247,7 @@ def build_resource_graph(snapshot: dict) -> tuple[dict, list]:
         "orphans": sorted(orphans),
     }
 
+    # 5.三类 finding 都按路径排序后产出（确定性输出）
     findings: list[dict] = []
     for target in sorted(missing):
         findings.append(make_finding(

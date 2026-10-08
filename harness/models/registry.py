@@ -7,8 +7,12 @@ from harness.models.strategy import ChatModelStrategy
 
 """策略注册表
 
-    职责：记一张表，provider 名字 -> 该用哪个策略，工厂来这张表按名字取策略。
-    现状：登记了 openai（及其兼容接口）、deepseek、mimo 三种。
+    职责：维护 provider 名字到创建策略的映射，工厂据此取策略
+        - 登记 openai（及兼容接口）、deepseek、mimo
+
+    对外暴露：
+        - get_strategy         按 provider 取策略实例，未注册返回 None
+        - supported_providers  列出已注册的 provider 标识
 """
 
 # provider 标识 → 策略单例（策略无状态，进程内复用即可）

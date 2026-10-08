@@ -14,14 +14,14 @@ if TYPE_CHECKING:
 
 logger = logging.getLogger(__name__)
 
-"""自定义指令中间件（agent_md）——在每次模型调用前注入用户的 agent.md。
+"""自定义指令中间件
 
-    定位：用户级个人偏好层（对齐 Codex AGENTS.md 全局指令的思路），
-         注入点为主代理系统提示词「末尾」（越靠后权重越高）。
-    链路：resolve_runtime_user_id 解析用户 → AgentMdStore 读取（mtime 缓存）
-         → render_text 包成 <agent_md> 块 → append 到系统消息末尾。
-    容错：best-effort——读失败/无内容/已注入都静默放行，绝不阻断对话。
-    幂等：系统消息已含 <agent_md> 标记则不再注入。
+    职责：每次模型调用前把用户的 agent.md 注入主代理系统提示词末尾
+        - 用户级个人偏好层（对齐 Codex AGENTS.md），越靠后权重越高
+        - 读失败 / 无内容 / 已注入都静默放行，不阻断对话
+
+    对外暴露：
+        - AgentMdMiddleware
 """
 
 # 系统提示里已含该标记则视为已注入，避免重复包裹

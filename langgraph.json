@@ -1,0 +1,7 @@
+{
+  "dependencies": ["."],
+  "graphs": {
+    "lead_agent": "./harness/eval/graph.py:graph"
+  },
+  "env": ".env"
+}

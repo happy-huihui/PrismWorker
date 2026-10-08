@@ -3,12 +3,11 @@ from __future__ import annotations
 from collections.abc import Mapping
 from typing import Any
 
-"""用户上下文解析（user_context）
+"""用户上下文解析
 
-    职责：从 LangChain/LangGraph 的 runtime 里解析当前 user_id，供工具 / 中间件
-         取用（不要从别处硬编码取值）。
-    阶梯：context → config.configurable → 图全局 get_config()，逐级回退；
-         都取不到则归到 DEFAULT_USER_ID。
+    职责：从 LangChain/LangGraph 的 runtime 里解析当前 user_id，供工具与中间件取用
+        - 阶梯：context → config.configurable → 图全局 get_config()，逐级回退
+        - 都取不到则归到 DEFAULT_USER_ID
 
     对外暴露：
         - DEFAULT_USER_ID            缺省用户

@@ -1,5 +1,3 @@
-"""上传文件路由（uploads）。"""
-
 from __future__ import annotations
 
 from typing import Any
@@ -9,6 +7,14 @@ from fastapi import APIRouter, Depends, File, HTTPException, UploadFile
 from app.api.deps import get_paths, get_user_id
 from app.api.schemas import UploadOut
 from app.core.uploads import list_uploads, save_upload
+
+"""上传文件路由
+
+    职责：上传（限 20MB）与列出线程已上传文件
+
+    对外暴露：
+        - router
+"""
 
 router = APIRouter(tags=["uploads"])
 
@@ -28,13 +34,16 @@ async def upload_file(
     paths: Any = Depends(get_paths),
 ) -> UploadOut:
     """上传文件到线程 uploads 目录（目录不存在自动创建）。"""
+    # 1.整体读入内存后再判大小（上限 20MB，可接受）
     data = await file.read()
+    # 2.超限直接 413
     if len(data) > _MAX_UPLOAD_BYTES:
         raise HTTPException(status_code=413, detail="文件超过 20MB 上限")
     try:
         info = save_upload(
             user_id, thread_id, filename=file.filename, data=data, paths=paths
         )
+    # 3.文件名非法 → 422
     except ValueError as exc:
         raise HTTPException(status_code=422, detail=str(exc))
     return UploadOut(**info)
@@ -51,5 +60,6 @@ async def list_thread_uploads(
     paths: Any = Depends(get_paths),
 ) -> list[UploadOut]:
     """列出线程已上传文件（按时间倒序，最新在前）。"""
+    # 时间倒序由 core 层保证
     items = list_uploads(user_id, thread_id, paths=paths)
     return [UploadOut(**i) for i in items]

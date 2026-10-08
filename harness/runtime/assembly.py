@@ -11,16 +11,15 @@ from harness.runtime.sandbox import get_app_sandbox
 from harness.runtime.sse_stream import get_event_bus
 from harness.runtime.threads_data import get_thread_store
 
-"""运行组装根（assembly）
+"""运行组装根
 
-    职责：把散在各 runtime 包的组件，按 harness 配置拼装成一个可运行的
-         RunManager，并提供进程级单例——是「谁来 new 依赖」的唯一落点。
-    背景：runtime 各包不自举、不反向 import app；依赖组装集中在这里，由
-         app 的 FastAPI lifespan 调用（get_run_service），保持分层干净。
+    职责：把散在各 runtime 包的组件按配置拼成一个可运行的 RunManager，是「谁来 new 依赖」的唯一落点
+        - 各包不自举、不反向 import app；依赖组装集中在这里，由 app 的 lifespan 调用
+        - 进程级单例懒建，供启动时复用
 
     对外暴露：
         - build_run_service   组装一个新 RunManager（每次调用新建）
-        - get_run_service     进程级单例（懒建，lifespan 启动/复用）
+        - get_run_service     进程级单例（懒建，线程安全）
         - reset_run_service   重置单例（测试隔离）
 """
 
@@ -56,6 +55,7 @@ def build_run_service(
         app_config=cfg,
         sandbox_provider=get_app_sandbox,
     )
+    # 组装唯一落点：四个依赖全部构造注入，runtime 各包不自己 new
     return RunManager(
         registry=agent_registry,
         threads=threads if threads is not None else get_thread_store(),
@@ -65,10 +65,12 @@ def build_run_service(
 
 
 def get_run_service() -> RunManager:
+    # 快路径：已建好直接返回，不进锁
     """返回进程级 RunManager 单例（懒构造，线程安全）。"""
     global _service
     if _service is not None:
         return _service
+    # 慢路径：加锁双检，避免并发 lifespan 各建一个
     with _service_lock:
         if _service is None:
             _service = build_run_service()
@@ -76,6 +78,7 @@ def get_run_service() -> RunManager:
 
 
 def reset_run_service() -> None:
+    # 置空即可，下次 get_run_service 会重新组装
     """清空单例（测试隔离用：下一次 get_run_service 重新组装）。"""
     global _service
     with _service_lock:

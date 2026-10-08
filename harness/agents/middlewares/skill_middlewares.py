@@ -18,24 +18,16 @@ from harness.skills.frontmatter import split_skill_markdown
 ModelRequest = types.ModelRequest
 
 
-"""
-    技能中间件（skill_middlewares）——技能发现、激活与工具访问策略。
+"""技能中间件
 
-    SkillActivationMiddleware：
-      1. abefore_model 扫描技能目录（{项目根}/skills/public/*/SKILL.md），用
-         frontmatter 解析每个技能的 name/description，把可用技能清单以
-         <available_skills> 结构块注入系统消息，让模型知道可以激活哪些技能；
-      2. awrap_model_call 检测模型输出中的激活指令标签
-         `<activate_skill name="X">`（出现在最新 AI 消息正文里），命中则
-         读取该技能 SKILL.md 的 body 作为指令注入系统消息，并把
-         SkillEntry 写入 state.skill_context（经由 Command 由 reducer 合并），
-         同时追加一条中文进度消息。
+    职责：让模型按需激活技能，并按技能声明控制特权工具的可用性
+        - SkillActivationMiddleware  扫技能目录注入清单 + 解析 <activate_skill> 标签
+        - SkillToolPolicyMiddleware  特权工具须被已激活技能覆盖才放行（默认空集合 = 直通）
 
-    SkillToolPolicyMiddleware：
-      最小访问策略——维护 restricted_tools 集合（"需要技能才可调用"的特权
-      工具，默认空 = 无特权工具、全部放行）。awrap_model_call 里把已激活技能
-      声明可用的工具并与请求工具比对：仅当请求中来自 restricted_tools 的工具
-      都被某个已激活技能覆盖时才放行，否则移除并提示。默认空集合 = 直通。
+    对外暴露：
+        - SkillActivationMiddleware
+        - SkillToolPolicyMiddleware
+        - scan_skills_dir / build_available_skills_block / extract_activation_requests
 """
 
 logger = logging.getLogger(__name__)
@@ -177,19 +169,20 @@ class SkillActivationMiddleware(AgentMiddleware):
         handler: Callable[[ModelRequest[Any]], Awaitable[Any]],
     ) -> Any:
         """包装模型调用：注入技能清单，响应激活指令加载技能正文。"""
-        # 合并公共 + 用户自定义技能，再按用户黑名单过滤
+        # 1.合并公共 + 用户自定义技能，再按用户黑名单过滤
         entries = self._filter_blocked(self._scan_entries(request.runtime), request.runtime)
         system_message = request.system_message
         base_text = system_message.text if system_message is not None else ""
 
+        # 2.尚未注入过技能清单 → 拼入 <available_skills> 块 + 激活提示
+        #    框架与激活提示都取自 harness.prompt（前缀换行由代码控制，与原行为逐字一致）
         needs_injection = _AVAILABLE_MARKER not in base_text
         if needs_injection and entries:
-            # 框架与激活提示都取自 harness.prompt；
-            # 提示前缀的两个换行由代码控制，与原行为逐字一致
             block = build_available_skills_block(entries)
             hint = load_text("skills/activate_hint")
             base_text = f"{block}\n\n{hint}\n\n{base_text}" if base_text else f"{block}\n\n{hint}"
 
+        # 3.响应最新 AI 消息里的激活指令，加载对应技能正文
         activation_names = _find_activations_in_messages(request.messages)
         loaded_sections: list[str] = []
         for name in activation_names:
@@ -207,6 +200,7 @@ class SkillActivationMiddleware(AgentMiddleware):
         if loaded_sections:
             base_text = "\n\n".join(loaded_sections) + "\n\n" + base_text
 
+        # 4.有改动才重建系统消息（避免无谓对象重建）
         if needs_injection or loaded_sections:
             new_system = SystemMessage(content=base_text)
             request = request.override(system_message=new_system)

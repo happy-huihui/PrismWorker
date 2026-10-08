@@ -17,24 +17,15 @@ from langgraph.graph.message import REMOVE_ALL_MESSAGES
 from harness.prompt import render_text
 
 
-"""
-    对话摘要中间件（summarization）——对话超长时把早期消息压成摘要。
+"""对话摘要中间件
 
-    触发条件：消息条数超过 max_messages 或 token 数超过 max_tokens（默认
-    40 条 / 8000 token）。满足其一即触发一次压缩。
-    压缩方式：调用主模型（用户确认：摘要走模型），把「最旧的、需要压缩的
-    那部分消息」交给模型生成一段中文摘要；被压缩的消息用 RemoveMessage
-    清空，保留最近 keep_messages（默认 20）条；摘要正文同时写入
-    state.summary_text（拼接式，保留历史摘要链），并写一条进度消息。
+    职责：消息条数或 token 超阈值时压缩早期消息，保住上下文窗口
+        - 触发：超过 40 条 / 8000 token（满足其一）
+        - 压缩前先把消息冲刷进长期记忆队列，保证「先入记忆、再被压缩」
+        - 保留段不拆散 AI/Tool 消息对；摘要失败回退规则式截断
 
-    记忆联动：压缩前通过 flush_hook（见 harness/memory/integration/middleware.py 的
-    memory_flush_hook）把将被压缩的消息紧急冲刷进长期记忆队列，保证
-    「先入记忆、再被压缩」，压缩不丢信息。flush_hook 缺省为 None，
-    未注入时行为与改造前完全一致。
-
-    安全边界：
-      - 保留段不拆散 AI/Tool 消息对（ToolMessage 必须与发起它的 AI 消息一起保留）；
-      - 摘要生成失败时回退为规则式截断（仍可压缩，不阻断对话）。
+    对外暴露：
+        - SummarizationMiddleware
 """
 
 logger = logging.getLogger(__name__)
@@ -52,7 +43,9 @@ def _find_safe_cutoff(messages: list[AnyMessage], messages_to_keep: int) -> int:
     """
     if len(messages) <= messages_to_keep:
         return 0
+    # 1.目标切割点 = len - keep
     target = len(messages) - messages_to_keep
+    # 2.若该位置是 ToolMessage，向前回退到包含其对应 AI tool_calls 的位置（整对一起压缩）
     while target > 0 and isinstance(messages[target], ToolMessage):
         target -= 1
     return target
@@ -94,20 +87,24 @@ class SummarizationMiddleware(AgentMiddleware):
         self, state: Any, runtime: Any  # type: ignore[override]
     ) -> dict[str, Any] | None:
         """模型调用前：检查是否超长，超长则压缩并返回摘要更新。"""
+        # 1.消息太少不压缩（少于 4 条没有压缩价值）
         messages = (state or {}).get("messages") or []
         if len(messages) < 4:
             return None
 
+        # 2.估算 token；估算失败退化为只按条数判断
         current_tokens = 0
         try:
             current_tokens = count_tokens_approximately(messages)
         except Exception:  # noqa: BLE001 —— 估算失败继续走条数判断
             current_tokens = 0
+        # 3.条数或 token 任一超阈值即触发压缩
         over_message_threshold = len(messages) > self._max_messages
         over_token_threshold = current_tokens > self._max_tokens
         if not (over_message_threshold or over_token_threshold):
             return None
 
+        # 4.找安全切割点（不拆散 AI/Tool 消息对）
         target = _find_safe_cutoff(messages, self._keep_messages)
         if target <= 0:
             return None
@@ -115,13 +112,15 @@ class SummarizationMiddleware(AgentMiddleware):
         to_summarize = messages[:target]
         preserved = messages[target:]
 
-        # 记忆联动：压缩前先把将被移除的消息冲刷进长期记忆队列
+        # 5.记忆联动：压缩前先把将被移除的消息冲刷进长期记忆队列
         #（紧急路径 add_nowait，立即后台提取；失败仅告警不阻断压缩）
         self._fire_flush_hook(to_summarize, runtime)
 
+        # 6.生成摘要并拼进历史摘要链
         summary = await self._summarize(to_summarize)
         combined_summary = _append_summary((state or {}).get("summary_text"), summary)
 
+        # 7.重建消息流：清空全部 → 先放摘要消息 → 再放保留段
         new_summary_msg = SystemMessage(content=f"对话摘要（压缩后）：\n{summary}")
         new_summary_msg.id = str(uuid.uuid4())
         new_messages = [
@@ -177,15 +176,17 @@ class SummarizationMiddleware(AgentMiddleware):
 
     async def _summarize(self, messages: list[AnyMessage]) -> str:
         """把待压缩消息交给模型生成摘要；失败时回退为规则式截断。"""
+        # 1.渲染待压缩消息为文本（失败用内容兜底拼接）
         try:
             from langchain_core.messages.utils import get_buffer_string
 
             rendered = get_buffer_string(messages)
         except Exception:  # noqa: BLE001
             rendered = "\n".join(str(m.content) for m in messages)[:20000]
-        # 摘要模板集中在 harness/prompt，这里只做变量装配（截断到 30000 字）
+        # 2.摘要模板集中在 harness/prompt，这里只做变量装配（截断到 30000 字）
         prompt = render_text("summarizer/summary", {"messages": rendered[:30000]})
 
+        # 3.调模型生成摘要；成功且非空直接返回
         try:
             model = self._load_model()
             response = await model.ainvoke(prompt)
@@ -195,6 +196,7 @@ class SummarizationMiddleware(AgentMiddleware):
         except Exception as exc:  # noqa: BLE001 —— 模型失败不阻断压缩流程
             logger.warning("摘要生成失败，改用规则式压缩: %s", exc)
 
+        # 4.模型失败 → 规则式截断（每条取前 120 字拼接）
         lines: list[str] = []
         for message in messages:
             text = _extract_text(message)

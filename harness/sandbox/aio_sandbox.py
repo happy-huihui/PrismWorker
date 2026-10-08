@@ -1,23 +1,3 @@
-"""基于 Docker all-in-one-sandbox 的 Aio 沙箱实现。
-
-通过 agent_sandbox SDK（Fern 生成的 HTTP 客户端）操作沙箱容器：
-    - shell.exec_command  —— 在容器内执行 bash 命令
-    - file.read_file/write_file —— 读 / 写容器内文件
-    - file.glob_files / grep_files / list_path —— 查找与查看
-
-关键设计：
-    1. 文件操作路径分两类：
-       - **可写工作区** `/mnt/user-data`（读写皆可，per-thread 隔离）
-       - **只读挂载区** `/mnt/skills`（只能读；写入会被拒绝，防止模型改写技能包）
-       两者都不允许 .. 穿越。
-    2. 命令执行失败（非零退出码）不抛异常，而是把退出码和输出
-       原样返回给模型，让模型自行修正（参考成熟工具行为）；
-       只有「连不上沙箱/网络错误」才抛 SandboxConnectionError。
-    3. 输出按配置截断，防止把模型上下文撑爆。
-    4. executor 与 lifecycle 分离：本文件只负责「指挥容器干活」，
-       容器启动/销毁由 lifecycle.py 负责。
-"""
-
 from __future__ import annotations
 
 import logging
@@ -37,6 +17,21 @@ from harness.sandbox.exceptions import (
     SandboxFileError,
     SandboxPathError,
 )
+
+"""沙箱容器客户端
+
+    职责：经 agent_sandbox SDK 操作容器（执行命令 / 读写文件 / 查找），只负责指挥容器干活
+        - 路径白名单与 .. 穿越校验
+        - 命令非零退出原样回给模型；仅连接类失败抛 SandboxConnectionError
+        - 输出按配置截断，防撑爆模型上下文
+        - 容器启停交给 lifecycle
+
+    对外暴露：
+        - GrepMatch              grep 命中（path / line_number / line）
+        - AioSandbox             容器客户端（exec_command / read_file / write_file / glob / grep / list_dir / file_exists）
+        - generate_sandbox_id    生成沙箱实例 id
+        - wait_for_sandbox_ready 轮询直到容器 HTTP 就绪
+"""
 
 logger = logging.getLogger(__name__)
 
@@ -84,6 +79,7 @@ class AioSandbox:
 
     def _get_client(self) -> AioSandboxClient:
         """懒创建 SDK 客户端（首次调用时创建）。"""
+        # 已关闭的实例不允许再发请求（避免用到已释放的连接池）
         if self._closed:
             raise SandboxConnectionError("沙箱已关闭", base_url=self.base_url, cause=None)
         if self._client is not None:
@@ -93,6 +89,7 @@ class AioSandbox:
             self._client = AioSandboxClient(
                 base_url=self.base_url,
                 timeout=client_timeout,
+                # trust_env=False：绕开环境里的 HTTP_PROXY，否则对 localhost 的请求会被代理成 404
                 httpx_client=httpx.Client(timeout=client_timeout, follow_redirects=True, trust_env=False),
             )
         except Exception as exc:  # noqa: BLE001 - 构造失败一律按连接错误处理
@@ -116,6 +113,7 @@ class AioSandbox:
             wrapper = getattr(client, "_client_wrapper", None)
             fern_http = getattr(wrapper, "httpx_client", None)
             real_httpx = getattr(fern_http, "httpx_client", None)
+            # 依次尝试 真实 httpx → Fern 包装 → SDK 客户端，取第一个有 close 的
             target = next(
                 (c for c in (real_httpx, fern_http, client) if c is not None and hasattr(c, "close")),
                 None,
@@ -133,6 +131,7 @@ class AioSandbox:
             return self.home_dir
         if self._home_dir_fetched:
             return self.home_dir or "/"
+        # 标记已查过：查不到也不重复请求（home_dir 缺失不致命）
         self._home_dir_fetched = True
         try:
             ctx = self._get_client().sandbox.get_context()
@@ -155,6 +154,7 @@ class AioSandbox:
         """
         if self._workspace_ensured:
             return
+        # 先探测；不存在才 sudo 建目录并 chown 给当前用户（镜像默认用户无权在 /mnt 下建目录）
         guard = self.exec_command(
             f"test -d {VIRTUAL_PATH_PREFIX} && echo EXISTS || echo MISSING"
         )
@@ -205,6 +205,7 @@ class AioSandbox:
             raise SandboxPathError("路径不能为空", path=path)
         normalized = path.replace("\\", "/").strip().rstrip("/") or "/"
 
+        # 写操作只认可写工作区；读操作额外放行只读技能目录
         allowed_prefixes = [VIRTUAL_PATH_PREFIX.rstrip("/")]
         if not for_write:
             allowed_prefixes.append(SKILLS_CONTAINER_PREFIX.rstrip("/"))
@@ -229,6 +230,7 @@ class AioSandbox:
                 path=path,
             )
 
+        # 逐段查 .. 穿越（只校验命中前缀之后的段）
         for segment in normalized[len(matched) + 1 :].split("/"):
             if segment == "..":
                 raise SandboxPathError(f"路径不允许 .. 穿越: {path!r}", path=path)
@@ -265,6 +267,7 @@ class AioSandbox:
         if exec_dir:
             cwd = self._validate_path(exec_dir)
 
+        # 串行化 shell 调用：容器 shell 是有状态资源，并发执行会互相串输出
         with _shell_lock:
             try:
                 client = self._get_client()
@@ -276,6 +279,7 @@ class AioSandbox:
                 )
                 data = result.data if result else None
             except ApiError as exc:
+                # 4xx 是命令本身的问题（语法 / 权限），当普通输出回给模型改；其余按连接错误抛
                 if exc.status_code and 400 <= exc.status_code < 500:
                     return self._format_error(exc)
                 raise SandboxConnectionError(
@@ -320,6 +324,7 @@ class AioSandbox:
             client = self._get_client()
             kwargs = {}
             if start_line is not None:
+                # SDK 行号 0 起、工具层 1 起，故减 1（负数兜到 0）
                 kwargs["start_line"] = max(start_line - 1, 0)
             if end_line is not None:
                 kwargs["end_line"] = max(end_line, 0)
@@ -360,6 +365,7 @@ class AioSandbox:
         try:
             client = self._get_client()
             self._ensure_workspace()
+            # SDK 写文件不自动建父目录，先 mkdir -p
             parent = safe_path.rsplit("/", 1)[0]
             with _shell_lock:
                 client.shell.exec_command(command=f"mkdir -p {parent}", truncate=True)
@@ -489,6 +495,7 @@ class AioSandbox:
                 pattern=pattern,
                 case_insensitive=not case_sensitive,
                 fixed_strings=literal,
+                # 多取一倍再在本地截断，便于准确判断是否被截断
                 max_results=max_results * 2,
                 recursive=True,
             )
@@ -509,6 +516,7 @@ class AioSandbox:
             ) from exc
 
         matches: list[GrepMatch] = []
+        # 边收边计数，达到上限即标记截断并停止
         for m in raw_matches:
             matches.append(
                 GrepMatch(
@@ -575,6 +583,7 @@ def wait_for_sandbox_ready(
     probe_client: AioSandboxClient | None = None
     while time.monotonic() < deadline:
         try:
+            # 复用同一个探测客户端，避免每次重试都新建连接
             if probe_client is None:
                 probe_client = AioSandboxClient(
                     base_url=base_url,
@@ -582,6 +591,7 @@ def wait_for_sandbox_ready(
                     httpx_client=httpx.Client(timeout=5, follow_redirects=True, trust_env=False),
                 )
             ctx = probe_client.sandbox.get_context()
+            # 能拿到 home_dir 说明 HTTP 服务已就绪
             if ctx and ctx.home_dir:
                 return True
         except Exception:  # noqa: BLE001 - 未就绪时忽略错误继续等待

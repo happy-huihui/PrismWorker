@@ -1,26 +1,17 @@
-"""app 层配置入口（config）——复用 harness 的 AppConfig，不重复造轮子。
-
-harness.config.app_config 已经提供完整配置能力：models / sandbox / memory /
-tools / subagents 子配置聚合、config.yaml 加载链（含 $ENV / ${VAR:default}
-环境变量展开）、无文件时的环境变量回退模型、以及进程级全局单例
-get_app_config()。app 层（run_service / agent_registry / api 网关）需要的
-正是这个被 harness 全链路验证过的配置对象，因此这里只做一层薄转发：
-
-    app.core.config.get_app_config  ──▶  harness.config.app_config.get_app_config
-
-理由：
-  1. 双份配置源必然漂移——app 层再造一份解析 = 维护双倍的模型/沙箱/工具
-     配置逻辑，得不偿失；
-  2. build_lead_agent / AgentRegistry 依赖的就是 harness AppConfig 实例，
-     转发保持「同一份配置、同一份模型决策」。
-
-将来若 app 层需要自己特有的运行参数（如 SSE 心跳、缓存容量、展示开关），
-应放在 app.api 层或新建 app.core.runtime_settings，不混入本模块。
-"""
-
 from __future__ import annotations
 
 from typing import Any
+
+"""app 层配置入口
+
+    职责：薄转发 harness 的 AppConfig，不另造一份配置源
+        - app 与 harness 共用同一份配置、同一份模型决策
+        - 附带启动前的配置校验（致命 / 警告分级）
+
+    对外暴露：
+        - get_app_config / set_app_config / reset_app_config
+        - validate_app_config   返回问题清单（空 = 可用）
+"""
 
 """
     API：
@@ -32,6 +23,7 @@ from typing import Any
 
 def get_app_config() -> Any:
     """返回 app 层使用的全局配置（转发 harness 单例，懒加载线程安全）。"""
+    # 延迟导入 harness 单例，保持 app → harness 单向依赖
     from harness.config.app_config import get_app_config as _h
 
     return _h()
@@ -39,6 +31,7 @@ def get_app_config() -> Any:
 
 def set_app_config(config: Any) -> None:
     """手动设置全局配置（测试或程序化启动时用）。"""
+    # 测试 / 程序化启动时注入显式配置
     from harness.config.app_config import set_app_config as _h
 
     _h(config)
@@ -46,6 +39,7 @@ def set_app_config(config: Any) -> None:
 
 def reset_app_config() -> None:
     """重置全局配置，下次 get_app_config() 重新加载（测试隔离用）。"""
+    # 清空单例，下次调用重新走加载链
     from harness.config.app_config import reset_app_config as _h
 
     _h()
@@ -64,10 +58,12 @@ def validate_app_config(config: Any | None = None) -> list[str]:
     cfg = config if config is not None else get_app_config()
     problems: list[str] = []
 
+    # 1.至少要有模型，否则服务跑不起来
     models = getattr(cfg, "models", None) or []
     if not models:
         problems.append("models 为空：至少需要配置一个模型（复制 config.example.yaml 为 config.yaml 后修改）")
     else:
+        # 2.active_model 必须能在 models 里找到
         active = getattr(cfg, "active_model", None) or ""
         if active:
             matcher = getattr(cfg, "get_model_config", None)
@@ -75,8 +71,10 @@ def validate_app_config(config: Any | None = None) -> list[str]:
             if found is None:
                 problems.append(f"active_model={active!r} 在 models 列表中不存在")
 
+    # 3.sandbox 段缺失只是不挂沙箱工具（警告级）
     sandbox = getattr(cfg, "sandbox", None)
     if sandbox is not None:
+        # 4.镜像与 use 是硬性要求（当前仅支持 aio）
         if not getattr(sandbox, "image", ""):
             problems.append("sandbox.image 为空：需指定 all-in-one-sandbox 镜像")
         if getattr(sandbox, "use", "aio") not in ("aio",):

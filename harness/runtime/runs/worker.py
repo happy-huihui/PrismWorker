@@ -22,21 +22,17 @@ from harness.runtime.serialization import (
     extract_text_content,
 )
 
-"""run 后台执行（runs.worker）
+"""run 后台执行
 
-    职责：驱动一次 agent 图 astream 运行，把 values/messages 帧解析成思考链
-         事件发布到总线，收尾落库、回填线程元数据、发终端事件。
-    流程：设置线程上下文 → 装配本次 run 专属 agent（新建 checkpointer）→
-         astream(["values","messages"]) 逐帧解析 → 结束 flush + finalize。
-    边界：不管理全局句柄/并发簿记（那是 manager 的事），只管单个 run。
+    职责：驱动一次 agent 图 astream 运行，把帧解析成思考链事件发布到总线，收尾落库
+        - 设置线程上下文 → 装配本次 run 专属 agent → astream 逐帧解析 → flush + finalize
+        - values 帧：冲刷未发文本，再对 prints / todos / artifacts 增量去重后发事件
+        - messages 帧：reasoning 与正文按 token 入缓冲、按时间片节流下发
+        - 定性后置：正文先当答复发出，同一条消息出现工具调用时补发 message_retract 降级为叙述
+        - 只管单个 run，不管理全局句柄与并发簿记（那是 manager 的事）
 
-    帧解析要点：
-        - values 帧：先冲刷未发文本，再对 prints / todos / artifacts 做增量去重后发事件；
-        - messages 帧：不再「整轮缓冲后一次发」——模型的思考（reasoning_content）与
-          正文都按 token 入缓冲、按时间片/字数节流下发，带 message_id；
-        - 定性后置：正文先当答复发出（用户立刻看到字流），同一条消息里一旦出现
-          工具调用，补发 message_retract 让前端把这段文本降级成思考叙述；
-        - 收尾 flush 保证最后一轮不漏发。
+    对外暴露：
+        - run_worker
 """
 
 logger = logging.getLogger(__name__)
@@ -95,6 +91,16 @@ async def run_worker(
     handle._run_started_wall = time.time()
     await store.update(run_id, fields={"status": RUN_STATUS_RUNNING, "started_at": time.time()})
 
+    # 结构化日志：run 开始执行
+    from harness.observability import get_observability_logger
+
+    get_observability_logger("prism.run").info(
+        "run_started",
+        run_id=run_id,
+        thread_id=thread_id,
+        model_name=handle.model_name,
+    )
+
     final_values: dict[str, Any] | None = None
     agent: Any = None
     checkpointer: Any = None
@@ -150,26 +156,34 @@ async def run_worker(
 
     # 运行阶段：正常/取消/异常分别收尾；finally 里回传产物、沙箱回源
     try:
-        with run_context(run_id, thread_id):
-            config: dict[str, Any] = {
-                "configurable": {
-                    "thread_id": thread_id,
-                    "user_id": handle.user_id,
+        from harness.observability import context as obs_context
+
+        with obs_context.bind_run(
+            trace_id=getattr(handle, "trace_id", "") or "",
+            run_id=run_id,
+            thread_id=thread_id,
+            user_id=handle.user_id,
+        ):
+            with run_context(run_id, thread_id):
+                config: dict[str, Any] = {
+                    "configurable": {
+                        "thread_id": thread_id,
+                        "user_id": handle.user_id,
+                    }
                 }
-            }
-            inputs: dict[str, Any] = {"messages": converted}
-            if live_sandbox is not None:
-                inputs["sandbox"] = {"sandbox_id": str(live_sandbox.id)}
-            async for mode, chunk in agent.astream(
-                inputs,
-                config=config,
-                stream_mode=["values", "messages"],
-            ):
-                if mode == "values":
-                    final_values = chunk
-                    await _handle_values(handle, chunk, bus=bus)
-                elif mode == "messages":
-                    await _handle_message_chunk(handle, chunk, bus=bus)
+                inputs: dict[str, Any] = {"messages": converted}
+                if live_sandbox is not None:
+                    inputs["sandbox"] = {"sandbox_id": str(live_sandbox.id)}
+                async for mode, chunk in agent.astream(
+                    inputs,
+                    config=config,
+                    stream_mode=["values", "messages"],
+                ):
+                    if mode == "values":
+                        final_values = chunk
+                        await _handle_values(handle, chunk, bus=bus)
+                    elif mode == "messages":
+                        await _handle_message_chunk(handle, chunk, bus=bus)
         await _finalize(
             handle,
             status=RUN_STATUS_FINISHED,
@@ -391,6 +405,7 @@ def _stage_text(
         round_ns: 当前模型轮次的 checkpoint_ns（与 message_id 合成轮次键）
         delta: 本次到达的文本片段
     """
+    # 按「类型 + 消息 + 轮次」分桶累计，同桶的增量最终拼成一段待发文本
     key = (kind, message_id, round_ns)
     handle._text_pending[key] = handle._text_pending.get(key, "") + delta
     # 正文累计台账：收尾算答复预览时要按它剔除被降级的轮次
@@ -427,6 +442,7 @@ async def _flush_text(
     """
     if not handle._text_pending:
         return
+    # 按固定顺序（先思考后正文）逐类发送，保证前端渲染顺序与模型输出一致
     for kind in _TEXT_KIND_ORDER:
         keys = [
             key
@@ -435,6 +451,7 @@ async def _flush_text(
             and (message_id is None or key[1] == message_id)
             and (round_ns is None or key[2] == round_ns)
         ]
+        # pop 即出队：发出去就不再留在缓冲里，避免下一轮重复下发
         for key in keys:
             text = handle._text_pending.pop(key, "")
             if not text:
@@ -664,6 +681,22 @@ async def _finalize(
                 payload=payload,
             )
         )
+    # 结构化日志：run 终态（观测中台按事件动词聚合）
+    from harness.observability import get_observability_logger
+
+    _event_name = {
+        RUN_STATUS_FINISHED: "run_finished",
+        RUN_STATUS_CANCELLED: "run_cancelled",
+        RUN_STATUS_ERROR: "run_error",
+    }.get(status, "run_finished")
+    get_observability_logger("prism.run").info(
+        _event_name,
+        run_id=run_id,
+        thread_id=thread_id,
+        status=status,
+        message_count=message_count,
+        error=error,
+    )
     await bus.publish_end(run_id)
 
 

@@ -21,21 +21,17 @@ from harness.skills.review.models import (
 from harness.skills.review.resource_graph import build_resource_graph
 
 
-"""
-    技能包确定性分析器。定位：审查流水线的"大脑"。
-    snapshot → facts：
-        把 readers 产出的 snapshot（快照，含每个文件的路径/内容/类型/哈希）
-        做一套纯逻辑（非 LLM）分析，产出 review-facts.v1 事实字典。
+"""技能包确定性分析器
 
-    处理链：
-        1. 找根 SKILL.md → 解析 frontmatter → 检查 name/description/body 合法性
-        2. 禁止嵌套 SKILL.md（eval fixture 下的豁免）
-        3. 包级安全检查：符号链接 / 嵌套压缩包 / 隐藏敏感文件
-        4. 委托 resource_graph 检查资源引用完整性
-        5. 委托 eval_schema 检查评测清单
-        6. 计算包指纹 + 汇总 findings
+    职责：审查流水线的大脑——把 snapshot 跑成 review-facts.v1 事实字典（纯逻辑，不用 LLM）
+        - 根 SKILL.md：frontmatter 合法性 + name / description / body
+        - 禁嵌套 SKILL.md（evals/fixtures 豁免）
+        - 包级安全：symlink / 嵌套压缩包 / 隐藏敏感文件
+        - 资源引用与 eval 清单分别委托 resource_graph / eval_schema
+        - 计算包指纹并汇总 findings
 
-    analyzer 产出的 facts 后续交给 renderer 生成人类可读报告。
+    对外暴露：
+        - analyze_skill_package   snapshot → facts
 """
 
 
@@ -67,6 +63,7 @@ def _valid_skill_name(name: str) -> bool:
         "My Skill"         → False（有大写和空格）
         "a" * 65           → False（超长）
     """
+    # 超长直接拒（上限防目录名过长）
     if len(name) > _MAX_SKILL_NAME_LENGTH:
         return False
     return bool(_VALID_NAME_RE.match(name))
@@ -80,6 +77,7 @@ def _is_nested_archive(path: str) -> bool:
 
     只判断路径后缀，不读文件内容，轻量级检查。
     """
+    # 只判后缀不读内容，轻量
     lower = path.lower()
     for ext in _NESTED_ARCHIVE_EXTS:
         if lower.endswith(ext):
@@ -100,6 +98,7 @@ def _is_hidden_sensitive_path(path: str) -> bool:
         "references/guide.md" → False
         "config/.npmrc"       → True
     """
+    # 任一段命中黑名单即算（如 scripts/.env）
     parts = path.replace("\\", "/").split("/")
     return any(p in _HIDDEN_SENSITIVE_NAMES for p in parts)
 
@@ -125,6 +124,7 @@ def _analyze_skill_md(content: str, findings: list) -> str | None:
 
     parts: SkillMarkdownParts | None
     error: str | None
+    # 1.frontmatter 不合法属致命问题，直接返回（后续检查无从谈起）
     parts, error = split_skill_markdown(content)
 
     if error is not None or parts is None:
@@ -141,6 +141,7 @@ def _analyze_skill_md(content: str, findings: list) -> str | None:
     metadata = parts.metadata
     body = parts.body
 
+    # 2.未允许的字段只告警，不影响可用性
     unknown_fields = set(metadata.keys()) - ALLOWED_FRONTMATTER_PROPERTIES
     for field in sorted(unknown_fields):
         findings.append(make_finding(
@@ -151,6 +152,7 @@ def _analyze_skill_md(content: str, findings: list) -> str | None:
             remediation=f"Remove the '{field}' field or rename it to an allowed field.",
         ))
 
+    # 3.name 缺失是 blocker；存在但不合规是 error
     name = metadata.get("name")
     if not name or not isinstance(name, str) or not name.strip():
         findings.append(make_finding(
@@ -174,6 +176,7 @@ def _analyze_skill_md(content: str, findings: list) -> str | None:
     else:
         declared_name = name.strip()
 
+    # 4.description 缺失 blocker；超长 error
     description = metadata.get("description")
     if not description or not isinstance(description, str) or not description.strip():
         findings.append(make_finding(
@@ -193,6 +196,7 @@ def _analyze_skill_md(content: str, findings: list) -> str | None:
             remediation=f"Shorten the description to at most {_MAX_DESCRIPTION_LENGTH} characters.",
         ))
 
+    # 5.body 为空说明技能没有实际指令
     if not body or not body.strip():
         findings.append(make_finding(
             rule_id="structure.empty-body",
@@ -236,8 +240,10 @@ def analyze_skill_package(snapshot: dict) -> dict:
     findings: list[dict] = []
     analyzer_errors: list[dict] = []
 
+    # 1.文件列表转成 path → entry 映射，便于 O(1) 取根文件
     files: dict[str, dict] = {e["path"]: e for e in snapshot["files"]}
 
+    # 2.根 SKILL.md：缺失 / 非文本 / 正常，三分支处理
     root_skill = files.get("SKILL.md")
     declared_name: str | None = None
 
@@ -261,6 +267,7 @@ def analyze_skill_package(snapshot: dict) -> dict:
         content = root_skill.get("content") or ""
         declared_name = _analyze_skill_md(content, findings)
 
+    # 3.嵌套 SKILL.md 是 blocker；夹具目录下的豁免
     for path, entry in files.items():
         if path == "SKILL.md":
             continue
@@ -277,6 +284,7 @@ def analyze_skill_package(snapshot: dict) -> dict:
                         "if it is a test fixture.",
         ))
 
+    # 4.包级安全：symlink / 嵌套压缩包 / 隐藏敏感文件
     for path, entry in files.items():
         if entry.get("kind") == "symlink":
             findings.append(make_finding(
@@ -304,17 +312,20 @@ def analyze_skill_package(snapshot: dict) -> dict:
                             "included in the skill package.",
             ))
 
+    # 5.委托资源图与 eval 清单检查，findings 一并汇总
     resources, resource_findings = build_resource_graph(snapshot)
     findings.extend(resource_findings)
 
     evals, eval_findings = analyze_eval_manifests(snapshot)
     findings.extend(eval_findings)
 
+    # 6.算整包指纹并补进 subject（跨机器比对用）
     package_digest = compute_package_digest(snapshot)
     subject = dict(snapshot.get("subject", {}))
     subject["declared_name"] = declared_name or subject.get("display_ref", "unknown")
     subject["package_digest"] = package_digest
 
+    # 7.统一排序 + 统计，保证输出确定性
     findings = sort_findings(findings)
     summary = summarize_findings(findings)
 

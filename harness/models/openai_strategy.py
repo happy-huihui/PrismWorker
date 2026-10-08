@@ -10,12 +10,14 @@ from harness.models.strategy import ChatModelStrategy
 
 """OpenAI 模型创建策略
 
-    职责：负责 openai 这一家（及任何 OpenAI 兼容端点）的模型怎么造。
-    流程：把工厂合并好的参数直接交给 ChatOpenAI；只有「开思考」时多一步——
-         下发 reasoning_effort，让推理档（如 gpt-6-astra）真的走深度推理。
+    职责：负责 openai 这一家（及任何 OpenAI 兼容端点）的模型怎么造
+        - 参数直接交给 ChatOpenAI
+        - 开思考时下发 reasoning_effort
+        - 不开思考时不发任何参数，保持原有行为
 
-    思考：不开思考时不发任何参数，保证普通对话（含指向第三方兼容代理的
-         base_url）行为与改造前完全一致，不引入额外风险。
+    对外暴露：
+        - OpenAIChatModelStrategy   provider="openai" 的策略
+        - THINKING_REASONING_EFFORT 开思考时的推理强度
 """
 
 # 开思考时的推理强度（gpt-6-astra 的 reasoning.effort 支持 low/medium/high/xhigh/max）
@@ -46,15 +48,15 @@ class OpenAIChatModelStrategy(ChatModelStrategy):
         返回：
             ChatOpenAI 实例
         """
-        # 空串视为「没配」：剔掉后由 ChatOpenAI 自行回退环境变量 / 官方地址，
-        # 否则空 base_url 会被当成真实地址拼出坏请求
+        # 1.空串视为「没配」：剔掉后由 ChatOpenAI 自行回退环境变量 / 官方地址，
+        #    否则空 base_url 会被当成真实地址拼出坏请求
         for key in ("api_key", "base_url"):
             if not settings.get(key):
                 settings.pop(key, None)
 
-        # 开思考：下发推理强度；不覆盖调用方显式给的值
+        # 2.开思考：下发推理强度；不覆盖调用方显式给的值
         if thinking_enabled:
             settings.setdefault("reasoning_effort", THINKING_REASONING_EFFORT)
 
-        # 使用配置和额外参数实例化 ChatOpenAI
+        # 3.使用配置和额外参数实例化 ChatOpenAI
         return ChatOpenAI(**settings, **kwargs)

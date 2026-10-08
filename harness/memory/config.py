@@ -1,27 +1,22 @@
-"""记忆后端私有配置（PrismMemConfig）。
-
-Host 共享字段在 ``harness/config/memory_config.py`` 的 ``MemoryConfig`` 上，
-本模块是「记忆后端」自己的全部调优参数，由 ``MemoryConfig.backend_config``
-（dict）解析而来——与参考实现的后端私有配置职责一致：共享 schema 不
-泄漏后端旋钮，后端不依赖 host 字段。
-
-字段分组：
-    - 存储：storage_path（空 = {数据根目录}/data，见 paths.py）
-    - 队列：debounce_seconds / queue_max_depth（异步防抖与背压）
-    - 事实：max_facts / fact_confidence_threshold（容量与置信度门槛）
-    - 注入：max_injection_tokens / guaranteed_categories /
-      guaranteed_token_budget（注入预算与必保类别）
-    - 增量：watermark_max_keys（水位线 LRU 上限）
-    - 模板：patterns_dir / prompts_dir（覆盖内置信号模式与提示词）
-    - 模型：model（记忆提取模型名；None = 复用主模型）
-"""
-
 from __future__ import annotations
 
 import logging
 from typing import Any
 
 from pydantic import BaseModel, Field, model_validator
+
+"""记忆后端私有配置
+
+    职责：承载「记忆后端」自己的全部调优参数，由 MemoryConfig.backend_config 解析而来
+        - 存储路径、队列防抖与背压
+        - 事实容量与置信度门槛
+        - 注入预算与必保类别
+        - 水位线缓存上限、模板目录、提取模型
+
+    对外暴露：
+        - PrismMemConfig                        后端私有配置
+        - PrismMemConfig.from_backend_config    从 host 的 backend_config 解析（未知 key 告警）
+"""
 
 logger = logging.getLogger(__name__)
 
@@ -107,6 +102,7 @@ class PrismMemConfig(BaseModel):
     @model_validator(mode="after")
     def _validate_storage_path(self) -> PrismMemConfig:
         """storage_path 是根目录而非文件（与参考实现一致，防手误把文件路径填进来）。"""
+        # 只在填了值时才校验；留空走默认数据目录
         if self.storage_path:
             from pathlib import Path
 
@@ -122,10 +118,14 @@ class PrismMemConfig(BaseModel):
     @classmethod
     def from_backend_config(cls, backend_config: dict[str, Any] | None) -> PrismMemConfig:
         """从 MemoryConfig.backend_config 解析；未知 key 告警（防拼写错误静默回退）。"""
+        # 没配就全用默认值
         if not backend_config:
             return cls()
+        # 拷贝一份，避免改动调用方传进来的 dict
         config_dict = dict(backend_config)
+        # 只保留认识的字段；值为 None 的丢掉，让 pydantic 走默认值
         known = {k: v for k, v in config_dict.items() if k in cls.model_fields and v is not None}
+        # 不认识的 key 只告警不报错，避免拼错一个字母就起不来
         unknown = sorted(k for k in config_dict if k not in cls.model_fields)
         if unknown:
             logger.warning(

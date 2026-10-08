@@ -7,12 +7,15 @@ from pathlib import Path
 logger = logging.getLogger(__name__)
 
 
-"""
-    文档大纲提取 —— 从转换后的 .md 文件里抽出标题结构（outline）。
+"""文档大纲提取
 
-    整个模块只做两件事：
-        1. extract_outline       从一个 .md 文件提取标题标题 -> list({title, line})
-        2. extract_outline_for_file 按文件名找到同名 .md 转换产物，有则提取大纲，没有则取前几行做内容预览
+    职责：从转换后的 .md 里抽出标题结构（outline），供上传文件清单展示
+        - 识别三种标题风格：标准 # 标题、纯加粗结构标题、拆分加粗标题
+        - 超过 MAX_OUTLINE_ENTRIES 追加截断哨兵；无标题时退回前几行预览
+
+    对外暴露：
+        - extract_outline           从 .md 提取标题列表
+        - extract_outline_for_file  按文件找同名 .md，返回 (大纲, 兜底预览)
 """
 
 _BOLD_HEADING_RE = re.compile(r"^\*\*((ITEM|PART|SECTION|SCHEDULE|EXHIBIT|APPENDIX|ANNEX|CHAPTER)\b[A-Z0-9 .,\-]*)\*\*\s*$")
@@ -36,6 +39,7 @@ def _clean_bold_title(raw: str) -> str:
         "**UNITED STATES** **SECURITIES**" → "UNITED STATES SECURITIES"
         "plain text"                       → "plain text"（未变化）
     """
+    # 先把相邻加粗碎片 **A** **B** 合并成一个 span
     merged = re.sub(r"\*\*\s*\*\*", " ", raw).strip()
     if m := re.fullmatch(r"\*\*(.+?)\*\*", merged, re.DOTALL):
         return m.group(1).strip()
@@ -72,21 +76,25 @@ def extract_outline(md_path: Path) -> list[dict]:
                 if not stripped:
                     continue
 
+                # 1.标准 Markdown 标题（# 开头），行内加粗残留交给 _clean_bold_title
                 if stripped.startswith("#"):
                     title = _clean_bold_title(stripped.lstrip("#").strip())
                     if title:
                         outline.append({"title": title, "line": lineno})
 
+                # 2.纯加粗结构标题（SEC 申报常见，pymupdf4llm 提不成 # 标题）
                 elif m := _BOLD_HEADING_RE.match(stripped):
                     title = m.group(1).strip()
                     if title:
                         outline.append({"title": title, "line": lineno})
 
+                # 3.拆分加粗标题：章节号与标题文本在底层被拆成两个 span
                 elif _SPLIT_BOLD_HEADING_RE.match(stripped):
                     title = " ".join(re.findall(r"\*\*([^*]+)\*\*", stripped))
                     if title:
                         outline.append({"title": title, "line": lineno})
 
+                # 4.超过上限：把最后一条换成截断哨兵并停止
                 if len(outline) > MAX_OUTLINE_ENTRIES:
                     outline.pop()
                     outline.append({"truncated": True})
@@ -109,15 +117,18 @@ def extract_outline_for_file(file_path: Path) -> tuple[list[dict], list[str]]:
         - preview：.md 的前几行非空内容，大纲为空时用作内容锚点，让 Agent
           有点上下文。大纲非空时为空（不需要兜底）。
     """
+    # 找同名 .md（上传转换管线的产物）
     md_path = file_path.with_suffix(".md")
     if not md_path.is_file():
         return [], []
 
     outline = extract_outline(md_path)
+    # 有标题就用标题，不再给预览
     if outline:
         logger.debug("Extracted %d outline entries from %s", len(outline), file_path.name)
         return outline, []
 
+    # 无标题才退回前几行非空内容当锚点
     preview: list[str] = []
     try:
         with md_path.open(encoding="utf-8") as f:

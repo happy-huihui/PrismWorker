@@ -1,15 +1,14 @@
 from __future__ import annotations
 
 
-"""
-    上传管理 —— 判定"暂存文件"。
+"""上传文件管理
 
-    网关侧在上传过程中会先生成一个带标记的临时文件（暂存文件），等上传完成
-    再落盘成正式文件。list_uploaded_files 扫描上传目录时，必须能识别并排除这些
-    半成品，避免把还没传完的文件当正式历史文件返回给 Agent。
+    职责：判定网关上传过程中的暂存文件（`.upload-<随机>.part`）
+        - list_uploaded_files 扫描上传目录时用它排除半成品
+        - 只保留本项目需要的一段判定逻辑
 
-    这里只保留最需要的一段判定逻辑（is_upload_staging_file + 两个前缀/后缀常量），
-    DeerFlow 的 uploads/manager 还有几十个上传管理函数，本项目暂不需要，不展开。
+    对外暴露：
+        - is_upload_staging_file / UPLOAD_STAGING_PREFIX / UPLOAD_STAGING_SUFFIX
 """
 
 UPLOAD_STAGING_PREFIX = ".upload-"
@@ -27,4 +26,5 @@ def is_upload_staging_file(filename: str) -> bool:
     2. 再用 endswith 检查是否带暂存后缀
     3. 两者都满足才判定是真暂存文件
     """
+    # 前缀 + 后缀都命中才算暂存文件（只看一个容易误伤正式文件）
     return filename.startswith(UPLOAD_STAGING_PREFIX) and filename.endswith(UPLOAD_STAGING_SUFFIX)

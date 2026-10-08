@@ -15,14 +15,13 @@ log_level: INFO                    # 日志级别（DEBUG / INFO / WARNING / ERR
 active_model: mimo-pro             # 激活档：路由未命中或规则关闭时的兜底模型
 
 # 模型清单。每个条目 = 一个可被 active_model / routing 选中的「档位」。
-# provider 决定用哪个策略实例化（openai / deepseek / mimo，见 harness/models/registry.py）
 models:
-  # --- MiMo（小米，OpenAI 兼容；当前默认档）---
+  # --- MiMo ---
   - name: mimo-pro                 # 档位名（路由与 active_model 引用它）
     provider: mimo
     model: ${MIMO_PRO_MODEL:mimo-v2.6-pro}   # 最新 pro 档，默认即输出 reasoning_content
     base_url: ${MIMO_BASE_URL:https://api.xiaomimimo.com/v1}   # OpenAI 兼容接口根地址
-    api_key: ${MIMO_API_KEY:}      # 密钥；留空回退环境变量 MIMO_API_KEY
+    api_key: ${MIMO_API_KEY:}      # 密钥
     supports_vision: false         # 暂未接视觉输入
     supports_thinking: true        # 输出思考链（无需下发开关参数，传了反而退化）
     context_window: 131072         # 上下文窗口(token)
@@ -37,7 +36,7 @@ models:
     context_window: 131072
     max_tokens: 16384
 
-  # --- DeepSeek（备选推理档）---
+  # --- DeepSeek ---
   - name: deepseek-pro
     provider: deepseek
     model: ${DEEPSEEK_PRO_MODEL:deepseek-v4-pro}   # 推理档，输出思考链
@@ -45,7 +44,7 @@ models:
     supports_vision: false
     supports_thinking: true        # 开思考时下发 reasoning_effort=high
     context_window: 65536
-    max_tokens: 16384              # 同上：推理档思维链更长，需要足够输出预算
+    max_tokens: 16384
   - name: deepseek-flash
     provider: deepseek
     model: ${DEEPSEEK_FLASH_MODEL:deepseek-v4-flash}   # 快速档，不出思考链
@@ -55,12 +54,12 @@ models:
     context_window: 65536
     max_tokens: 16384
 
-  # --- OpenAI 兼容（默认指向官方，可用 OPENAI_BASE_URL 改指代理）---
+  # --- OpenAI ---
   - name: openai-default
     provider: openai
     model: ${OPENAI_MODEL:gpt-6-astra}
-    base_url: ${OPENAI_BASE_URL:}  # 兼容接口地址；留空走官方
-    api_key: ${OPENAI_API_KEY:}    # 密钥；留空回退 OPENAI_API_KEY
+    base_url: ${OPENAI_BASE_URL:}
+    api_key: ${OPENAI_API_KEY:}    # 密钥
     supports_vision: true          # 支持图像输入
     supports_thinking: true        # 支持推理；开思考时下发 reasoning.effort=high
     context_window: 1050000        # 上下文窗口(token)
@@ -150,7 +149,7 @@ memory:
   root_dir: null                   # 记忆数据根目录；null → {数据根}/data
   checkpoints_db_file: checkpoints.db  # 短期记忆 checkpoint 库文件名
   max_results: 5                   # 记忆检索条数上限
-  backend_config:                  # 记忆后端私有参数（非共享字段，放这里）
+  backend_config:                  # 记忆后端私有参数
     debounce_seconds: 30           # 两次提取之间的去抖窗口(秒)
     queue_max_depth: 1000          # 提取队列最大深度
     max_facts: 100                 # 单用户保留的事实条数上限
@@ -177,7 +176,7 @@ tools:
     enabled: true                  # 是否启用生图工具
     api_key: ${ARK_API_KEY:}       # 方舟密钥（从 .env 的 ARK_API_KEY 读取，勿硬编码提交）
     base_url: https://ark.cn-beijing.volces.com/api/v3  # 方舟 OpenAI 兼容根地址
-    model: ${ARK_IMAGE_MODEL:doubao-seedream-5-0-pro-260628}  # 生图模型 ID（Seedream 5.0 Pro）
+    model: ${ARK_IMAGE_MODEL:doubao-seedream-5-0-pro-260628}  # 生图模型 （Seedream 5.0 Pro）
     size: "2K"
     watermark: false               # 是否加 AI 水印
     response_format: url           # 返回格式：url（24h 有效） / b64_json
@@ -197,3 +196,26 @@ subagents:
       timeout_seconds: 600
       max_turns: 30
       token_budget: null           # token 预算；null=不限制
+
+
+# ──────────────────────── 8. 观测 ────────────────────────
+observability:
+  # 管理员 user_id 列表：观测台入口仅对这些人显示，且能看到所有用户数据。
+  admin_user_ids: [huihui]
+  # 模型成本价格表：每百万 token 美元价（input / output），模型标识按子串匹配。
+  pricing:
+    mimo-v2.6-pro:                 # 小米 MiMo 官方海外价
+      input: 0.435
+      output: 0.87
+    mimo-v2.6-flash:
+      input: 0.14
+      output: 0.28
+    deepseek-v4-pro:               # DeepSeek V4-Pro 空闲档
+      input: 0.66
+      output: 1.98
+    deepseek-v4-flash:             # DeepSeek V4.1-Flash（v4-flash 已路由至此）
+      input: 0.15
+      output: 0.60
+    gpt-6-astra:                   # OpenAI 官方
+      input: 10.00
+      output: 50.00

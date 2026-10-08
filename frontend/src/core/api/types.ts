@@ -34,6 +34,12 @@ export interface RunOut {
   created_at: number
   started_at: number | null
   finished_at: number | null
+  /** 观测：trace_id（一次 HTTP 请求的观测关联 id） */
+  trace_id?: string
+  /** 观测：累计 token 总量 */
+  total_tokens?: number
+  /** 观测：估算成本（美元） */
+  cost?: number
 }
 
 export interface RunCreateBody {

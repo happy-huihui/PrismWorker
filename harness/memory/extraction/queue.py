@@ -14,19 +14,20 @@ if TYPE_CHECKING:
 
 logger = logging.getLogger(__name__)
 
-"""记忆更新防抖队列（extraction.queue）
+"""记忆更新防抖队列
 
-    职责：把「一轮对话」缓冲成「一次提取」——异步、防抖、合并、背压。
-    流程：
-        1. add            入队并重置防抖计时器；窗口内同 (thread,user) 多次入队合并
-                          （新消息覆盖旧消息，信号并集保留）；
-        2. add_nowait     紧急冲刷（摘要压缩前）：立即处理且 bypass 水位线，与普通更新共存；
-        3. 背压           深度达 queue_max_depth 时只拒「非信号」普通更新（抛 QueueFull，下轮重喂），
-                          信号更新永远准入——重要记忆不因拥堵丢失；
-        4. _process_queue Timer 线程逐个调 updater.update_memory（同步 LLM，项间 0.5s 防限流）；
-        5. flush_sync     优雅关闭时在守护线程有界排空，避免丢缓冲里的更新。
-    线程模型：入队即快照 user_id（Timer 线程不继承 ContextVar）；共享状态全走锁；
-         纯内存队列，非优雅退出丢尾属可接受（best-effort）。
+    职责：把「一轮对话」缓冲成「一次提取」——异步、防抖、合并、背压
+        - add 重置防抖计时器，窗口内同 (thread,user) 合并（新消息覆盖、信号取并集）
+        - 背压满只拒「非信号」新项（抛 QueueFull 下轮重喂），信号永远准入
+        - add_nowait 紧急冲刷（摘要压缩前），bypass 水位线且与普通项共存
+        - _process_queue 在 Timer 线程逐项同步提取，项间 0.5s 防限流
+        - flush_sync 优雅关闭时有界排空
+
+    对外暴露：
+        - QueueFull             背压满异常
+        - queue_key             防抖合并的身份键
+        - ConversationContext   一份待处理对话（入队即快照）
+        - MemoryUpdateQueue     队列本体
 """
 
 
@@ -39,6 +40,7 @@ def queue_key(
     user_id: str | None,
 ) -> tuple[str, str | None]:
     """防抖合并的身份键（本项目单 Agent，不需要 agent 维度）。"""
+    # 单 Agent 架构下身份键只需 线程 + 用户
     return (thread_id, user_id)
 
 
@@ -268,6 +270,7 @@ class MemoryUpdateQueue:
 
     def flush_nowait(self) -> None:
         """后台立即开始处理（不等待）。"""
+        # 延时 0 = 下一拍立即触发（调用方不等待处理完成）
         with self._lock:
             self._schedule_timer(0)
 
@@ -299,10 +302,12 @@ class MemoryUpdateQueue:
         def _run() -> None:
             nonlocal success
             try:
+                # 跳过项间 sleep，尽快清完
                 self.flush(skip_inter_item_delay=True)
                 success = True
             except Exception:  # noqa: BLE001
                 logger.exception("记忆队列关闭排空失败")
+                # 无论成败都置位，让等待方拿回超时控制权
             finally:
                 done.set()
 
@@ -331,10 +336,12 @@ class MemoryUpdateQueue:
     def pending_count(self) -> int:
         """待处理项数量。"""
         with self._lock:
+            # 只统计尚未被 worker 换出的项
             return len(self._items)
 
     @property
     def is_processing(self) -> bool:
         """是否正在处理。"""
         with self._lock:
+            # 是否有 worker 正在处理（含已换出的在飞批次）
             return self._processing

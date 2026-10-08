@@ -13,20 +13,16 @@ from langgraph.types import Command
 from harness.config.paths import VIRTUAL_PATH_PREFIX
 from harness.tools.types import Runtime
 
-"""view_image 工具：模型查看图片的入口。
+"""看图工具
 
-设计（按用户确认）：
-    1. 只暴露 file_path 单选 + 可选 resize 参数（不暴露范围/多选等复杂参数）；
-    2. 工具本身「只存元信息、不读像素」：路径校验 + 元数据落 state，
-       真正的 base64 由 before_model 中间件调用 resolve_view_image_placeholder()
-       按需从沙箱读取注入（避免把大图塞进每个 checkpoint，见 thread_state）；
-    3. resize 是「模型侧缩放」：给出最长边像素数，中间件注入时按此缩放，
-       防止超清大图浪费模型视觉 token（Pillow 处理，已装）；
-    4. 错误/成功消息用中文。
+    职责：模型查看图片的入口——工具只登记元信息，像素由中间件按需注入
+        - 路径白名单（workspace / uploads / outputs）+ 禁 .. 穿越
+        - 登记不读像素：避免大图塞进每个 checkpoint
+        - resolve_view_image_placeholder 在模型调用前把图转成 data URI（可 resize）
 
-与参考实现的关系：
-    - 参考工具直接读文件做 magic-byte 校验；本项目改为「工具登记 + 中间件懒读」，
-      校验逻辑下沉到 resolve_view_image_placeholder()，职责边界更清晰。
+    对外暴露：
+        - view_image_tool                  工具本体（写 state.viewed_images）
+        - resolve_view_image_placeholder   沙箱图片 → data URI（供 before_model 中间件）
 """
 
 logger = logging.getLogger(__name__)
@@ -59,9 +55,12 @@ def _is_allowed_image_virtual_path(image_path: str) -> bool:
     """
     if not isinstance(image_path, str) or not image_path.strip():
         return False
+    # 归一为 POSIX 并去掉尾斜杠
     normalized = image_path.replace("\\", "/").strip().rstrip("/")
+    # 逐段禁 .. 穿越
     if any(part == ".." for part in normalized.split("/")):
         return False
+    # 必须命中白名单根目录本身或其子路径
     return any(
         normalized == root or normalized.startswith(f"{root}/")
         for root in _ALLOWED_IMAGE_VIRTUAL_ROOTS
@@ -118,6 +117,7 @@ def view_image_tool(
         file_path: 图片在沙箱内的虚拟路径（如 /mnt/user-data/workspace/截图.png）
         resize: 可选。图片最长边缩放到的像素数（如 1024）。不传则保留原尺寸。
     """
+    # 1.路径白名单校验：不通过直接回错误，不登记
     if not _is_allowed_image_virtual_path(file_path):
         return Command(
             update={
@@ -130,6 +130,7 @@ def view_image_tool(
                 ]
             }
         )
+    # 2.扩展名不在支持列表 → 回错误
     mime_type = _mime_from_extension(file_path)
     if mime_type is None:
         return Command(
@@ -143,6 +144,7 @@ def view_image_tool(
                 ]
             }
         )
+    # 3.resize 必须是正整数（最长边像素数）
     if resize is not None and (not isinstance(resize, int) or resize <= 0):
         return Command(
             update={
@@ -155,6 +157,7 @@ def view_image_tool(
             }
         )
 
+    # 4.只登记元信息（size 留 0 占位），像素留给中间件按需注入
     new_viewed_images = {
         file_path: {
             "mime_type": mime_type,
@@ -200,17 +203,20 @@ def resolve_view_image_placeholder(
     from harness.sandbox.aio_sandbox import AioSandbox
     from harness.sandbox.exceptions import SandboxError
 
+    # 1.本函数可能被别处直接调用，这里再校验一次路径
     if not _is_allowed_image_virtual_path(image_path):
         logger.warning("view_image: 拒绝读取非法路径 %s", image_path)
         return None
 
     try:
+        # 2.先问容器文件大小，顺便确认文件存在
         size_cmd = f"stat -c %s {shlex.quote(image_path)}"
         size_out = (sandbox.exec_command(size_cmd) or "").strip()
         if not size_out.isdigit():
             logger.warning("view_image: 文件不存在或无法读取大小: %s", image_path)
             return None
         image_size = int(size_out)
+        # 3.空文件或超上限直接放弃
         if image_size <= 0 or image_size > max_bytes:
             logger.warning(
                 "view_image: 图片 %s 大小 %d 超出上限 %d",
@@ -223,6 +229,7 @@ def resolve_view_image_placeholder(
         b64_cmd = f"base64 -w0 {shlex.quote(image_path)}"
         b64_text = (sandbox.exec_command(b64_cmd) or "").strip()
         image_data = base64.b64decode(b64_text)
+        # 4.核对字节数，防读取期间文件被改
         if len(image_data) != image_size:
             logger.warning("view_image: 图片内容在读取时发生变化: %s", image_path)
             return None
@@ -230,11 +237,13 @@ def resolve_view_image_placeholder(
         logger.warning("view_image: 沙箱读取失败 %s: %s", image_path, exc)
         return None
 
+    # 5.按 magic bytes 复核真实类型（扩展名只用于登记）
     detected_mime = _detect_image_mime(image_data)
     if detected_mime is None:
         logger.warning("view_image: 文件内容不是受支持的图片格式: %s", image_path)
         return None
 
+    # 6.需要缩放时用 Pillow 等比缩到最长边，统一转 PNG
     if resize:
         try:
             from PIL import Image
@@ -254,5 +263,6 @@ def resolve_view_image_placeholder(
             logger.warning("view_image: 图片缩放失败 %s: %s", image_path, exc)
             return None
 
+    # 7.拼成 data URI 返回
     encoded = base64.b64encode(image_data).decode("ascii")
     return f"data:{detected_mime};base64,{encoded}"

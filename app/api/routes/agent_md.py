@@ -1,13 +1,3 @@
-"""自定义指令路由（agent_md）——用户级 agent.md 的读写端点。
-
-职责：把 harness.runtime.agent_md 的存储能力暴露成 HTTP 接口；
-     鉴权沿用 deps.get_user_id（Bearer token 换 user_id），数据按用户隔离。
-
-端点：
-  GET /agent-md   Authorization: Bearer <token> → {content, updated_at, max_length}
-  PUT /agent-md   {content} → 同上（strip 后为空即清空；超长 422）
-"""
-
 from __future__ import annotations
 
 from fastapi import APIRouter, Depends
@@ -15,6 +5,16 @@ from pydantic import BaseModel, Field
 
 from app.api.deps import get_user_id
 from harness.runtime.agent_md import MAX_AGENT_MD_LENGTH, get_agent_md_store
+
+"""自定义指令路由
+
+    职责：把 harness.runtime.agent_md 的存储能力暴露成 HTTP 接口
+        - GET /agent-md 读现状（content / updated_at / max_length）
+        - PUT /agent-md 保存（空即清空；超长由 pydantic 拦下）
+
+    对外暴露：
+        - router
+"""
 
 router = APIRouter(prefix="/agent-md", tags=["agent-md"])
 
@@ -39,6 +39,7 @@ class AgentMdIn(BaseModel):
 
 def _build_out(user_id: str) -> AgentMdOut:
     """读取当前指令并组装响应（updated_at 取文件 mtime，无文件为 None）。"""
+    # 1.读当前指令内容（空串 = 未设置）
     store = get_agent_md_store()
     content = store.load(user_id)
     updated_at: float | None = None
@@ -61,5 +62,6 @@ async def get_agent_md(user_id: str = Depends(get_user_id)) -> AgentMdOut:
 @router.put("", response_model=AgentMdOut)
 async def save_agent_md(body: AgentMdIn, user_id: str = Depends(get_user_id)) -> AgentMdOut:
     """保存当前用户自定义指令（空内容即清空，返回清空后的现状）。"""
+    # 保存后回读现状，保证前端拿到规整后的结果
     get_agent_md_store().save(user_id, body.content)
     return _build_out(user_id)

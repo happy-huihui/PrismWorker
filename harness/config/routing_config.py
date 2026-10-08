@@ -2,16 +2,14 @@ from __future__ import annotations
 
 from pydantic import BaseModel, Field
 
-"""模型路由配置（routing）
+"""模型路由配置
 
-    职责：定义「一轮对话该挑哪个模型」的规则参数。与 model_config.py 分工：
-         - model_config.py   单个模型长什么样（怎么造）
-         - routing_config.py 该挑哪一个（挑谁）
-
-    设计要点：
-        - 默认档 / 升级档都用「配置里的模型 name」指定，不硬编码 model id
-          → 换供应商只改 models 段，路由规则不用动。
-        - 关键词命中即升档：简单、可解释、零额外延迟，不引入第二个模型做意图识别。
+    职责：管理「一轮对话该挑哪个模型」的路由规则
+        - 路由开关
+        - 默认档 / 升级档模型（用 models 里的 name 指定，不硬编码 id）
+        - 升级关键词（命中即升档）
+        - 升级最小字数
+        - 视觉模型（带图时切换）
 
     对外暴露：
         - DEFAULT_ESCALATE_KEYWORDS  默认升级关键词

@@ -11,20 +11,15 @@ from harness.config.paths import get_paths
 
 logger = logging.getLogger(__name__)
 
-"""用户技能黑名单仓库（skill_prefs）
+"""用户技能黑名单仓库
 
-    职责：管理每用户一份的技能黑名单——被用户在设置里关闭的技能 name 集合。
-    存储：{base_dir}/users/{user_id}/skill_blacklist.json，结构
-         {"blocked": ["deep-research", ...]}，原子改写（临时文件 + os.replace）。
-         文件缺失/解析失败都视为「空黑名单」（全部技能可用）。
-    用途：API 路由（app/api/routes/skills.py）负责读写；
-         SkillActivationMiddleware 每轮模型调用按 runtime 用户加载，
-         在装配技能清单/响应激活前过滤掉黑名单内的技能。
-    缓存：mtime 缓存——文件未变时直接返回缓存集合，避免每轮模型调用重复读盘。
+    职责：按用户维护被关闭的技能 name 集合（文件缺失 / 解析失败一律视为空黑名单）
+        - 落盘 users/{uid}/skill_blacklist.json，原子改写
+        - mtime 缓存，文件未变不重复读盘
 
     对外暴露：
-        - SkillBlacklistStore        仓库本体（load/save）
-        - get_skill_blacklist_store  进程级单例
+        - SkillBlacklistStore         仓库本体（load / save）
+        - get_skill_blacklist_store   进程级单例（懒构造、线程安全）
         - reset_skill_blacklist_store 重置单例（测试隔离）
 """
 

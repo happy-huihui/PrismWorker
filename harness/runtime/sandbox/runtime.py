@@ -8,24 +8,22 @@ from typing import Any
 
 logger = logging.getLogger(__name__)
 
-"""沙箱运行时（sandbox.runtime）
+"""沙箱运行时
 
-    职责：把 harness 进程级 SandboxManager（含热池）接入 run 装配链，做
-         「thread_id → 确定性 sandbox_id → manager.start/release」的薄封装。
-    流程：首用懒启动（首个 run 才起容器）；同线程后续 run 复用同一容器
-         （活跃缓存或热池提升，零冷启动）；run 结束 release 回源保活，
-         idle_timeout 后由守护线程自动销毁；服务关闭 stop 统一回收全部容器。
-    线程上下文：run 是独立 asyncio.Task，用 ContextVar 传当前 thread_id，
-         装配链无需改签名即可取到线程归属，并保证并发 run 各拿各的容器。
+    职责：把进程级 SandboxManager（含热池）接入 run 装配链，做「thread_id → 确定性 sandbox_id → start/release」的薄封装
+        - 首用懒启动；同线程后续 run 复用同一容器（活跃缓存或热池提升，零冷启动）
+        - run 结束 release 回源保活，idle_timeout 后由守护线程自动销毁；服务关闭统一 stop
+        - 线程 / 用户归属走 ContextVar：装配链无需改签名，并发 run 各拿各的容器
+        - 挂载宿主 user-data 目录，容器与宿主共用同一份文件
 
     对外暴露：
-        - set_runtime_thread_id / get_runtime_thread_id  线程上下文（装配前设置）
-        - set_runtime_user_id / get_runtime_user_id      用户上下文（同上，算挂载路径用）
-        - derive_sandbox_id       thread_id → 确定性沙箱 id
-        - get_app_sandbox()       按线程取用沙箱（懒启动，失败安全降级 None）
-        - release_app_sandbox()   run 结束回源热池（幂等）
-        - stop_app_sandbox()      销毁全部容器（幂等）
-        - push_uploads_to_sandbox(...)  宿主 uploads → 容器推送
+        - set_runtime_thread_id / get_runtime_thread_id  线程上下文
+        - set_runtime_user_id / get_runtime_user_id      用户上下文
+        - derive_sandbox_id      thread_id → 确定性沙箱 id
+        - get_app_sandbox        按线程取用沙箱（懒启动，失败降级 None）
+        - release_app_sandbox    run 结束回源热池（幂等）
+        - stop_app_sandbox       销毁全部容器（幂等）
+        - push_uploads_to_sandbox  宿主 uploads → 容器推送
 """
 
 # 当前 run 的线程归属（asyncio.create_task 自动复制 context，天然隔离并发）
@@ -54,11 +52,13 @@ def set_runtime_thread_id(thread_id: str | None) -> None:
     参数：
         thread_id: 当前 run 的线程 id
     """
+    # 直接 set 不复位：run 是独立 Task，上下文随任务结束自然回收
     _THREAD_ID_CONTEXT.set(thread_id)
 
 
 def get_runtime_thread_id() -> str | None:
     """读取当前任务上下文的线程归属。"""
+    # 读不到返回 None，调用方据此走「共享兜底沙箱」
     return _THREAD_ID_CONTEXT.get()
 
 
@@ -68,11 +68,13 @@ def set_runtime_user_id(user_id: str | None) -> None:
     参数：
         user_id: 当前 run 的用户 id（多用户隔离目录要用）
     """
+    # 与线程归属同理，只用于拼挂载路径
     _USER_ID_CONTEXT.set(user_id)
 
 
 def get_runtime_user_id() -> str | None:
     """读取当前任务上下文的用户归属。"""
+    # 读不到返回 None，paths 层会退回默认用户目录
     return _USER_ID_CONTEXT.get()
 
 
@@ -85,8 +87,10 @@ def derive_sandbox_id(thread_id: str | None) -> str:
     返回：
         确定性沙箱 id（同线程永远同值 → 活跃/热池复用）
     """
+    # 无线程归属 → 共享兜底 id（旧版进程级单容器语义）
     if not thread_id:
         return _SHARED_SANDBOX_ID
+    # 哈希而不是直接用 thread_id：id 要能安全当容器名
     digest = hashlib.sha256(thread_id.encode("utf-8")).hexdigest()[:12]
     return f"t-{digest}"
 
@@ -132,6 +136,7 @@ def is_workspace_mounted(thread_id: str | None = None) -> bool:
     返回：
         能拼出挂载目录 → True；否则 False（退回旧的「收尾回传」语义）
     """
+    # 能拼出挂载目录即视为已挂载；拼不出来就退回旧的「收尾回传」语义
     return _host_workspace_dir(thread_id or get_runtime_thread_id()) is not None
 
 
@@ -206,6 +211,7 @@ def release_app_sandbox(sandbox_id: str | None = None) -> None:
 
 
 def stop_app_sandbox() -> None:
+    # 关闭路径一律吞异常：回收失败也不能挡住进程退出
     """销毁当前进程管理的全部沙箱容器（幂等；服务关闭时调用）。"""
     try:
         from harness.config.app_config import get_app_config
@@ -235,6 +241,7 @@ def push_uploads_to_sandbox(sandbox: Any, *, user_id: str, thread_id: str) -> in
          进容器，使「上传 → list/read」闭环可用。仅文本以 UTF-8 写入，二进制
          以 latin-1 保底；单文件失败仅告警跳过，不阻断 run。
     """
+    # 延迟导入，避免模块级拉入 config 链
     from harness.config.paths import get_paths
 
     paths = get_paths()
@@ -244,6 +251,7 @@ def push_uploads_to_sandbox(sandbox: Any, *, user_id: str, thread_id: str) -> in
     pushed = 0
     from pathlib import Path
 
+    # 逐文件推送；单文件失败只告警，不阻断整轮 run
     for f in sorted(udir.iterdir()):
         if not f.is_file():
             continue

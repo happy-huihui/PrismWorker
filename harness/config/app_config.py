@@ -11,20 +11,18 @@ import yaml
 from harness.config.database_config import DatabaseConfig
 from harness.config.memory_config import MemoryConfig
 from harness.config.model_config import ModelConfig
+from harness.config.observability_config import ObservabilityConfig
 from harness.config.routing_config import RoutingConfig
 from harness.config.sandbox_config import SandboxConfig
 from harness.config.subagents_config import SubagentsAppConfig
 from harness.config.tool_config import ToolConfig, ToolsConfig
 
-"""应用总配置（AppConfig）
+"""应用总配置
 
-    职责：聚合全部子配置（模型 / 路由 / 数据库 / 沙箱 / 记忆 / 工具 / 子代理），
-         并提供加载与查询能力。
-
-    加载链：
-        1. 显式传入的配置文件路径（存在才读）
-        2. ./config.yaml（存在才读）
-        3. 都没有 → 从环境变量兜底造一个模型（密钥缺失时留到调用期再报错）
+    职责：聚合全部子配置并提供加载与查询能力
+        - 聚合：模型 / 路由 / 数据库 / 沙箱 / 记忆 / 工具 / 子代理
+        - 加载链：显式配置路径 → ./config.yaml → 环境变量兜底
+        - 查询：模型/工具按名查找、激活模型、工具开关判定
 
     对外暴露：
         - AppConfig          总配置对象（含 get_model_config / active_model_config 等查询）
@@ -43,25 +41,25 @@ def _resolve_env_variables(value: Any) -> Any:
     返回：
         展开后的同构结构；字符串保留前后缀，只替换变量部分
     """
-    # 字典：逐值递归
+    # 1.分支一：字典 → 逐值递归展开，保持键结构不变
     if isinstance(value, dict):
         return {k: _resolve_env_variables(v) for k, v in value.items()}
 
-    # 列表：逐项递归
+    # 2.分支二：列表 → 逐项递归展开
     if isinstance(value, list):
         return [_resolve_env_variables(v) for v in value]
 
-    # 字符串：按三种写法做正则替换
+    # 3.分支三：字符串 → 把三种占位写法统一替换成环境变量值
     if isinstance(value, str):
 
         def _replace(match: re.Match) -> str:
-            # 三种写法分别落在不同捕获组，取到变量名与默认值
+            # 3.1 三种写法分别落在不同捕获组：${VAR:def}=组1+2、${VAR}=组3、$VAR=组4
             var = match.group(1) or match.group(3) or match.group(4)
             default = match.group(2)
-            # 从环境变量取值；未定义时用默认值，无默认值则空串
+            # 3.2 环境变量已定义则取值；未定义用默认值；无默认值落空串
             return os.getenv(var, default if default is not None else "")
 
-        # ${VAR:default} / ${VAR} / $VAR 三选一匹配
+        # 3.3 ${VAR:default} / ${VAR} / $VAR 三选一匹配（默认值冒号写法优先）
         return re.sub(
             r"\$\{([A-Za-z_][A-Za-z0-9_]*):([^}]*)\}"
             r"|\$\{([A-Za-z_][A-Za-z0-9_]*)\}"
@@ -70,7 +68,7 @@ def _resolve_env_variables(value: Any) -> Any:
             value,
         )
 
-    # 其余类型原样返回
+    # 4.分支四：其余类型（数字/布尔等）原样返回，不做替换
     return value
 
 
@@ -91,6 +89,7 @@ class AppConfig:
     tools: ToolsConfig
     subagents: SubagentsAppConfig
     routing: RoutingConfig
+    observability: ObservabilityConfig
 
     tool_overrides: dict[str, bool]
 
@@ -105,6 +104,7 @@ class AppConfig:
         tools: ToolsConfig | None = None,
         subagents: SubagentsAppConfig | None = None,
         routing: RoutingConfig | None = None,
+        observability: ObservabilityConfig | None = None,
         agent_name: str = "LeadAgent",
         log_level: str = "INFO",
         tool_overrides: dict[str, bool] | None = None,
@@ -112,23 +112,26 @@ class AppConfig:
         """用显式对象构造 AppConfig（子配置缺省时各自取默认值）。"""
         self.models = list(models) if models else []
         self.active_model = active_model
-        # 数据库连接串兜底读 DATABASE_URL
+        # 1.数据库连接串兜底读 DATABASE_URL，其余子配置缺省时用各自默认实例
         self.database = database or DatabaseConfig(postgres_url=os.getenv("DATABASE_URL", ""))
         self.sandbox = sandbox or SandboxConfig()
         self.memory = memory or MemoryConfig()
         self.tools = tools or ToolsConfig()
         self.subagents = subagents or SubagentsAppConfig()
         self.routing = routing or RoutingConfig()
+        self.observability = observability or ObservabilityConfig()
         self.agent_name = agent_name
         self.log_level = log_level
+        # 2.工具开关覆盖表缺省为空 dict
         self.tool_overrides = tool_overrides or {}
 
     def get_model_config(self, name: str) -> ModelConfig | None:
         """按名称查找模型配置，找不到返回 None。"""
-        # 线性比对 name（模型条目通常个位数，无需索引）
+        # 1.线性比对 name（模型条目通常个位数，无需建索引）
         for m in self.models:
             if m.name == name:
                 return m
+        # 2.遍历完都没命中 → None
         return None
 
     def active_model_config(self) -> ModelConfig:
@@ -139,15 +142,15 @@ class AppConfig:
         异常：
             一个模型都没配置时抛出清晰的 ValueError
         """
-        # 先按 active_model 精确匹配
+        # 1.优先按 active_model 精确匹配
         if self.active_model:
             found = self.get_model_config(self.active_model)
             if found is not None:
                 return found
-        # 其次取列表首个
+        # 2.回退：active_model 没配/配错时，取列表首个
         if self.models:
             return self.models[0]
-        # 都没有则报错，提示两条补救路径
+        # 3.彻底没配模型 → 报错，并在文案里给出两条补救路径
         raise ValueError(
             "No models configured. Add a model via config.yaml "
             "(see config.example.yaml) or set OPENAI_API_KEY / "
@@ -156,11 +159,13 @@ class AppConfig:
 
     def get_tool_config(self, name: str) -> ToolConfig | None:
         """按名称查找工具开关配置（tools.enabled_tools 内），找不到返回 None。"""
-        # 白名单项可能是字符串或 ToolConfig，统一取出名字比对
+        # 1.白名单项可能是字符串或 ToolConfig，统一取出名字逐条比对
         for t in self.tools.enabled_tools:
             tool_name = t.name if isinstance(t, ToolConfig) else str(t)
+            # 2.命中：原样返回（字符串则包成默认开的 ToolConfig）
             if tool_name == name:
                 return t if isinstance(t, ToolConfig) else ToolConfig(name=name)
+        # 3.没命中 → None
         return None
 
     def is_tool_enabled(self, name: str) -> bool:
@@ -171,13 +176,13 @@ class AppConfig:
             2. 否则看 enabled_tools 白名单
             3. 白名单为空表示全部启用
         """
-        # 显式覆盖优先
+        # 1.显式覆盖（tool_overrides）优先级最高，直接拍板
         if name in self.tool_overrides:
             return self.tool_overrides[name]
-        # 白名单非空则按白名单判定
+        # 2.白名单非空 → 按白名单是否含该工具判定
         if self.tools.enabled_tools:
             return self.get_tool_config(name) is not None
-        # 白名单为空 → 全开
+        # 3.白名单为空 → 约定为全开
         return True
 
     @classmethod
@@ -190,22 +195,23 @@ class AppConfig:
         返回：
             装配完成的 AppConfig
         """
-        # 入口统一展开一次环境变量（幂等，重复调用无害）
+        # 1.入口统一展开一次环境变量（幂等，重复调用无害）
         data = _resolve_env_variables(data)
 
-        # 模型列表：逐条转 ModelConfig
+        # 2.模型列表：逐条转成 ModelConfig（pydantic 校验字段）
         models_raw = data.get("models") or []
         models = [ModelConfig(**m) for m in models_raw]
 
-        # 各子配置段原样取出，交给各自的 pydantic 模型校验
+        # 3.各子配置段原样取出，交给各自的 pydantic 模型校验
         database_raw = data.get("database")
         sandbox_raw = data.get("sandbox")
         memory_raw = data.get("memory")
         tools_raw = data.get("tools")
         subagents_raw = data.get("subagents")
         routing_raw = data.get("routing")
+        observability_raw = data.get("observability")
 
-        # 段缺失时传 None，由 __init__ 落回各自默认值
+        # 4.段缺失时传 None，由 __init__ 落回各自默认值；显式配了才用配置值
         return cls(
             models=models,
             active_model=data.get("active_model"),
@@ -215,6 +221,7 @@ class AppConfig:
             tools=ToolsConfig(**tools_raw) if tools_raw else None,
             subagents=SubagentsAppConfig(**subagents_raw) if subagents_raw else None,
             routing=RoutingConfig(**routing_raw) if routing_raw else None,
+            observability=ObservabilityConfig(**observability_raw) if observability_raw else None,
             agent_name=data.get("agent_name", "LeadAgent"),
             log_level=data.get("log_level", "INFO"),
         )
@@ -239,20 +246,20 @@ class AppConfig:
             装配完成的 AppConfig（路径都不存在时走 from_defaults）
         """
         path: Path | None = None
-        # 显式路径优先
+        # 1.显式路径优先
         if config_path is not None:
             path = Path(config_path)
         else:
-            # 否则探测当前工作目录下的 config.yaml
+            # 2.否则探测当前工作目录下的 config.yaml
             candidate = Path("config.yaml")
             if candidate.exists():
                 path = candidate
 
-        # 没有可用文件 → 环境变量兜底
+        # 3.没有可用文件 → 环境变量兜底
         if path is None or not path.exists():
             return cls.from_defaults()
 
-        # 读 YAML → 展开环境变量 → 装配
+        # 4.读 YAML → 展开环境变量 → 装配
         with open(path, encoding="utf-8") as f:
             raw = yaml.safe_load(f) or {}
 
@@ -270,7 +277,7 @@ def _default_model_from_env() -> ModelConfig:
         单条 ModelConfig；三家密钥都没有时返回一个无密钥的 OpenAI 条目，
         实际调用时由模型工厂抛出清晰错误
     """
-    # MiMo：当前默认档（用户 2026-09-25 指定）
+    # 1.MiMo：当前默认档（用户 2026-09-25 指定）
     if os.getenv("MIMO_API_KEY"):
         return ModelConfig(
             name="default",
@@ -283,7 +290,7 @@ def _default_model_from_env() -> ModelConfig:
             context_window=131072,
         )
 
-    # DeepSeek：备选
+    # 2.DeepSeek：备选
     if os.getenv("DEEPSEEK_API_KEY"):
         return ModelConfig(
             name="default",
@@ -295,7 +302,7 @@ def _default_model_from_env() -> ModelConfig:
             context_window=65536,
         )
 
-    # OpenAI：最后兜底（gpt-6-astra，105 万上下文，支持视觉与推理）
+    # 3.OpenAI：最后兜底（gpt-6-astra，105 万上下文，支持视觉与推理）
     return ModelConfig(
         name="default",
         provider="openai",
@@ -315,10 +322,10 @@ _lock = threading.Lock()
 def get_app_config() -> AppConfig:
     """返回 AppConfig 全局唯一实例（懒加载，双重检查加锁）。"""
     global _app_config
-    # 快路径：已初始化直接返回，不加锁
+    # 1.快路径：已初始化直接返回，不加锁（绝大多数调用走这里）
     if _app_config is None:
         with _lock:
-            # 慢路径：拿到锁后二次确认，避免并发重复加载
+            # 2.慢路径：拿到锁后二次确认，避免并发重复加载
             if _app_config is None:
                 _app_config = AppConfig.from_file()
     return _app_config
@@ -327,6 +334,7 @@ def get_app_config() -> AppConfig:
 def set_app_config(config: AppConfig) -> None:
     """手动设置全局配置（测试或程序化启动时用）。"""
     global _app_config
+    # 加锁写入，保证与 get_app_config 的读侧不竞争
     with _lock:
         _app_config = config
 
@@ -334,5 +342,6 @@ def set_app_config(config: AppConfig) -> None:
 def reset_app_config() -> None:
     """重置全局配置，下次 get_app_config() 重新加载（测试用）。"""
     global _app_config
+    # 加锁置空，下次访问走慢路径重新 from_file 加载
     with _lock:
         _app_config = None

@@ -16,14 +16,15 @@ from harness.memory.storage.document import (
 
 logger = logging.getLogger(__name__)
 
-"""旧长期记忆库迁移（storage.migration）
+"""旧长期记忆库迁移
 
-    职责：把历史遗留的 SQLite 记忆库（memory.db / memory_entries 表）
-         一次性导入为新的 memory.json 文档，并把旧库改名备份。
-    规则：
-        - 仅当旧库存在、且某用户还没有 memory.json 时才导入该用户；
-        - 旧行按 kind 映射为事实类别，confidence=1.0（历史数据视为确定），source="legacy"；
-        - 全部成功后旧库改名 memory.db.migrated.bak；失败只告警不阻断（下次启动重试）。
+    职责：把历史遗留的 SQLite 记忆库一次性导入为新的 memory.json 文档
+        - 仅当旧库存在、且该用户还没有 memory.json 时才导入
+        - 旧行按 kind 映射类别，confidence=1.0、source="legacy"
+        - 全部成功后旧库改名备份；失败只告警不阻断
+
+    对外暴露：
+        - migrate_legacy_sqlite
 """
 
 # 旧库文件名与表名
@@ -129,12 +130,14 @@ def migrate_legacy_sqlite(mem_config: PrismMemConfig) -> int:
 
 def _content_key(content: str) -> str:
     """事实内容归一化键（去空白、小写），用于去重。"""
+    # 折叠空白 + 小写，用于跨库判重
     return " ".join(content.strip().lower().split())
 
 
 def _legacy_kind_to_category(kind: str) -> str:
     """旧 kind 开放标签映射为事实类别：已知类别直通，未知归 context。"""
     normalized = (kind or "").strip().lower()
+    # 已知类别直通；未知（含空串）一律归 context
     if normalized in {"preference", "knowledge", "context", "behavior", "goal", "correction"}:
         return normalized
     return "context"

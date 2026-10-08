@@ -3,23 +3,25 @@ from __future__ import annotations
 from typing import Any, Literal, NotRequired, TypedDict
 
 
-"""
-    会话目标状态（GoalState）——记录一个会话正在追求的长期目标。
+"""会话目标状态
 
-    只做类型定义，不含逻辑。整个 thread_state 里 `goal` 字段、以及将来做
-    goal 评估的模块，都用这里的三组结构：
-      - GoalBlocker：当前目标被什么原因卡住的枚举
-      - GoalEvaluation：某次评估的结论（是否满足 + 阻塞原因 + 理由）
-      - GoalState：会话目标本身的全部字段
+    职责：定义会话长期目标的结构，只做类型定义不含逻辑
+        - GoalBlocker     目标被卡住的原因
+        - GoalEvaluation  某次评估的结论
+        - GoalState       会话目标全部字段
+
+    对外暴露：
+        - GoalBlocker / GoalEvaluation / GoalState
 """
 
+# 目标阻塞原因：区分「只是还没做完」和「确实卡住了、卡在哪」，供续跑决策使用
 GoalBlocker = Literal[
-    "none",
-    "missing_evidence",
-    "needs_user_input",
-    "run_failed",
-    "external_wait",
-    "goal_not_met_yet",
+    "none",              # 未被阻塞
+    "missing_evidence",  # 证据不足，需要继续取证
+    "needs_user_input",  # 需要用户补充信息（走澄清路径）
+    "run_failed",        # 本轮运行失败（模型/工具报错）
+    "external_wait",     # 依赖外部系统，只能等待
+    "goal_not_met_yet",  # 目标尚未达成，但不属于真阻塞
 ]
 
 

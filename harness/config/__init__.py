@@ -9,6 +9,7 @@ from harness.config.app_config import (
 from harness.config.database_config import DatabaseConfig
 from harness.config.memory_config import MemoryConfig
 from harness.config.model_config import ModelConfig, ModelProvider
+from harness.config.observability_config import ObservabilityConfig, PricingConfig
 from harness.config.paths import (
     PROJECT_ROOT,
     SKILLS_CONTAINER_PREFIX,
@@ -58,6 +59,8 @@ __all__ = [
     "WebFetchConfig",
     "SubagentsAppConfig",
     "SubagentConfig",
+    "ObservabilityConfig",
+    "PricingConfig",
     "SkillsConfig",
     "Paths",
     "VIRTUAL_PATH_PREFIX",

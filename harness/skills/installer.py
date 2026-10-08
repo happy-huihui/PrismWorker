@@ -9,17 +9,12 @@ from pathlib import Path
 
 logger = logging.getLogger(__name__)
 
-"""技能包安全解压器（installer）——把 .skill（ZIP）归档解到临时目录。
+"""技能包安全解压器
 
-    定位：服务端 Agent 的安装入口第一环。用户上传 .skill 后，先在本模块做
-         「受控解压」，再把解压出的技能根目录交给审查（user_skills）。
-    安全边界（对照 DeerFlow installer 同款清单）：
-        - 拒绝绝对路径 / '..' / 盘符冒号        → 防 zip-slip 目录穿越
-        - 跳过 symlink 条目                     → 防符号链接逃逸
-        - 检测 ELF/PE/Mach-O 魔数拒可执行文件   → 防恶意二进制
-        - 条目数 / 解压总量围栏 + 64KB 流式写   → 防 zip bomb
-        - 过滤 macOS 元数据（__MACOSX/.DS_Store）→ 过滤归档噪声
-    解压后自动解析技能根目录（唯一子目录，或根下直接是 SKILL.md）。
+    职责：把 .skill（ZIP）归档安全解到临时目录，并解析出技能根目录
+        - 拒绝绝对路径 / '..' / 盘符冒号（防 zip-slip）
+        - 跳过 symlink 与 macOS 元数据条目
+        - 魔数拒可执行文件；条目数 / 总量围栏 + 64KB 流式写（防 zip bomb）
 
     对外暴露：
         - MAX_ARCHIVE_ENTRIES / MAX_ARCHIVE_TOTAL_BYTES  围栏常量
@@ -131,6 +126,7 @@ def _extract_members(archive: Path, dest_root: Path) -> None:
 
 def _looks_executable(head: bytes) -> bool:
     """判断文件头是否命中可执行魔数（head 实际可能不足 4 字节，双向前缀匹配）。"""
+    # 双向前缀匹配：文件头可能不足 4 字节，避免短头漏判
     return any(head.startswith(magic) or magic.startswith(head) for magic in _EXEC_MAGIC)
 
 
@@ -151,6 +147,7 @@ def _safe_member_rel_path(name: str) -> str:
 def _is_metadata_member(name: str) -> bool:
     """是否 macOS 元数据条目（__MACOSX 目录 / .DS_Store）。"""
     normalized = name.replace("\\", "/")
+    # 逐段查：只要任一段是元数据名就过滤
     return any(
         part in _METADATA_NAMES or part == ".DS_Store"
         for part in normalized.split("/")

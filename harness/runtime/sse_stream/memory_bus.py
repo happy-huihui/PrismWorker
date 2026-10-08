@@ -9,30 +9,18 @@ from typing import Any
 
 from harness.runtime.events.types import RunEvent, TERMINAL_EVENT_TYPES
 
-"""事件总线（memory_bus）——run 事件的进程内发布/订阅枢纽。
+"""事件总线
 
-    设计对齐「生产侧不阻塞」原则：订阅者队列有界（默认 4096 条），队列满时
-    普通事件直接丢弃并计数（思考链可丢、agent 执行不可停）；终端事件
-    （run_finished / run_error）与 END 哨兵走高优先级必达通道（阻塞入队，
-    保证消费端一定能收到收尾信号）。订阅者彼此独立，互不拖累。
-
-    回放：文本改成逐 token 下发后，“建 run 时就发事件、前端拿到 run_id
-    后才订阅”的竞态会被放大（run_started / run_meta 永远错过）。所以总线按 run
-    录制已发布事件，新订阅者先回放存量再跟实时（快照与入队之间无 await，
-    不会重复投递）。录制同时用于 run 结束后落库与历史思考链回放。
-
-    典型消费流程：
-        async for event in bus.subscribe(run_id):
-            ...  # event.seq 连续，可直接作 SSE 的 id
-    订阅在迭代结束或 run 结束时自动摘除。
+    职责：run 事件的进程内发布/订阅枢纽
+        - 订阅者队列有界（默认 4096），队列满时普通事件丢弃并计数（思考链可丢、执行不可停）
+        - 终端事件（run_finished / run_error）与 END 哨兵走高优先级必达通道
+        - 按 run 录制已发布事件：新订阅者先回放存量再跟实时，解决「建 run 时才发事件」的订阅竞态
+        - 录制同时用于 run 结束落库与历史思考链回放
 
     对外暴露：
         - EventBus           总线本体（publish / publish_end / subscribe / cancel）
         - get_event_bus      进程级单例
         - reset_event_bus    重置单例（测试隔离）
-
-    说明：本包只做进程内 pub/sub，不涉及 HTTP；SSE 帧格式化与
-         EventSourceResponse 仍在 app 路由层。
 """
 
 logger = logging.getLogger(__name__)
@@ -194,6 +182,7 @@ class EventBus:
         返回：
             丢弃事件计数
         """
+        # 指定 run 取自身丢弃数；不指定则汇总全部 + 无订阅者丢弃
         if run_id is not None:
             return self._dropped.get(run_id, 0)
         return sum(self._dropped.values()) + self._unwatched_events
@@ -204,6 +193,7 @@ class EventBus:
 
     async def close(self) -> None:
         """关闭总线：以 cancelled 终止所有遗留订阅并清空内部表。"""
+        # 逐个终止遗留订阅（cancel 会投递 cancelled 哨兵并摘除订阅）
         for run_id in list(self._subscribers.keys()):
             self.cancel(run_id)
         self._seq.clear()
@@ -221,6 +211,7 @@ class EventBus:
             紧凑事件列表 [{event, data}, ...]（按发布顺序）；录制本体在
             publish_end / cancel 时才释放
         """
+        # 只做只读快照：不 pop，录制本体留给后续订阅者回放
         return [
             {"event": item.type.value, "data": dict(item.payload or {})}
             for item in self._record.get(run_id, ())
@@ -259,6 +250,7 @@ class EventBus:
         返回：
             自增前的当前序号
         """
+        # 先取当前值再自增：seq 从 0 起、每个事件唯一，回放时可当 SSE 帧 id
         seq = self._seq.get(run_id, 0)
         self._seq[run_id] = seq + 1
         return seq
@@ -270,6 +262,7 @@ class EventBus:
             run_id: 目标 run
             queue: 待摘除的订阅者队列
         """
+        # 队列可能已被 cancel/close 摘除，找不到就静默返回（幂等）
         subs = self._subscribers.get(run_id)
         if not subs:
             return
@@ -291,6 +284,7 @@ def _with_seq(event: RunEvent, seq: int) -> RunEvent:
     返回：
         带新 seq 的事件副本
     """
+    # 局部导入：仅在重建事件副本时用到，避免污染模块顶部导入区
     from dataclasses import replace
 
     return replace(event, seq=seq)

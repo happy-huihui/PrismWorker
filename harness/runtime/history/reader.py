@@ -6,22 +6,15 @@ from typing import Any
 
 from harness.runtime.serialization import strip_user_input_wrapper, to_role
 
-"""会话历史读取（history.reader）
+"""会话历史读取
 
-    职责：从 checkpoints.db（与 runs 表同库）读出指定线程「最新一轮」checkpoint
-         保存的对话原文，转成前端可直接渲染的精简结构 {role, content}。
-    规则：跳过 tool 消息；带工具调用的 assistant 视为中间步骤一并跳过；
-         user 消息剥离防注入包裹标记；线程从没跑过 run（无 checkpoint）→ 空数组。
+    职责：从 checkpoints.db 读出指定线程最新一轮 checkpoint 的对话原文，转成前端可渲染的精简结构
+        - 跳过 tool 消息；带工具调用的 assistant 视为中间步骤一并跳过
+        - user 消息剥离防注入包裹标记；无 checkpoint 返回空数组
 
     对外暴露：
-        - get_message_history  读线程会话历史（精简结构列表）
+        - get_message_history  读线程会话历史（[{role, content}]）
         - count_messages       线程当前消息条数
-
-    输出数据示例：
-        [
-          {"role": "user", "content": "帮我查一下今天天气"},
-          {"role": "assistant", "content": "今天晴，25℃……"}
-        ]
 """
 
 
@@ -55,6 +48,7 @@ async def get_message_history(
 
         _, db_path = resolve_memory_paths(None)
 
+    # 统一成 Path，下面要做 exists() 判断
     db_path = Path(db_path)
     # 库还不存在 = 从没跑过，直接空
     if not db_path.exists():
@@ -63,8 +57,10 @@ async def get_message_history(
     import aiosqlite
     from langgraph.checkpoint.sqlite.aio import AsyncSqliteSaver
 
+    # 短连接：读完即关（finally），不长期占着库
     conn = await aiosqlite.connect(str(db_path))
     try:
+        # 借用 LangGraph 的 saver 读最新 checkpoint，保证与 run 写入端同格式
         saver = AsyncSqliteSaver(conn)
         config = {
             "configurable": {
@@ -83,6 +79,7 @@ async def get_message_history(
         archived = channel_values.get("archived_messages", []) or []
         current = channel_values.get("messages", []) or []
         messages = [*archived, *current]
+        # 逐条转成 {role, content}，中间步骤（tool / 带调用的 assistant）在这里被过滤
         result: list[dict[str, Any]] = []
         # 只取最近 limit 条
         seq = messages[-limit:]
@@ -120,6 +117,7 @@ async def get_message_history(
 
 async def count_messages(user_id: str, thread_id: str, *, db_path: str | Path | None = None) -> int:
     """线程当前消息条数（供 UI 角标/调试；无历史返回 0）。"""
+    # 复用历史读取的过滤规则，保证角标条数与历史列表一致
     history = await get_message_history(user_id, thread_id, limit=500, db_path=db_path)
     return len(history)
 
@@ -128,6 +126,7 @@ async def _main() -> None:
     """命令行自检：python -m harness.runtime.history.reader。"""
     import sys
 
+    # 参数不足只打印用法，不报错退出
     if len(sys.argv) < 3:
         print("用法: python -m harness.runtime.history.reader <user_id> <thread_id>")
         return

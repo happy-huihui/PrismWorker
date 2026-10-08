@@ -11,20 +11,15 @@ from harness.prompt import render_text
 ModelRequest = types.ModelRequest
 
 
-"""
-    延迟工具过滤中间件（deferred_tool_filter）——stub 最小实现。
+"""延迟工具过滤中间件
 
-    背景（用户确认的方案）：完整版里，某些"延迟工具"（deferrable tools，
-    如耗时的 Web 搜索 / 子代理派发）不该随请求一次性全量暴露给模型，而应
-    按需放行。本项目收敛为最小实现：
-      - 保留 whitelist（白名单）概念：白名单内的工具**直接放行**（原样留在
-        request.tools，交给后续模型调用）；
-      - 白名单为空 = 全部放行（等价于未启用本中间件）；
-      - 非白名单工具在模型调用前被移除，并注入一条系统提示说明哪些工具
-        暂不可用，引导模型改用其它工具。
+    职责：模型调用前按白名单过滤工具（stub 最小实现）
+        - 白名单内的工具直接放行，为空表示全部放行
+        - 非白名单工具移除，并提示模型改用其它工具
+        - 不做 defer-and-promote 两阶段机制
 
-    这是一个明确标注的 stub：只做「白名单直接放行」这一档，不做
-    defer-and-promote（延迟到后续轮次再提升）的完整两阶段机制。
+    对外暴露：
+        - DeferredToolFilterMiddleware
 """
 
 
@@ -41,21 +36,26 @@ class DeferredToolFilterMiddleware(AgentMiddleware):
         handler: Callable[[ModelRequest[Any]], Awaitable[Any]],
     ) -> Any:
         """包装模型调用：按白名单过滤 request.tools 后交给 handler。"""
+        # 1.白名单为空 = 全部放行（等价于未启用本中间件）
         if not self._whitelist:
             return await handler(request)
+        # 2.本轮没有工具 → 无可过滤
         tools = request.tools
         if not tools:
             return await handler(request)
 
+        # 3.计算被白名单拦下的工具名
         existing_names = {_tool_name(tool) for tool in tools}
         blocked = sorted(name for name in existing_names if name not in self._whitelist)
+        # 3.1 没有被拦的 → 直接放行
         if not blocked:
             return await handler(request)
+        # 3.2 保留白名单内的工具
         kept = [tool for tool in tools if _tool_name(tool) in self._whitelist]
 
+        # 4.注入提示：告知模型哪些工具暂不可用（文案集中在 harness.prompt）
         system_message = request.system_message
         text = system_message.text if system_message is not None else ""
-        # 不可用工具提示文案集中在 harness.prompt；blocked 名单作值注入
         notice = render_text("deferred_tools/unavailable", {"blocked": ", ".join(blocked)})
         if system_message is None:
             new_system = SystemMessage(content=notice)
@@ -63,6 +63,7 @@ class DeferredToolFilterMiddleware(AgentMiddleware):
             text = f"{notice}\n\n{text}" if text else notice
             new_system = system_message.__class__(content=text)
 
+        # 5.用过滤后的工具 + 新系统消息放行
         return await handler(
             request.override(
                 tools=kept,

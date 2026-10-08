@@ -1,5 +1,3 @@
-"""子代理执行器：把 task 工具派发的任务变成真正的子代理运行。"""
-
 from __future__ import annotations
 
 import asyncio
@@ -18,6 +16,18 @@ from harness.agents.middlewares.model_output_sanitizer import ModelOutputSanitiz
 from harness.agents.thread_state import ThreadState
 from harness.models.factory import create_chat_model
 from harness.subagents.config import SubagentConfig, resolve_subagent_model_name
+
+"""子代理执行器
+
+    职责：把 task 工具派发的任务变成一次真正的子代理运行
+        - 解析模型名 → 组装「全量工具减黑名单」→ create_agent 跑「模型-工具」循环
+        - 挂 ModelOutputSanitizer 净化退化输出（幻影 tool_call / 空 id / 正文壳）
+        - 超时 / 轮次上限 / 异常统一收敛成终止态 SubagentResult 交回父代理
+
+    对外暴露：
+        - SubagentResult    一次执行的最终结果
+        - SubagentExecutor  执行器（execute 为唯一入口）
+"""
 
 logger = logging.getLogger(__name__)
 
@@ -73,6 +83,7 @@ class SubagentExecutor:
         self.thread_id = thread_id
         self.user_id = user_id
 
+        # 沙箱状态由父代理透传；这里只存 id，真正实例去进程级管理器里取
         self.sandbox_id: str | None = None
         if isinstance(sandbox_state, dict):
             self.sandbox_id = sandbox_state.get("sandbox_id")
@@ -90,9 +101,11 @@ class SubagentExecutor:
         Returns:
             SubagentResult（status 一定是终止态：completed / failed / timed_out）。
         """
+        # 先落一个 completed 兜底，后续各分支按实际情况改写
         started_at = datetime.now()
         result = SubagentResult(status="completed", started_at=started_at)
 
+        # 模型与工具都懒加载并缓存（一个执行器只跑一次任务）
         model = self._get_model()
         tools = self._get_tools()
         logger.info(
@@ -104,6 +117,7 @@ class SubagentExecutor:
             self.config.max_turns,
         )
 
+        # 子代理用独立 ThreadState，只挂净化中间件（没有主链路的其它兜底）
         agent = create_agent(
             model=model,
             tools=tools,
@@ -114,16 +128,19 @@ class SubagentExecutor:
             middleware=[ModelOutputSanitizerMiddleware()],
         )
 
+        # 初始状态：只有这条任务消息 + 父代理的线程数据
         initial_state: dict[str, Any] = {
             "messages": [HumanMessage(content=prompt)],
             "thread_data": self.thread_data,
             "viewed_images": {},
         }
+        # 带上沙箱 id，子代理的文件工具才连到父代理同一个容器
         if self.sandbox_id:
             initial_state["sandbox"] = {"sandbox_id": self.sandbox_id}
 
         final_state: dict[str, Any] | None = None
 
+        # 只取 values 帧：每帧都是全量 state，最后一帧即终态
         async def _run() -> None:
             nonlocal final_state
             async for chunk in agent.astream(
@@ -134,6 +151,7 @@ class SubagentExecutor:
                 final_state = chunk
 
         try:
+            # 超时即终止：父代理据此决定是否重派
             await asyncio.wait_for(_run(), timeout=self.config.timeout_seconds)
         except TimeoutError:
             result.completed_at = datetime.now()
@@ -141,6 +159,7 @@ class SubagentExecutor:
             result.stop_reason = "timed_out"
             result.error = f"子代理执行超过 {self.config.timeout_seconds} 秒，已终止"
             return result
+        # 轮次上限：langgraph 抛递归错误；有部分产出就当 completed 收尾
         except GraphRecursionError:
             partial = _extract_final_message(final_state)
             result.completed_at = datetime.now()
@@ -152,6 +171,7 @@ class SubagentExecutor:
                 result.status = "failed"
                 result.error = f"达到轮次上限 {self.config.max_turns} 且没有产出有效结果"
             return result
+        # 其余异常一律转成可读结果，绝不把栈抛回父代理
         except Exception as exc:  # noqa: BLE001 —— 任何异常都要转成可读结果交给父代理
             logger.exception("子代理[%s] 任务[%s] 执行失败", self.config.name, result.task_id)
             result.completed_at = datetime.now()
@@ -159,6 +179,7 @@ class SubagentExecutor:
             result.error = f"{type(exc).__name__}: {exc}"
             return result
 
+        # 正常结束：从终态里抠最后一条 AI 正文当结果
         result.completed_at = datetime.now()
         body = _extract_final_message(final_state)
         if body:
@@ -172,6 +193,7 @@ class SubagentExecutor:
 
     def _get_model(self) -> Any:
         """解析模型名并创建聊天模型（懒加载）。"""
+        # 懒加载：解析模型名并造实例，只造一次
         if self._model is None:
             model_name = resolve_subagent_model_name(self.config, self.parent_model)
             self._model = create_chat_model(name=model_name, thinking_enabled=False)
@@ -188,6 +210,7 @@ class SubagentExecutor:
         if self._tools is not None:
             return self._tools
 
+        # 沙箱工具：连父代理同一个容器；拿不到实例就整组跳过（不报错）
         sandbox_tools: list[BaseTool] = []
         sandbox = self._get_sandbox()
         if sandbox is not None:
@@ -202,6 +225,7 @@ class SubagentExecutor:
             review_skill_package,
             view_image_tool,
         )
+        # 内置工具：全注册，task 由黑名单过滤掉（防子代理再派子代理）
         builtin_tools: list[BaseTool] = [
             ask_clarification_tool,
             list_uploaded_files,
@@ -213,8 +237,10 @@ class SubagentExecutor:
         from harness.community.tavily_search.tools import web_search_tool
         from harness.community.web_fetch.tools import web_fetch_tool
 
+        # web 工具：搜索 + 抓取
         web_tools: list[BaseTool] = [web_search_tool, web_fetch_tool]
 
+        # 合成全量后依次过白名单、黑名单
         all_tools = [*sandbox_tools, *builtin_tools, *web_tools]
         self._tools = _filter_tools(
             all_tools,
@@ -232,6 +258,7 @@ class SubagentExecutor:
 
     def _get_sandbox(self) -> Any | None:
         """按 sandbox_id 从进程级沙箱管理器取回容器实例；取不到返回 None。"""
+        # 父代理没传沙箱 id（未启用沙箱）→ 子代理也不给沙箱工具
         if not self.sandbox_id:
             return None
         try:
@@ -258,9 +285,11 @@ def _filter_tools(
     Returns:
         过滤后的工具列表。
     """
+    # 白名单：None = 不限；给了就只留名单内的
     if allowed is not None:
         allowed_set = set(allowed)
         all_tools = [t for t in all_tools if t.name in allowed_set]
+    # 黑名单：命中的一律剔除（在白名单之后执行，黑名单优先）
     if disallowed:
         denied = set(disallowed)
         all_tools = [t for t in all_tools if t.name not in denied]
@@ -272,6 +301,7 @@ def _extract_final_message(state: dict[str, Any] | None) -> str:
     if not state:
         return ""
     messages = state.get("messages") or []
+    # 从后往前找第一条有正文的 AI 消息（跳过工具调用轮）
     for message in reversed(messages):
         if getattr(message, "type", "") != "ai":
             continue

@@ -1,21 +1,3 @@
-"""沙箱工具生成：把 AioSandbox 封装成 LangChain 工具。
-
-生成六个工具（供 Lead Agent / 子代理注册）：
-    - read_file    读取容器内文件
-    - write_file   写入容器内文件
-    - glob_files   按 glob 模式查找文件
-    - grep_files   按正则搜索文件内容
-    - list_dir     列出目录内容
-    - exec_command 执行 bash 命令
-
-工具风格与本题内置工具保持一致：
-    - @tool("name", parse_docstring=True) 装饰
-    - runtime: Runtime 注入（用于读取线程/工作区信息）
-    - tool_call_id: Annotated[str, InjectedToolCallId] 注入
-    - 返回 Command(update={"messages": [ToolMessage(...)]})
-
-"""
-
 from __future__ import annotations
 
 import logging
@@ -30,6 +12,19 @@ from harness.config.paths import SKILLS_CONTAINER_PREFIX, VIRTUAL_PATH_PREFIX
 from harness.sandbox.aio_sandbox import AioSandbox
 from harness.sandbox.exceptions import SandboxError
 from harness.tools.types import Runtime
+
+"""沙箱工具工厂
+
+    职责：把 AioSandbox 封装成一组 LangChain 工具，供 Lead Agent / 子代理注册
+        - 文件工具 read_file / write_file / glob_files / grep_files / list_dir
+        - exec_command 由 allow_bash 开关决定是否注册
+        - 统一 Command 返回；沙箱异常转成 ToolMessage，不向上抛
+
+    对外暴露：
+        - SANDBOX_TOOL_NAMES      六个沙箱工具名
+        - make_sandbox_tools      按沙箱实例生成工具列表
+        - sandbox_default_workdir 默认工作目录（模型提示词用）
+"""
 
 logger = logging.getLogger(__name__)
 
@@ -57,6 +52,7 @@ def make_sandbox_tools(
     Returns:
         LangChain 工具列表
     """
+    # 文件工具恒定注册；exec_command 由 allow_bash 决定（禁用 bash 的场景只给文件工具）
     tools: list[BaseTool] = [
         tool("read_file", parse_docstring=True)(_make_read_file(sandbox)),
         tool("write_file", parse_docstring=True)(_make_write_file(sandbox)),
@@ -66,16 +62,19 @@ def make_sandbox_tools(
     ]
     if allow_bash:
         tools.append(tool("exec_command", parse_docstring=True)(_make_exec_command(sandbox)))
+    # 工具契约：内部捕获 SandboxError 转成 ToolMessage 返回，让模型看到失败原因自行纠正，不让整个 run 崩掉
     return tools
 
 
 def _tool_message(helper: Any, content: str, tool_call_id: str) -> Command:
     """构造工具返回 Command（统一消息格式）。"""
+    # 统一 Command(update=...) 形态，与本项目其它工具一致
     return Command(update={"messages": [ToolMessage(content=content, tool_call_id=tool_call_id)]})
 
 
 def _extract_user_dir(runtime: Runtime) -> str | None:
     """从线程状态提取用户上传目录（容器内路径），拿不到返回 None。"""
+    # thread_data.uploads_path 由线程上下文中间件写入；拿不到就不给模型提示上传目录
     if runtime.state is None:
         return None
     thread_data = runtime.state.get("thread_data") or {}

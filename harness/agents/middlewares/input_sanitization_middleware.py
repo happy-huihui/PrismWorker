@@ -12,28 +12,17 @@ ModelRequest = types.ModelRequest
 ModelResponse = types.ModelResponse
 
 
-"""
-    用户输入净化 —— PrismWorker 的安全红线。
+"""用户输入净化
 
-    背景：进入 LLM 上下文的内容分"可信"与"不可信"两类。
-        可信 = 系统提示词、框架注入的结构块；
-        不可信 = 用户聊天文本、上传文件元信息、被审查的技能内容。
-    攻击者能在不可信文本里伪造 <system-reminder>、<system> 等框架标签，
-    冒充受信任的系统上下文，诱导 LLM 执行攻击者指令（提示注入）。
+    职责：把不可信文本里伪造的框架标签中和掉，防止提示注入
+        - 可信 = 系统提示词 / 框架结构块；不可信 = 用户文本 / 文件元信息 / 技能内容
+        - 只转义不拒绝，保留用户表达
+        - fail-open：净化异常时放行原消息
+        - 纯静态无 IO、确定性（同输入同输出）
 
-    这个模块做三件事：
-        1. neutralize_untrusted_tags —— 净化本体（公共原语），
-           把黑名单标签转义成字面文本、把伪造的边界标记中和掉；
-        2. InputSanitizationMiddleware —— 真实 LangChain AgentMiddleware，
-           在 graph compile 时挂载，实时净化用户消息；
-        3. 净化与包裹分离：只有用户消息需要包 BEGIN/END 边界，
-           文件与技能审查内容只转义、不包裹。
-
-    关键约定：
-        - 转义不拒绝：净化不拦用户，只把危险标签变普通文字，保留表达。
-        - fail-open：净化异常时放行原消息（可用性 > 严格性）。
-        - 纯静态无 IO：只做字符串正则替换，不调 LLM、不访问文件系统。
-        - 确定性：同一输入必得同一输出。
+    对外暴露：
+        - neutralize_untrusted_tags     净化本体（公共原语，供其它中间件复用）
+        - InputSanitizationMiddleware   实时净化用户消息的中间件
 """
 
 
@@ -111,6 +100,7 @@ def _unwrap_wrapped_input(text: str) -> str:
     INPUT]）残留。这里从外到内逐层剥离：真实包裹剥掉后，再把惰性
     标记行移除，直到拿到纯文本。
     """
+    # 1.循环剥掉最外层的真实 BEGIN/END 包裹（历史数据可能多层嵌套）
     while True:
         stripped = text.strip()
         if stripped.startswith(_USER_INPUT_BEGIN) and stripped.endswith(_USER_INPUT_END):
@@ -119,7 +109,9 @@ def _unwrap_wrapped_input(text: str) -> str:
             text = stripped
             continue
         break
+    # 2.移除残留的惰性边界行（[BEGIN/END USER INPUT]）
     cleaned = _NEUTRALIZED_BOUNDARY_LINE_RE.sub("", text)
+    # 3.把连续多空行压成单空行，返回纯文本
     return re.sub(r"\n{3,}", "\n\n", cleaned).strip()
 
 
@@ -199,6 +191,7 @@ class InputSanitizationMiddleware(AgentMiddleware):
         """
         messages = request.messages
 
+        # 1.从后往前找最后一条「真实用户消息」，命中即停（只净化这一条）
         for i in range(len(messages) - 1, -1, -1):
             msg = messages[i]
             if not isinstance(msg, HumanMessage):
@@ -206,12 +199,15 @@ class InputSanitizationMiddleware(AgentMiddleware):
             if not self._is_genuine_user_message(msg):
                 continue
 
+            # 2.净化 content（字符串或块列表，内部会包裹 BEGIN/END）
             original = msg.content
             sanitized = self._sanitize_message_content(original)
 
+            # 3.净化前后一致 → 返回（避免无谓重建）
             if sanitized == original:
                 return
 
+            # 4.替换 content，并留存原文到 additional_kwargs 供后续取用
             msg.content = sanitized
             msg.additional_kwargs.setdefault(
                 ORIGINAL_USER_CONTENT_KEY, original

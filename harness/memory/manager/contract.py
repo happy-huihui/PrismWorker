@@ -3,13 +3,14 @@ from __future__ import annotations
 from abc import ABC, abstractmethod
 from typing import Any, ClassVar, Literal
 
-"""记忆管理器契约（manager.contract）
+"""记忆管理器契约
 
-    职责：定义「跨会话长期记忆后端」的统一接口，主链路（中间件 / 工具 /
-         注入 / 生命周期）只依赖本抽象，不绑定具体实现。
-    分层：tier-1 必须实现（写 add / 读注入 get_context）；tier-2 检索与管理
-         （search / get_memory / clear / fact CRUD / 生命周期）给默认实现，
-         不强制每个后端都写。
+    职责：定义跨会话长期记忆后端的统一接口，主链路只依赖本抽象
+        - tier-1 必须实现：add / add_nowait / get_context
+        - tier-2 带默认实现：search / 文档读写 / fact CRUD / 生命周期
+
+    对外暴露：
+        - MemoryManager   记忆后端抽象基类
 """
 
 
@@ -105,6 +106,8 @@ class MemoryManager(ABC):
         *,
         user_id: str | None = None,
         agent_name: str | None = None,
+        key: str | None = None,
+        source: str = "manual",
     ) -> tuple[dict[str, Any], str | None]:
         """手动新增事实（默认不支持，PrismMem 覆盖）。"""
         raise NotImplementedError(f"create_fact not supported by {type(self).__name__}")

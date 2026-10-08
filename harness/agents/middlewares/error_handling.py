@@ -11,21 +11,16 @@ from langchain_core.messages import AIMessage, SystemMessage, ToolMessage
 ModelRequest = types.ModelRequest
 ToolCallRequest = types.ToolCallRequest
 
-"""
-    错误处理中间件（error_handling）——工具异常与模型异常的兜底。
+"""错误处理中间件
 
-    ToolErrorMiddleware（工具异常）：
-      用 awrap_tool_call 包住工具执行：handler 抛异常时不把异常抛到图
-      上层让整个 run 崩溃，而是转成一条友好的 ToolMessage（内容 = 统一
-      中文错误说明 + 原始异常摘要），让模型看到"工具调用失败了，尝试
-      其它方法"。对工具名/参数做净化，避免异常文本里的不可信内容注入。
-      可注入 last_n 条最近错误在 prints 中提示。
+    职责：把工具 / 模型抛出的异常转成可继续对话的友好消息，避免整个 run 崩溃
+        - ToolErrorMiddleware  工具异常 → 友好 ToolMessage，异常文本做净化
+        - LLMErrorMiddleware   模型异常 → AIMessage + 一次轻量重试
 
-    LLMErrorMiddleware（模型异常）：
-      用 awrap_model_call 包住模型调用：捕获模型 API 异常，返回一条
-      AIMessage 说明模型调用失败并引导用户重试/换模型，同时写一条中文
-      进度消息。重试一次后仍失败才兜底（一次轻量重试，绝大多数瞬时
-      网络抖动都可自愈）。
+    对外暴露：
+        - ToolErrorMiddleware
+        - LLMErrorMiddleware
+        - neutralize_tags   异常文本净化（防不可信内容注入）
 """
 
 logger = logging.getLogger(__name__)
@@ -48,24 +43,28 @@ class ToolErrorMiddleware(AgentMiddleware):
         handler: Callable[[ToolCallRequest[Any]], Awaitable[Any]],
     ) -> Any:
         """包装工具执行：兜底异常为错误 ToolMessage。"""
+        # 1.取工具调用 id 与名字
         tool_call_id = str(request.tool_call.get("id") or "")
         tool_name = str(request.tool_call.get("name") or "")
-        # 空 id 兜底：合成一个合法 id，避免 ToolMessage(tool_call_id="") 入历史后
-        # 下一轮请求体出现空 id 引发服务端 400（2026-09-26 线上实锤）
+        # 2.空 id 兜底：合成一个合法 id，避免 ToolMessage(tool_call_id="") 入历史后
+        #    下一轮请求体出现空 id 引发服务端 400（2026-09-26 线上实锤）
         if not tool_call_id:
             tool_call_id = f"call_sanitized_{uuid.uuid4().hex[:24]}"
+        # 3.正常执行一次，异常则记录（不抛出，走兜底）
         last_error: Exception | None = None
         try:
             return await handler(request)
         except Exception as exc:  # noqa: BLE001 —— 工具异常一律兜底
             last_error = exc
             logger.warning("工具 %s 调用失败: %s", tool_name, exc, exc_info=True)
+        # 4.开重试则再试一次（大多数瞬时抖动可自愈）
         if self._retry_once:
             try:
                 return await handler(request)
             except Exception as exc:  # noqa: BLE001
                 last_error = exc
                 logger.warning("工具 %s 重试仍失败: %s", tool_name, exc)
+        # 5.兜底：转成一条友好的错误 ToolMessage，让模型看到失败并换方案
         assert last_error is not None
         message = _sanitize(_TOOL_ERROR_TEMPLATE.format(error=_error_brief(last_error)))
         result = ToolMessage(
@@ -93,17 +92,21 @@ class LLMErrorMiddleware(AgentMiddleware):
         """包装模型调用：捕获异常并重试，仍失败则返回兜底 AIMessage。"""
         last_error: Exception | None = None
         attempts = 0
+        # 1.循环尝试：成功直接返回，失败按预算重试
         while True:
             try:
                 return await handler(request)
             except Exception as exc:  # noqa: BLE001 —— 模型异常统一兜底
                 last_error = exc
+                # 1.1 还有重试额度 → 重试
                 if attempts < self._max_retries:
                     attempts += 1
                     logger.warning("模型调用失败，第 %s 次重试……", attempts)
                     continue
+                # 1.2 额度耗尽 → 记录并退出循环
                 logger.error("模型调用最终失败: %s", exc, exc_info=True)
                 break
+        # 2.兜底：返回可读的 AIMessage，引导用户重试/换模型
         assert last_error is not None
         message = _sanitize(_LLM_ERROR_TEMPLATE.format(error=_error_brief(last_error)))
         return AIMessage(content=f"（系统提示模型调用异常）{message}")

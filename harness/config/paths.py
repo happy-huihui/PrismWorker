@@ -5,15 +5,13 @@ import re
 import shutil
 from pathlib import Path
 
-"""路径管理：沙箱虚拟路径 <==> 宿主机真实路径
+"""路径管理
 
-    职责：集中管理所有文件系统路径约定，并提供双向映射与路径安全校验。
-
-    目录布局（base_dir = 数据根目录）：
-        {base_dir}/users/{user_id}/threads/{thread_id}/user-data
-            ├── workspace   工作区（沙箱内 /mnt/user-data/workspace）
-            ├── uploads     用户上传（沙箱内 /mnt/user-data/uploads）
-            └── outputs     Agent 产出（沙箱内 /mnt/user-data/outputs）
+    职责：管理沙箱虚拟路径 ↔ 宿主机真实路径的映射与安全校验
+        - 目录布局：{base_dir}/users/{user_id}/threads/{thread_id}/user-data/{workspace|uploads|outputs}
+        - 虚拟路径前缀 /mnt/user-data 与技能挂载点 /mnt/skills
+        - thread_id / user_id 合法性校验（防路径穿越）
+        - 虚拟路径 → 真实路径解析
 
     对外暴露：
         - VIRTUAL_PATH_PREFIX     user-data 在沙箱内的挂载点
@@ -225,10 +223,12 @@ class Paths:
         返回：
             被删除的目录路径；安全检查未通过时返回 None
         """
+        # 1.resolve 出待删目录的真实绝对路径
         tdir = self.thread_dir(thread_id, user_id=user_id).resolve()
-        # 只有父链里带 threads 目录才允许删，挡住 base_dir 被整体误删
+        # 2.安全检查：只有父链里带 threads 目录才允许删，挡住 base_dir 被整体误删
         if "threads" not in [p.name for p in tdir.parents]:
             return None
+        # 3.递归删除（忽略不存在等错误），返回被删路径
         shutil.rmtree(tdir, ignore_errors=True)
         return tdir
 
@@ -255,20 +255,22 @@ class Paths:
         异常：
             前缀不匹配或检测到路径穿越时抛 ValueError
         """
+        # 1.去掉开头斜杠，取出虚拟前缀，便于统一比对
         stripped = virtual_path.lstrip("/")
         prefix = VIRTUAL_PATH_PREFIX.lstrip("/")
 
-        # 校验一：必须落在 user-data 前缀下
+        # 2.校验一：必须落在 user-data 前缀下（要么相等要么是其子路径）
         if stripped != prefix and not stripped.startswith(prefix + "/"):
             raise ValueError(f"Path must start with /{prefix}")
 
-        # 去掉前缀，得到相对路径
+        # 3.去掉前缀，得到相对路径
         relative = stripped[len(prefix):].lstrip("/")
 
+        # 4.拼到线程 user-data 真实根上并 resolve 归一化
         base = self.sandbox_user_data_dir(thread_id, user_id=user_id).resolve()
         actual = (base / relative).resolve()
 
-        # 校验二：解析后仍须在 base 之内，挡住 ../ 穿越
+        # 5.校验二：解析后仍须在 base 之内，挡住 ../ 穿越
         try:
             actual.relative_to(base)
         except ValueError:

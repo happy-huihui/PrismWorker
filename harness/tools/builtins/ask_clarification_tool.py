@@ -1,7 +1,16 @@
 from typing import Literal, Required, TypedDict
 from langchain.tools import tool
 
-""" 当 LLM 需要用户澄清时，调用此工具，触发 ClarificationMiddleware 执行 """
+"""澄清提问工具
+
+    职责：模型遇到「缺信息 / 有歧义 / 多选一 / 有风险 / 待批准」时向用户提问
+        - return_direct=True：调用即中断本轮，把问题交给前端呈现
+        - 支持纯文本 / 选项列表 / 表单三种提问形态
+
+    对外暴露：
+        - ClarificationFormField   表单字段定义（TypedDict）
+        - ask_clarification_tool   工具本体（由 ClarificationMiddleware 承接）
+"""
 
 class ClarificationFormField(TypedDict, total=False):
     """ 澄清表单里的输入框定义：每个框叫什么名字、是什么类型、是不是必填 """
@@ -74,4 +83,5 @@ def ask_clarification_tool(
             - placeholder: 输入框里的灰色提示文字
         【注意】：表单最多 16 个字段，每个字段最多 24 个选项，名称/标签/选项/提示文字每项最多 200 个字符。超出限制会退化（降级）成纯文本提问。
     """
+    # 真正的中断与表单渲染由 ClarificationMiddleware 按工具参数完成，这里只占位返回
     return "Clarification request processed by middleware"

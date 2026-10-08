@@ -4,10 +4,11 @@ from pydantic import BaseModel, Field
 
 """工具配置
 
-    职责：管理 Lead Agent 可用工具的开关与参数，目前涵盖三块：
-         - Web 搜索（tavily 提供）与网页抓取
-         - 火山方舟豆包生图（Ark Image / doubao-seedream）
-         - 全局工具白名单（留空表示全部启用）
+    职责：管理 Lead Agent 可用工具的开关与参数
+        - web 搜索（tavily）
+        - 网页抓取
+        - 火山方舟豆包生图（doubao-seedream）
+        - 工具白名单（留空表示全部启用）
 
     对外暴露：
         - WebSearchConfig   web 搜索参数

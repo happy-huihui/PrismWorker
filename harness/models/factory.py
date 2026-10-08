@@ -32,16 +32,11 @@ from harness.models.registry import get_strategy, supported_providers
 
 """模型工厂
 
-    职责：根据 ModelConfig ，实例化 Model
-    流程：解析配置、合并参数、按 provider 选择策略 -> 委托实例化，具体的实例化细节由各 provider 策略承担。
-
-    缓存：模型实例按 (配置, 模型名, 思考开关) LRU 复用。这是首帧提速的关键——
-        实测构造一个 ChatDeepSeek 要 2.7~9.6 秒（内部两个 httpx 客户端各约 0.9 秒，
-        Windows 上加载 SSL 信任库很慢），而 run 装配每次都重新造，等于每条会话
-        白等好几秒。带覆盖参数的调用（采样温度等不同参数）不进缓存，避免串参数。
-
-    降级：请求了思考但模型 supports_thinking=false 时不再抛错，忽略该开关继续跑
-        （是否真的被降级由 runtime 层查 supports_thinking 告知前端）。
+    职责：按 ModelConfig 造模型实例，并缓存复用
+        - 解析配置、合并参数，按 provider 选策略
+        - 实例按（配置, 模型名, 思考开关）LRU 复用（构造一次要 2.7~9.6 秒）
+        - 带覆盖参数的调用不进缓存，避免串参数
+        - 请求思考但模型不支持时忽略该开关，不抛错
 
     对外暴露：
         - create_chat_model()   工厂入口，按 provider 分流创建模型
@@ -107,10 +102,10 @@ def create_chat_model(
     返回：
         一个 BaseChatModel 实例（ChatOpenAI 或 DeepSeek 实现类）
     """
-    # 取配置：显式传入优先，否则用全局单例
+    # 1.取配置：显式传入优先，否则用全局单例
     config = app_config or get_app_config()
 
-    # 未指定名字用激活模型，指定了则按名查找（找不到直接报错）
+    # 2.未指定名字用激活模型；指定了则按名查找（找不到直接报错）
     if name is None:
         model_config = config.active_model_config()
     else:
@@ -118,9 +113,10 @@ def create_chat_model(
         if model_config is None:
             raise ValueError(f"模型 {name} 在配置中不存在") from None
 
-    # 思考模式降级：不支持就是不开，不再抛错打断整条 run
+    # 3.思考模式降级：不支持就是不开，不再抛错打断整条 run
     effective_thinking = bool(thinking_enabled) and bool(model_config.supports_thinking)
     if thinking_enabled and not effective_thinking:
+        # 3.1 每个配置只告警一次，避免每条会话重复刷日志
         warn_key = (id(config), model_config.name)
         if warn_key not in _DEGRADE_WARNED:
             _DEGRADE_WARNED.add(warn_key)
@@ -129,38 +125,38 @@ def create_chat_model(
                 model_config.name,
             )
 
-    # 仅「纯配置构造」可复用：带覆盖参数或额外 kwargs 的调用必须现造，
-    # 否则会把 A 调用方的参数串给 B
+    # 4.仅「纯配置构造」可复用：带覆盖参数或额外 kwargs 的调用必须现造，
+    #    否则会把 A 调用方的参数串给 B
     cacheable = not model_overrides and not kwargs
     cache_key: tuple[Any, ...] = (id(config), model_config.name, effective_thinking)
     if cacheable:
         with _MODEL_CACHE_LOCK:
             cached = _MODEL_CACHE.get(cache_key)
             if cached is not None:
-                # 命中即提到 LRU 队尾（最近使用）
+                # 4.1 命中即提到 LRU 队尾（最近使用）
                 _MODEL_CACHE.move_to_end(cache_key)
                 return cached
 
-    # 把配置转换为构造器参数字典
+    # 5.把配置转换为构造器参数字典
     settings = _model_to_settings(model_config)
 
-    # 合并调用方覆盖参数，忽略值为 None 的键以免覆盖配置
+    # 6.合并调用方覆盖参数，忽略值为 None 的键以免覆盖配置
     if model_overrides:
         settings.update(
             {k: v for k, v in model_overrides.items() if v is not None}
         )
 
-    # 按 provider 选择策略并实例化模型
+    # 7.按 provider 选择策略并实例化模型
     model = _build_model(model_config, settings, effective_thinking, **kwargs)
 
+    # 8.可复用的调用回填缓存，超容量则淘汰最久未用
     if cacheable:
         with _MODEL_CACHE_LOCK:
             _MODEL_CACHE[cache_key] = model
-            # 超容量则从队首淘汰最久未用
             while len(_MODEL_CACHE) > _MODEL_CACHE_MAX:
                 _MODEL_CACHE.popitem(last=False)
 
-    # 记录创建结果，便于排查配置问题
+    # 9.记录创建结果，便于排查配置问题
     logger.debug(
         "Created model %s (provider=%s, thinking=%s)",
         model_config.name,
@@ -180,10 +176,10 @@ def _model_to_settings(model_config: ModelConfig) -> dict[str, Any]:
         剔除纯元数据字段后的构造器参数字典
         （保留 model / api_key / base_url / temperature / max_tokens 等）
     """
-    # 序列化配置，忽略未设置的可选字段
+    # 1.序列化配置，忽略未设置的可选字段
     data = model_config.model_dump(exclude_none=True)
 
-    # 移除纯元数据字段（构造器不认识、仅用于工厂决策）
+    # 2.移除纯元数据字段（构造器不认识、仅用于工厂决策）
     for meta_key in ("name", "provider", "supports_vision", "supports_thinking", "context_window"):
         data.pop(meta_key, None)
 
@@ -205,17 +201,17 @@ def _build_model(
         kwargs: 额外参数
     """
 
-    # 获取模型提供商
+    # 1.获取模型提供商标识
     provider = model_config.provider
 
-    # 从注册表按 provider 取对应策略
+    # 2.从注册表按 provider 取对应策略
     strategy = get_strategy(provider)
 
-    # 命中策略则委托其实例化（各 provider 细节封装在策略内部）
+    # 3.命中策略则委托其实例化（各 provider 细节封装在策略内部）
     if strategy is not None:
         return strategy.build(model_config, settings, thinking_enabled, **kwargs)
 
-    # 不支持的供应商直接抛错
+    # 4.不支持的供应商直接抛错（提示里带上可用清单）
     raise ValueError(
         f"不支持的模型提供方: {provider!r}（仅支持 {' / '.join(supported_providers())}）"
     ) from None

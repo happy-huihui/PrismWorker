@@ -5,14 +5,15 @@ from typing import Any, Literal
 from harness.skills.review.models import REPORT_SCHEMA_VERSION
 
 
-"""
-    技能包审查报告渲染器。定位：把 analyzer 产出的 facts 渲染成可读报告。
+"""审查报告渲染
 
-    干两件事：
-        - build_static_report：把 facts 换成标准化的 review-report.v1 dict
-        - render_report_markdown：把 report dict 渲染成中文 Markdown 字符串
+    职责：把 analyzer 的 facts 渲染成可读报告（纯静态，不调 LLM）
+        - build_static_report     facts → review-report.v1 结构化报告
+        - render_report_markdown  报告 → 中文 Markdown
 
-    纯静态渲染，不调用 LLM，所有内容都来自审查的确定性结果。
+    对外暴露：
+        - Readiness / Assurance
+        - readiness_from_facts / build_static_report / render_report_markdown
 """
 
 Readiness = Literal["blocked", "revise", "publish_candidate"]
@@ -28,6 +29,7 @@ def _semantic_severity(severity: str) -> str:
     warning → minor（轻微，值得注意）
     info    → info
     """
+    # 技术级别 → 报告语义级别（error 叫 major、warning 叫 minor）
     mapping = {
         "blocker": "blocker",
         "error": "major",
@@ -67,6 +69,7 @@ def _dimensions_from_facts(facts: dict) -> list[dict]:
     blockers = int(summary.get("blockers", 0))
     errors = int(summary.get("errors", 0))
 
+    # structure：有 blocker 就 blocker，有 error 就 concern，否则 pass
     if blockers > 0:
         structure_status = "blocker"
     elif errors > 0:
@@ -76,6 +79,7 @@ def _dimensions_from_facts(facts: dict) -> list[dict]:
 
     evals = facts.get("evals", {})
     case_count = int((evals or {}).get("case_count", 0))
+    # evidence_quality：有用例才 pass
     evidence_status = "pass" if case_count > 0 else "concern"
 
     return [
@@ -106,6 +110,7 @@ def _recommended_actions(facts: dict, readiness: str) -> list[str]:
     取 findings 里前 5 条的 remediation（修复建议），
     让用户能照着逐步修复问题。
     """
+    # blocked 时只取 blocker 的修复建议；否则取前 5 条
     if readiness == "blocked":
         blockers = [f for f in facts.get("findings", [])
                     if f.get("severity") == "blocker"]
@@ -113,6 +118,7 @@ def _recommended_actions(facts: dict, readiness: str) -> list[str]:
     else:
         actions = [f.get("remediation", "") for f in facts.get("findings", [])[:5]]
 
+    # 去重：同一句 remediation 只出现一次
     seen: set[str] = set()
     result: list[str] = []
     for a in actions:
@@ -143,6 +149,7 @@ def build_static_report(
     readiness = readiness_from_facts(facts, scope=scope)
     dimensions = _dimensions_from_facts(facts)
 
+    # 1.逐条 finding 转成报告 issue（严重级别换成语义级别）
     issues: list[dict] = []
     for f in facts.get("findings", []):
         issues.append({
@@ -154,6 +161,7 @@ def build_static_report(
             "remediation": f.get("remediation", ""),
         })
 
+    # 2.assurance 恒为 static_only：本项目不做行为级验证
     assurance = "static_only"
 
     limitations = [

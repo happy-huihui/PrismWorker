@@ -5,15 +5,14 @@ from typing import Any, Literal
 
 from pydantic import BaseModel, Field, model_validator
 
-"""记忆配置（各方共享字段）
+"""记忆配置
 
-    职责：只放「所有记忆调用方共同读取」的开关与路径；记忆后端的私有调优
-         参数一律塞进 backend_config（dict），由 harness/memory/config.py 的
-         PrismMemConfig 自行解析，避免私有旋钮泄漏到共享 schema 上。
-
-    兼容：backend / memory_db_file / table_name / max_memory_chars 是已弃用
-         字段（长期记忆已改为 memory.json 文档存储），仅保留以兼容旧 config.yaml
-         与旧构造调用；出现非空值时记 WARNING 提醒迁移，不阻断启动。
+    职责：管理记忆的开关、运行模式与检索参数
+        - 启用开关与运行模式（middleware/tool）
+        - 是否注入长期记忆到系统提示词
+        - 记忆数据根目录与 checkpoint 库文件
+        - 检索条数上限
+        - 记忆后端私有配置（backend_config，由 harness/memory/config.py 的 PrismMemConfig 解析）
 
     对外暴露：
         - MemoryConfig       记忆配置
@@ -70,10 +69,10 @@ class MemoryConfig(BaseModel):
     @model_validator(mode="after")
     def _warn_deprecated(self) -> MemoryConfig:
         """旧字段非空时告警，帮助存量配置迁移（不阻断启动）。"""
-        # 逐个检查已弃用字段
+        # 1.逐个检查已弃用字段
         for name in ("backend", "memory_db_file", "table_name", "max_memory_chars"):
             value = getattr(self, name)
-            # 空值视为「没配」，不告警
+            # 2.空值视为「没配」，不告警；非空才告警（仅提示，不阻断启动）
             if value not in (None, ""):
                 logger.warning(
                     "memory.%s=%r 已弃用（长期记忆改为 memory.json 文档存储），"
@@ -88,7 +87,7 @@ class MemoryConfig(BaseModel):
 def get_memory_config() -> MemoryConfig:
     """返回当前全局记忆配置（懒加载）。"""
     global _memory_config
-    # 首次访问时从全局 AppConfig 取
+    # 1.首次访问时从全局 AppConfig 取记忆段
     if _memory_config is None:
         from harness.config.app_config import get_app_config
 
@@ -99,6 +98,7 @@ def get_memory_config() -> MemoryConfig:
 def set_memory_config(config: MemoryConfig) -> None:
     """设置全局记忆配置（测试用）。"""
     global _memory_config
+    # 直接覆盖缓存（测试隔离用）
     _memory_config = config
 
 

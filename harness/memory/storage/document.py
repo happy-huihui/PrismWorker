@@ -16,23 +16,17 @@ from harness.memory.paths import memory_file_path, memory_root
 
 logger = logging.getLogger(__name__)
 
-"""长期记忆文档存储（storage.document）
+"""长期记忆文档存储
 
-    职责：每用户一份 memory.json 的读写 + revision 乐观锁 + 原子落盘 + 线程安全。
-    数据模型（与参考实现一致）：
-        {
-          "version": "1.0",
-          "revision": 0,                     # 乐观锁版本号，每次写入 +1
-          "lastUpdated": "...Z",
-          "user":    {workContext/personalContext/topOfMind: {summary, updatedAt}},
-          "history": {recentMonths/earlierContext/longTermBackground: {...}},
-          "facts":   [{id, content, category, confidence, createdAt, source}]
-        }
-    设计要点：
-        - 进程内 RLock 保证线程安全（队列 Timer 线程与主线程并发）；
-        - 写入「临时文件 + os.replace」原子替换，杜绝半写文件；
-        - save 校验 expected_revision，冲突抛 MemoryRevisionConflict 由 updater 重试；
-        - agent_name 仅保留签名兼容，存储一律按 user 分桶。
+    职责：每用户一份 memory.json 的读写 + revision 乐观锁 + 原子落盘 + 线程安全
+        - 文档结构：user / history 三段摘要 + facts 列表
+        - 写入「临时文件 + os.replace」；save 校验 expected_revision
+        - 读入做防御性归一化，补齐缺失分区
+
+    对外暴露：
+        - MemoryStorageError / MemoryStorageCorruption / MemoryRevisionConflict
+        - utc_now_iso_z / create_empty_memory
+        - MemoryStorage
 """
 
 # fact id 合法字符集（外部传入 id 时校验用）
@@ -59,6 +53,7 @@ def utc_now_iso_z() -> str:
 
 def create_empty_memory() -> dict[str, Any]:
     """返回空记忆文档（updater 与注入共用同一结构）。"""
+    # user / history 各三格摘要 + facts 列表，全部置空（updater 与注入共用同一结构）
     return {
         "version": "1.0",
         "revision": 0,
@@ -79,6 +74,7 @@ def create_empty_memory() -> dict[str, Any]:
 
 def _fact_id() -> str:
     """生成短事实 id（与参考实现同风格：fact_ + hex 8）。"""
+    # 短 id：fact_ + 8 位 hex，够用且不撑爆文档
     return f"fact_{uuid.uuid4().hex[:8]}"
 
 
@@ -100,6 +96,7 @@ class MemoryStorage:
     # ── 内部工具 ────────────────────────────────────────────────────────
     def _document_path(self, user_id: str) -> Path:
         """返回某用户的 memory.json 路径（父目录不自动创建）。"""
+        # 只算路径不建目录：读路径不应有副作用
         return memory_file_path(self._config, user_id)
 
     def _read_raw(self, user_id: str) -> dict[str, Any] | None:
@@ -200,6 +197,7 @@ class MemoryStorage:
 
     def reload(self, user_id: str) -> dict[str, Any]:
         """强制重读（丢弃任何缓存视图）；与 load 同义（本项目无缓存）。"""
+        # 本项目无进程内文档缓存，reload 与 load 等价（保留接口语义）
         return self.load(user_id)
 
     def clear(self, *, user_id: str, agent_name: str | None = None) -> dict[str, Any]:
@@ -210,11 +208,13 @@ class MemoryStorage:
             agent_name: 兼容签名；单 Agent 架构下即清空该用户全部记忆
         """
         with self._lock:
+            # 清空 = 原子写回一份空文档（不删文件，避免竞态读到不存在）
             document = create_empty_memory()
             self._atomic_write(user_id, document)
             return document
 
     def close(self) -> None:
+        # 无外部资源可释放，保持接口一致（连接由各自持有者关闭）
         """释放资源（本实现无外部资源，保持接口一致）。"""
 
     # ── 防御性归一化 ────────────────────────────────────────────────────

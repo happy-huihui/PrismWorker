@@ -1,25 +1,3 @@
-"""generate_image 工具：火山方舟豆包生图 + 落盘 + 产物登记。
-
-   职责：把「Agent 想生成一张图」这件事端到端做完——
-        1. 调 Ark 生图接口拿图片 URL（24h 有效，不可直接交付）
-        2. **立即下载到本线程 outputs 目录**（宿主机侧写盘，不依赖沙箱网络）
-        3. 通过 present_files 的同一套虚拟路径约定登记为交付产物
-           （返回 Command(update={"artifacts": [...]})，前端产物栏即可预览/下载）
-
-   为什么落盘要走宿主机而不是沙箱：
-       生图请求是宿主机发起的（Ark 需要出网 + API Key），图片字节已在宿主机；
-       再往返沙箱写一次纯属绕路。present_files 的路径归一化逻辑
-       （normialize_result_file）本来就同时支持「沙箱虚拟路径」与「宿主机真实
-       路径」两种入参，这里走宿主真实路径即可。
-
-   与 view_image 的区别：
-       view_image 是「把已有图片读给模型看」；本工具是「产出新图片给用户」。
-
-   与 present_files 的关系：
-       本工具自带登记，所以 Agent **不需要**再对这些图片调 present_files；
-       提示词里也据实说明，避免重复登记。
-"""
-
 from __future__ import annotations
 
 import base64
@@ -38,6 +16,18 @@ from langgraph.types import Command
 from harness.config.paths import VIRTUAL_PATH_PREFIX, get_paths
 from harness.tools.types import Runtime
 from harness.runtime.user_context import resolve_runtime_user_id
+
+"""generate_image 工具
+
+    职责：把「生成一张图」端到端做完——调接口 → 立即落盘 outputs → 登记产物
+        - 图片 URL 仅 24h 有效，必须马上下载到宿主 outputs
+        - 落盘走宿主机（生图请求在宿主发起、字节已在宿主，不绕沙箱）
+        - 自带登记，模型无需再对这些图片调 present_files
+
+    对外暴露：
+        - generate_image_tool
+        - OUTPUTS_VIRTUAL_PREFIX
+"""
 
 logger = logging.getLogger(__name__)
 
@@ -85,27 +75,33 @@ def _sanitize_stem(text: str) -> str:
 
 def _guess_extension(url: str, content_type: str | None, index: int) -> str:
     """推断图片扩展名（按 URL 后缀 → Content-Type → 默认 jpg 逐级回退）。"""
+    # 1.优先看 URL 路径后缀（去掉 query）
     suffix = Path(url.split("?")[0]).suffix.lower()
     if suffix in (".jpg", ".jpeg", ".png", ".webp", ".gif", ".bmp"):
         return ".jpg" if suffix == ".jpeg" else suffix
+    # 2.退到 Content-Type
     if content_type:
         main = content_type.split(";")[0].strip().lower()
         if main in _EXT_BY_MIME:
             return _EXT_BY_MIME[main]
     # 多图时加序号，避免同名覆盖
+    # 3.再兜底 jpg；多图加序号避免同名覆盖
     return ".jpg" if index == 0 else f"-{index}.jpg"
 
 
 def _thread_id_from_runtime(runtime: Runtime) -> str | None:
     """从运行时上下文解析 thread_id（与 present_file 同款三阶梯回退）。"""
+    # 1.优先 runtime.context
     thread_id = runtime.context.get("thread_id") if runtime.context else None
     if thread_id:
         return str(thread_id)
+    # 2.退到 runtime.config.configurable
     runtime_config = getattr(runtime, "config", None) or {}
     if isinstance(runtime_config, dict):
         found = runtime_config.get("configurable", {}).get("thread_id")
         if found:
             return str(found)
+    # 3.再退到图全局 config（无运行时上下文时抛 RuntimeError）
     try:
         found = get_config().get("configurable", {}).get("thread_id")
         if found:
@@ -127,9 +123,11 @@ def _save_bytes(thread_id: str, user_id: str, filename: str, data: bytes) -> Pat
     返回：
         宿主机真实文件路径
     """
+    # 1.定位本线程 outputs 目录并确保存在
     paths = get_paths()
     outputs_dir = paths.sandbox_outputs_dir(thread_id, user_id=user_id)
     outputs_dir.mkdir(parents=True, exist_ok=True)
+    # 2.双重防穿越：即使文件名被污染也不允许跳出 outputs
     target = (outputs_dir / filename).resolve()
     # 双重防穿越：即使 filename 被污染也不允许跳出 outputs
     try:
@@ -142,6 +140,7 @@ def _save_bytes(thread_id: str, user_id: str, filename: str, data: bytes) -> Pat
 
 def _virtual_of(thread_id: str, user_id: str, real_path: Path) -> str:
     """把宿主机真实路径转成前端统一识别的产物虚拟路径。"""
+    # 与 present_files 同一套虚拟路径约定，前端才能识别
     outputs_dir = get_paths().sandbox_outputs_dir(thread_id, user_id=user_id).resolve()
     relative = real_path.resolve().relative_to(outputs_dir)
     return f"{OUTPUTS_VIRTUAL_PREFIX}/{relative.as_posix()}"
@@ -161,6 +160,7 @@ def _artifact_message(content: str, tool_call_id: str, artifacts: list[str]) -> 
         前端产物栏读的就是这个通道——只回 ToolMessage 的话，图片虽然落盘了，
         但用户界面上不会出现任何产物卡片，等于「生成了却交付不到」。
     """
+    # 显式写 artifacts 键，reducer 才会把产物合并进 ThreadState
     return Command(
         update={
             "messages": [ToolMessage(content, tool_call_id=tool_call_id)],
@@ -174,6 +174,7 @@ def _download(url: str, timeout: float) -> tuple[bytes, str | None]:
     import httpx
 
     with httpx.Client(timeout=timeout, follow_redirects=True) as client:
+        # 跟随重定向（图片 CDN 常 302）；非 2xx 抛错由调用方按单张失败处理
         resp = client.get(url)
         resp.raise_for_status()
         return resp.content, resp.headers.get("content-type")
@@ -193,12 +194,14 @@ def _generate_and_register(
     from harness.community.ark_image.client import ArkImageError, build_client
 
     # 1. 定位线程与用户（落盘与登记都要用）
+    # 1.定位线程与用户（落盘与登记都要用）
     thread_id = _thread_id_from_runtime(runtime)
     if not thread_id:
         return _tool_message("生图失败：无法解析当前线程 id", tool_call_id)
     user_id = resolve_runtime_user_id(runtime)
 
     # 2. 调 Ark 生图
+    # 2.构造客户端；失败必须留痕（否则排查只能解剖 checkpoint）
     try:
         client = build_client()
     except ArkImageError as exc:
@@ -206,6 +209,7 @@ def _generate_and_register(
         logger.warning("生图失败（构造客户端）：%s", exc)
         return _tool_message(f"生图失败：{exc}", tool_call_id)
 
+    # 3.调接口（异常信息已含状态码 / 错误码 / 处置建议，不要再手工拼）
     try:
         result = client.generate(prompt, size=size, model=model, image=image)
     except ArkImageError as exc:
@@ -220,6 +224,7 @@ def _generate_and_register(
     saved: list[str] = []
     errors: list[str] = []
 
+    # 4.逐张落盘：url 形式先下载、b64 形式直接解码；单张失败不阻断其余
     for index, url in enumerate(result.urls):
         try:
             data, content_type = _download(url, timeout)
@@ -237,12 +242,14 @@ def _generate_and_register(
             continue
         saved.append(_persist(stem, index + len(result.urls), ".png", data, thread_id, user_id))
 
+    # 5.一张都没成功才算整体失败
     if not saved:
         joined = "；".join(errors) or "未返回图片数据"
         logger.warning("生图失败（产物落盘）：%s", joined)
         return _tool_message(f"生图失败：{joined}", tool_call_id)
 
     # 4. 回执：成功登记了几张、虚拟路径是什么、以及失败提示
+    # 6.回执：成功清单 + 失败提示 + 「无需再调 present_files」说明
     header = f"已生成 {len(saved)} 张图片并登记为交付产物："
     lines = [f"- {path}" for path in saved]
     tail = ""
@@ -270,6 +277,7 @@ def _persist(
     user_id: str,
 ) -> str:
     """落盘一张图片并返回其虚拟路径（多图自动加序号）。"""
+    # 首张不加序号，多图从 -2 开始编号
     name = f"{stem}{ext}" if index == 0 else f"{stem}-{index + 1}{ext}"
     real = _save_bytes(thread_id, user_id, name, data)
     return _virtual_of(thread_id, user_id, real)
@@ -306,6 +314,7 @@ def generate_image_tool(
         image: 参考图（可选）：图片 URL 或 URL 列表，用于图生图 / 多图融合；
             必须是公网可访问的 URL，本地虚拟路径（/mnt/user-data/...）无效。
     """
+    # 工具层只做转发，主流程在 _generate_and_register
     return _generate_and_register(
         prompt=prompt,
         size=size,

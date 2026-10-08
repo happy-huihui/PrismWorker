@@ -171,3 +171,28 @@ subagents:
       timeout_seconds: 600
       max_turns: 30
       token_budget: null           # token 预算；null=不限制
+
+
+# ──────────────────────── 8. 观测 ────────────────────────
+observability:
+  # 管理员 user_id 列表：观测台入口仅对这些人显示，且能看到所有用户数据。
+  admin_user_ids: [huihui]
+  # 模型成本价格表：每百万 token 美元价（input / output），模型标识按子串匹配。
+  # 真实价格 2026-09-29 联网核实（标准实时 API、缓存未命中），可随时改。
+  #   DeepSeek 2026-08-16 起峰谷定价（高峰 = 2× 空闲），此处记空闲档。
+  pricing:
+    mimo-v2.6-pro:                 # 小米 MiMo 官方海外价
+      input: 0.435
+      output: 0.87
+    mimo-v2.6-flash:
+      input: 0.14
+      output: 0.28
+    deepseek-v4-pro:               # DeepSeek V4-Pro 空闲档
+      input: 0.66
+      output: 1.98
+    deepseek-v4-flash:             # DeepSeek V4.1-Flash（v4-flash 已路由至此）
+      input: 0.15
+      output: 0.60
+    gpt-6-astra:                   # OpenAI 官方
+      input: 10.00
+      output: 50.00

@@ -1,7 +1,15 @@
-"""内置 general_purpose 子代理的配置定义。"""
-
 from harness.prompt import load_text
 from harness.subagents.config import SubagentConfig
+
+"""general_purpose 子代理配置
+
+    职责：定义唯一内置子代理 general_purpose 的配置
+        - 提示词取自 harness/prompt 的 subagents/general_purpose
+        - 继承父级模型，禁用 task（防递归派发）
+
+    对外暴露：
+        - GENERAL_PURPOSE_CONFIG
+"""
 
 GENERAL_PURPOSE_CONFIG = SubagentConfig(
     name="general_purpose",

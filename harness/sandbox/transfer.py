@@ -1,22 +1,3 @@
-"""容器 → 宿主产物回传（transfer）——阶段15 交付闭环。
-
-背景：真实沙箱容器未挂载宿主工作区（容器内存态 /mnt/user-data），
-agent 在容器内产出的文件宿主不可见，present_files 登记的虚拟路径
-没有物理文件可下载。本模块在 run 收尾把容器 outputs 目录的内容拉回
-宿主线索 outputs 目录，让产物交付链路闭合。
-
-实现：基于 exec_command 的文本通道做分块 base64 传输——
-  1. find 列出容器内全部普通文件（相对路径 %POSIX 风格）
-  2. 逐文件按块（块大小由 bash_output_max_chars 动态计算，保证单次
-     命令的 base64 输出不超限）执行 `dd 分段 + base64 -w0` 读回
-  3. 宿主解码写盘，用 stat -c%s 做完整字节数对账
-
-限制与约定：
-  - 仅回传普通文件（跳过目录 / 符号链接）
-  - 单目录文件数上限 _MAX_FILES（默认 500），超出告警并以已列出的为准
-  - 传输失败抛 SandboxTransferError；不影响 run 本身（收尾阶段容忍失败）
-"""
-
 from __future__ import annotations
 
 import base64
@@ -26,6 +7,18 @@ from pathlib import Path
 
 from harness.config.paths import VIRTUAL_PATH_PREFIX
 from harness.sandbox.exceptions import SandboxError, SandboxPathError
+
+"""容器产物回传
+
+    职责：run 收尾把容器 outputs 目录的文件拉回宿主线程 outputs 目录，闭合产物交付链路
+        - exec_command 文本通道分块 base64 传输（dd 分段 + base64 -w0）
+        - stat -c%s 字节数对账；仅普通文件，单目录上限 _MAX_FILES
+        - 失败抛 SandboxTransferError，不影响 run 本身
+
+    对外暴露：
+        - SandboxTransferError    回传失败（路径 / 内容 / 对账）
+        - pull_container_outputs  回传容器目录到宿主目录，返回文件数
+"""
 
 logger = logging.getLogger(__name__)
 
@@ -62,19 +55,24 @@ def pull_container_outputs(
     Raises:
         SandboxTransferError: 任意一步失败（调用方按收尾容忍处理）
     """
+    # 只接受具备 exec_command 与路径校验能力的真实沙箱（None / FakeSandbox 直接拒绝）
     validate = getattr(sandbox, "_validate_path", None)
     exec_command = getattr(sandbox, "exec_command", None)
     if validate is None or exec_command is None:
         raise SandboxTransferError("回传目标不是有效沙箱实例（缺 exec_command / _validate_path）")
+    # 先过白名单：容器源目录必须落在 /mnt/user-data 下
     try:
         safe_src = validate(container_src_dir)
     except SandboxPathError as exc:
         raise SandboxTransferError(f"容器源目录越界: {container_src_dir}") from exc
 
+    # 宿主目标目录不存在就建（线程 outputs 目录可能尚未创建）
     dest = Path(host_dest_dir)
     dest.mkdir(parents=True, exist_ok=True)
 
+    # 阶段一：列出容器内全部普通文件的相对路径
     listing = exec_command(_FIND_TEMPLATE.format(src=safe_src))
+    # 容器里没有 outputs 目录：不算错误，直接回传 0 个
     if "SBX_OUTPUTS_MISSING" in listing:
         logger.info("容器内无 outputs 目录（%s），跳过回传", safe_src)
         return 0
@@ -85,14 +83,17 @@ def pull_container_outputs(
 
     pulled = 0
     for rel_path in rel_paths:
+        # 防御性校验：容器列出的相对路径不得含 ..（否则会写到宿主目录之外）
         if ".." in rel_path.split("/"):
             raise SandboxTransferError(f"容器产物体含非法相对路径: {rel_path!r}")
+        # 阶段二：问容器该文件的字节数，供分块读取与最终对账
         stat_out = exec_command(f"stat -c%s -- '{safe_src}/{rel_path}'; echo SBX_STAT_END")
         size_bytes = _parse_size(stat_out)
         if size_bytes is None:
             raise SandboxTransferError(
                 f"无法确定容器文件大小: {rel_path}（输出={stat_out[:200]!r}）"
             )
+        # 保留相对目录结构（dest 下按 rel_path 重建）
         target = dest / rel_path
         target.parent.mkdir(parents=True, exist_ok=True)
         written = _pull_single_file(sandbox, exec_command, safe_src, rel_path, target, size_bytes)
@@ -109,6 +110,7 @@ def _parse_listing(listing: str) -> list[str]:
     """
     paths: list[str] = []
     for raw_line in listing.splitlines():
+        # 每行一条路径；跳过空行与 exec_command 夹带的杂质（退出码说明 / 截断提示）
         line = raw_line.strip()
         if not line or line == "(no output)":
             continue
@@ -120,6 +122,7 @@ def _parse_listing(listing: str) -> list[str]:
 
 def _parse_size(stat_out: str) -> int | None:
     """从 stat 输出中提取文件字节数（取第一个非负整数，直到结束标记）。"""
+    # 只取结束标记之前的内容，避免把标记本身当数字解析
     end = stat_out.split("SBX_STAT_END")[0]
     for token in end.split():
         try:
@@ -196,14 +199,17 @@ def _read_base64_chunk(exec_command: object, container_path: str, offset: int, r
     """
     bs = raw_len
     skip = offset // bs
+    # dd 按 bs 分片、skip 跳到目标偏移；base64 -w0 单行输出，便于走文本通道
     command = (
         f"dd if='{container_path}' bs={bs} skip={skip} count=1 2>/dev/null | base64 -w0; echo SBX_EOF"
     )
     out = exec_command(command)
     marker = "SBX_EOF"
+    # 缺结束标记 = 输出被截断，宁可报错也不要写半截文件
     if marker not in out:
         raise SandboxTransferError(
             f"容器分块输出不完整（缺结束标记）: {container_path} @ {offset} (输出={out[:200]!r})"
         )
+    # 去掉换行等非 base64 字符，只留合法载荷
     payload = out.split(marker)[0]
     return re.sub(r"[^A-Za-z0-9+/=]", "", payload)

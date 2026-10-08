@@ -10,12 +10,15 @@ from harness.memory.storage import migrate_legacy_sqlite
 
 logger = logging.getLogger(__name__)
 
-"""记忆管理器单例工厂（manager.factory）
+"""记忆管理器单例工厂
 
-    职责：按全局配置懒构建进程级唯一 MemoryManager，并在线程安全下复用；
-         首次构建时顺带执行一次「旧 SQLite 库迁移」。
-    解耦：从 harness.config.memory_config 取 host 配置，转成后端私有
-         PrismMemConfig，再装配 PrismMemoryManager。
+    职责：按全局配置懒构建进程级唯一 MemoryManager，并在线程安全下复用
+        - 首次构建时顺带执行一次旧 SQLite 库迁移
+        - host 配置 → 后端私有 PrismMemConfig → 装配 PrismMemoryManager
+
+    对外暴露：
+        - get_memory_manager    进程级单例（懒构造、线程安全）
+        - reset_memory_manager  重置单例并关闭旧实例
 """
 
 # 单例与其构造锁

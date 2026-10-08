@@ -1,6 +1,7 @@
 import { useState } from 'react'
+import { useNavigate } from 'react-router-dom'
 
-import { MorphIcon, SettingsGear } from '@/components/icons'
+import { Activity, MorphIcon, SettingsGear } from '@/components/icons'
 import { useAuth } from '@/app/providers/AuthProvider'
 
 import { cn } from '@/lib/utils'
@@ -18,7 +19,8 @@ import { SettingsDialog } from '../settings/SettingsDialog'
  *   已登录           → 实心头像 + user_id，点击进设置（退出登录在「账户设置」里）。
  */
 export function SidebarFooter({ collapsed }: { collapsed: boolean }) {
-  const { userId, booting, openLogin } = useAuth()
+  const { userId, booting, openLogin, isAdmin } = useAuth()
+  const navigate = useNavigate()
   // 设置弹窗开合（本地状态即可，无需全局）
   const [settingsOpen, setSettingsOpen] = useState(false)
 
@@ -54,6 +56,26 @@ export function SidebarFooter({ collapsed }: { collapsed: boolean }) {
 
   return (
     <div className={cn('border-t px-2 py-2', collapsed && 'px-1.5')}>
+      {/* 观测台入口：仅管理员可见，进入 /observability（独立整页中台） */}
+      {isAdmin && (
+        <button
+          type="button"
+          title="观测台"
+          aria-label="观测台"
+          onClick={() => navigate('/observability')}
+          className={cn(
+            'flex w-full items-center gap-2 rounded-lg px-1.5 py-1 text-left text-[13px] text-muted-foreground transition-colors',
+            'hover:bg-secondary hover:text-foreground',
+            collapsed && 'justify-center px-0',
+          )}
+        >
+          <span className="grid size-[30px] shrink-0 place-items-center rounded-[9px]">
+            <Activity className="size-[18px]" />
+          </span>
+          {!collapsed && <span>观测台</span>}
+        </button>
+      )}
+
       {/* 整行可点：进入设置（齿轮为行尾视觉件，不单独响应） */}
       <button
         type="button"

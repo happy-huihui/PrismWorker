@@ -1,9 +1,3 @@
-"""线程路由（threads）——线程会话的 CRUD 网关。
-
-全部委托 harness.runtime.threads_data.ThreadStore：本层只做参数解析 / 异常映射 /
-响应序列化，不含业务逻辑。用户身份来自 X-User-Id 请求头（deps.get_user_id）。
-"""
-
 from __future__ import annotations
 
 from typing import Any
@@ -18,6 +12,16 @@ from app.api.schemas import (
     thread_out_from_meta,
 )
 
+"""线程路由
+
+    职责：线程会话 CRUD 网关，全部委托 ThreadStore
+        - 只做参数解析 / 异常映射 / 响应序列化，不含业务逻辑
+        - 身份来自 deps.get_user_id（Bearer token 换 user_id）
+
+    对外暴露：
+        - router
+"""
+
 router = APIRouter(prefix="/threads", tags=["threads"])
 
 
@@ -28,6 +32,7 @@ async def create_thread(
     store: Any = Depends(get_thread_store),
 ) -> ThreadOut:
     """创建线程（只建元数据；磁盘目录留待首次 run 时创建）。"""
+    # 只建元数据；磁盘目录由首次 run 时的线程上下文中间件创建
     meta = store.create(user_id=user_id, title=body.title)
     return thread_out_from_meta(meta)
 
@@ -65,6 +70,7 @@ async def rename_thread(
     """重命名线程（标题非空）。"""
     try:
         meta = store.rename(user_id=user_id, thread_id=thread_id, new_title=body.title)
+    # 线程不存在 → 404；标题非法（空）→ 422
     except KeyError:
         raise HTTPException(status_code=404, detail=f"线程不存在: {thread_id}")
     except ValueError as exc:
@@ -84,6 +90,7 @@ async def delete_thread(
     """
     try:
         deleted = await store.delete(user_id=user_id, thread_id=thread_id)
+    # 目录删除失败则中止并保留元数据（保证「有 meta 必有目录」）
     except OSError as exc:
         raise HTTPException(status_code=409, detail=f"线程目录删除失败: {exc}")
     if not deleted:

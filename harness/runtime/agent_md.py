@@ -9,19 +9,16 @@ from harness.config.paths import get_paths
 
 logger = logging.getLogger(__name__)
 
-"""用户自定义指令仓库（agent_md）
+"""用户自定义指令仓库
 
-    职责：管理每用户一份的自定义指令（agent.md）——读取、保存、清空。
-    存储：{base_dir}/users/{user_id}/agent.md，纯文本 Markdown + 原子改写
-         （临时文件 + os.replace）。内容为空/文件缺失都视为「未设置」。
-    用途：API 路由（app/api/routes/agent_md.py）负责读写，
-         AgentMdMiddleware 在每轮模型调用前读取并注入系统提示词末尾。
-    缓存：mtime 缓存——文件未变时直接返回缓存内容，避免每轮模型调用重复读盘。
+    职责：按用户维护一份自定义指令 agent.md，支持读 / 写 / 清空（缺失或空视为未设置）
+        - 落盘 users/{uid}/agent.md，纯文本原子改写
+        - 长度上限 MAX_AGENT_MD_LENGTH，mtime 缓存避免重复读盘
 
     对外暴露：
         - MAX_AGENT_MD_LENGTH  指令长度上限（字符数）
-        - AgentMdStore         仓库本体（load/save/clear）
-        - get_agent_md_store   进程级单例
+        - AgentMdStore         仓库本体（load / save / clear）
+        - get_agent_md_store   进程级单例（懒构造、线程安全）
         - reset_agent_md_store 重置单例（测试隔离）
 """
 

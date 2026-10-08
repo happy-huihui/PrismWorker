@@ -12,21 +12,18 @@ from typing import Any
 
 from harness.config.paths import _validate_thread_id, get_paths
 
-"""线程元数据仓库（threads_data.store）
+"""线程元数据仓库
 
-    职责：只管线程的元数据（标题/时间/消息数/状态），不创建也不删除磁盘目录。
-    背景：线程的 user-data 目录由 harness 在首次 run 时经 ThreadContextMiddleware
-         自动创建；删除时做「目录 + 元数据」联动——先异步删 user-data 目录
-         （失败则中止、保留元数据，保证「有 meta 必有目录可用」），成功后再删
-         元数据行。
-    存储：{base_dir}/users/{user_id}/threads/meta.json，单文件 JSON + 原子改写
-         （临时文件 + os.replace），进程内缓存 + 写时落盘。
+    职责：只管线程元数据（标题 / 时间 / 消息数 / 状态），不创建也不删除磁盘目录
+        - 落盘 users/{uid}/threads/meta.json，单文件 JSON + 原子改写
+        - 进程内两级缓存（user → thread），写时落盘
+        - 删除做「目录 + 元数据」联动：先删目录、成功再摘元数据（保证有 meta 必有目录）
 
     对外暴露：
-        - ThreadMeta       一条线程元数据
-        - ThreadStore      仓库本体（create/get/list/rename/update/exists/delete）
-        - get_thread_store 进程级单例
-        - reset_thread_store 重置单例（测试隔离）
+        - ThreadMeta          一条线程元数据
+        - ThreadStore         仓库本体（create / get / list / rename / update / exists / delete）
+        - get_thread_store    进程级单例（懒构造、线程安全）
+        - reset_thread_store  重置单例（测试隔离）
 """
 
 # 元数据文件名
@@ -144,9 +141,11 @@ class ThreadStore:
     ) -> ThreadMeta | None:
         """更新并落盘；返回更新后的元数据（不存在返回 None）。"""
         data = self._load(user_id)
+        # 线程未登记：不动盘，直接返回 None
         entry = data.get(thread_id)
         if entry is None:
             return None
+        # 只合并调用方传入的字段，未传的保持原值
         if fields:
             entry.update(fields)
         self._save(user_id, data)
@@ -196,6 +195,7 @@ class ThreadStore:
         _validate_thread_id(thread_id)
         with self._lock:
             data = self._load(user_id)
+            # 未登记的线程返回 None（调用方据此判存在性）
             entry = data.get(thread_id)
             return ThreadMeta.from_dict(entry) if entry else None
 
@@ -204,6 +204,7 @@ class ThreadStore:
         with self._lock:
             data = self._load(user_id)
             metas = [ThreadMeta.from_dict(entry) for entry in data.values()]
+        # 按最后更新时间倒序，最新的会话排在最前
         metas.sort(key=lambda m: m.updated_at, reverse=True)
         return metas
 

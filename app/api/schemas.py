@@ -1,15 +1,21 @@
-"""API 请求/响应模型（schemas）——Pydantic v2 标准模型。
-
-为前端提供稳定契约，同时承担输入校验（字段类型/必填/长度）。模型直接映射
-core 层数据结构（ThreadMeta / RunRecord / RunHandle 的公开字段），不引入
-多余概念。字段命名与 core 一致，前端直接消费。
-"""
-
 from __future__ import annotations
 
 from typing import Any
 
 from pydantic import BaseModel, Field
+
+"""API 请求 / 响应模型
+
+    职责：为前端提供稳定契约，并承担输入校验（类型 / 必填 / 长度）
+        - 字段直接映射 core 层数据结构的公开字段，不引入多余概念
+        - 另含 ThreadMeta / RunRecord → 响应模型的转换函数
+
+    对外暴露：
+        - ThreadCreate / ThreadRename / ThreadOut
+        - RunCreate / RunOut / ChainOut
+        - ModelOut / MessageOut / UploadOut
+        - thread_out_from_meta / run_out_from_record
+"""
 
 """
     API 契约速览：
@@ -84,6 +90,31 @@ class RunOut(BaseModel):
     created_at: float = Field(description="创建时间戳")
     started_at: float | None = Field(default=None, description="开始执行时间戳")
     finished_at: float | None = Field(default=None, description="结束时间戳")
+    trace_id: str = Field(default="", description="观测 trace_id")
+    total_tokens: int = Field(default=0, description="累计 token 总量")
+    cost: float = Field(default=0.0, description="估算成本（美元）")
+
+
+class ObsRunDetailOut(BaseModel):
+    """观测中台运行详情：run 汇总 + span 树 + 日志流 + 思考链回放。"""
+
+    run: RunOut = Field(description="run 汇总（含 token/成本）")
+    spans: list[dict[str, Any]] = Field(
+        default_factory=list, description="span 列表（attributes 已反序列化）"
+    )
+    logs: list[dict[str, Any]] = Field(
+        default_factory=list, description="结构化日志列表（fields 已反序列化）"
+    )
+    chain_events: list[dict[str, Any]] = Field(
+        default_factory=list, description="思考链事件流 [{event, data}]，供回放"
+    )
+
+
+class ObsRunListOut(BaseModel):
+    """观测中台运行列表：分页数据 + 总数。"""
+
+    items: list[RunOut] = Field(default_factory=list, description="本页运行记录")
+    total: int = Field(default=0, description="符合过滤条件的总数（供分页）")
 
 
 
@@ -130,6 +161,7 @@ class UploadOut(BaseModel):
 
 def thread_out_from_meta(meta: Any) -> ThreadOut:
     """从 ThreadMeta 构造 ThreadOut。"""
+    # 逐字段搬运，保持与 core 数据结构同名字段
     return ThreadOut(
         thread_id=meta.thread_id,
         user_id=meta.user_id,
@@ -144,6 +176,7 @@ def thread_out_from_meta(meta: Any) -> ThreadOut:
 
 def run_out_from_record(record: Any) -> RunOut:
     """从 RunRecord 构造 RunOut。"""
+    # artifacts 先拷一份，避免把 core 内部列表引用透出去
     return RunOut(
         run_id=record.run_id,
         thread_id=record.thread_id,
@@ -157,4 +190,7 @@ def run_out_from_record(record: Any) -> RunOut:
         created_at=record.created_at,
         started_at=record.started_at,
         finished_at=record.finished_at,
+        trace_id=record.trace_id,
+        total_tokens=record.total_tokens,
+        cost=record.cost,
     )

@@ -1,20 +1,3 @@
-"""沙箱热池（Warm Pool）——保活复用与闲置治理的纯数据结构与策略。
-
-职责（对应参考实现 aio_sandbox_provider 的 warm pool 协议与
-WarmPoolLifecycleMixin，去掉跨进程 ownership）：
-    - ``park``：把 run 结束的沙箱放回热池（容器保持运行，零冷启动复用）；
-    - ``reclaim``：取用时从热池提升回活跃（同线程下轮直接复用）；
-    - ``idle_expired``：按 idle_timeout 收集闲置超时的条目（供 idle checker
-      销毁容器）——配置字段 idle_timeout 在本模块真正生效；
-    - ``evict_oldest``：容量闸门——活跃+热池达到 replicas 上限时逐出最旧
-      的热池条目（参考实现的 _evict_oldest_warm）；
-    - ``snapshot / clear``：管理接口与优雅关闭。
-
-线程安全：内部 RLock，可被主线程、run 收尾线程与 idle checker 守护线程
-并发访问。模块只处理「条目的增删查」，不执行任何 docker 命令——容器销毁
-由调用方（SandboxManager）根据返回的条目执行，保持职责分离。
-"""
-
 from __future__ import annotations
 
 import logging
@@ -22,6 +5,20 @@ import threading
 import time
 from dataclasses import dataclass, field
 from typing import Any, Protocol
+
+"""沙箱热池
+
+    职责：热池的保活复用与闲置治理，只增删查条目、不执行任何 docker 命令
+        - park / reclaim / peek / remove 条目流转
+        - idle_expired 收集闲置条目（0 = 永不超时）
+        - evict_oldest 容量闸门逐出最旧
+        - 内部 RLock，支持主线程 / run 收尾线程 / idle checker 并发访问
+
+    对外暴露：
+        - Parkable   可入池沙箱的协议（id / base_url）
+        - WarmEntry  一条热池记录（实例 + 入池时间）
+        - WarmPool   热池本体
+"""
 
 logger = logging.getLogger(__name__)
 
@@ -46,6 +43,7 @@ class WarmPool:
 
     def __init__(self) -> None:
         """初始化空热池（线程安全）。"""
+        # 实例 id → 条目；用 RLock 支持同一线程重入（快照内再调其它方法）
         self._entries: dict[str, WarmEntry] = {}
         self._lock = threading.RLock()
 
@@ -88,18 +86,22 @@ class WarmPool:
 
         调用方负责保证容器运行中且实例未被 close（实例复用语义）。
         """
+        # 没有 id 就无法做键，直接拒绝（避免产生取不回的孤儿条目）
         if instance is None or not getattr(instance, "id", None):
             raise ValueError("park 需要带 id 的沙箱实例")
         with self._lock:
+            # 已存在则覆盖：幂等，且刷新 parked_at = 重置 idle 计时
             self._entries[instance.id] = WarmEntry(instance=instance, parked_at=time.time())
 
     def reclaim(self, sandbox_id: str) -> Any | None:
+        # pop 即「取出并移除」：提升回活跃后就不该再留在热池
         """从热池提升一个沙箱回活跃（取出即删除）；不存在返回 None。"""
         with self._lock:
             entry = self._entries.pop(sandbox_id, None)
             return entry.instance if entry is not None else None
 
     def peek(self, sandbox_id: str) -> Any | None:
+        # get 不删：只探测健康，真正取用由 reclaim 完成
         """只看不取（健康检查前探测用）；不存在返回 None。"""
         with self._lock:
             entry = self._entries.get(sandbox_id)
@@ -121,6 +123,7 @@ class WarmPool:
 
         调用方拿到列表后自行销毁容器并 ``remove`` 每一条。
         """
+        # idle_timeout<=0 视为关闭闲置回收（永不超时）
         if idle_timeout <= 0:
             return []
         current = now if now is not None else time.time()
@@ -136,6 +139,7 @@ class WarmPool:
         with self._lock:
             if not self._entries:
                 return None
+            # 取 parked_at 最小者（入池最久）逐出
             oldest_id = min(self._entries, key=lambda sid: self._entries[sid].parked_at)
             entry = self._entries.pop(oldest_id)
             return entry.instance

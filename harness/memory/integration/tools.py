@@ -13,13 +13,14 @@ from harness.tools.types import Runtime
 
 logger = logging.getLogger(__name__)
 
-"""长期记忆工具（integration.tools）
+"""长期记忆工具
 
-    职责：让模型自主保存 / 检索 / 删除跨会话记忆（仅 mode=tool 时注册）。
-    三工具：save_memory（同 key 自动更新）/ search_memory（按关键词+标签检索）
-           / delete_memory（按 key 定位删除）。
-    约定：user_id 统一从 runtime 解析；工具签名与旧版一致（模型侧零改动），
-         底层从 SQLite 直读写切换为记忆管理器的 fact CRUD。
+    职责：让模型自主保存 / 检索 / 删除跨会话记忆（仅 mode=tool 时注册）
+        - save_memory 同 key 覆盖更新 / search_memory 关键词+标签检索 / delete_memory 按 key 删除
+        - user_id 统一从 runtime 解析；异常统一转 ToolMessage
+
+    对外暴露：
+        - save_memory_tool / search_memory_tool / delete_memory_tool
 """
 
 

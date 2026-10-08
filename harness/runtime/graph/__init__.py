@@ -7,9 +7,13 @@ from harness.runtime.graph.registry import (
     reset_agent_registry,
 )
 
-"""图包（graph）
+"""图包
 
-    职责：Lead Agent 的装配与 LRU 缓存，向 run 编排提供编译好的图。
+    职责：Lead Agent 的装配与 LRU 缓存，向 run 编排提供编译好的图
+
+    对外暴露：
+        - AgentRegistry / AgentBuilder
+        - get_agent_registry / reset_agent_registry
 """
 
 __all__ = [

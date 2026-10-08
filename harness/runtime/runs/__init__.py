@@ -15,11 +15,18 @@ from harness.runtime.runs.models import (
 from harness.runtime.runs.store import RunStore, row_to_record
 from harness.runtime.runs.worker import run_worker
 
-"""run 编排包（runs）
+"""run 编排包
 
-    职责：一次 agent run 的完整编排——创建/取消/查询/等待 + 后台执行 + 落库。
-    结构：models 数据模型、store runs 表读写、worker 后台驱动与帧解析、
-         manager 对外编排入口。
+    职责：一次 agent run 的完整编排——创建 / 取消 / 查询 / 等待 + 后台执行 + 落库
+        - models   数据模型与状态常量
+        - store    runs 表读写
+        - worker   后台驱动与帧解析
+        - manager  对外编排入口
+
+    对外暴露：
+        - RunManager / RunStore / row_to_record / run_worker
+        - RunRecord / RunHandle / RunConflictError / RunNotFoundError
+        - RUN_STATUS_PENDING / RUNNING / FINISHED / CANCELLED / ERROR
 """
 
 __all__ = [

@@ -13,33 +13,20 @@ from harness.models.reasoning import (
 
 """MiMo（小米大模型）模型实现类
 
-    职责：放 MiMo 到底用哪几个模型类，以及多轮思考链的保活代码。
-    背景：MiMo 走 OpenAI 兼容协议（https://api.xiaomimimo.com/v1），
-         所以直接继承 ChatOpenAI；但它是推理模型——默认就返回
-         reasoning_content（无需任何开关参数），多轮时把上一轮思考链
-         一并回传效果最好，而 LangChain 序列化时会把它丢掉，这里补回来。
-
-    实测结论（2026-09-25，非照抄文档）：
-        - /v1/models 当前 9 个模型，pro 档最新为 mimo-v2.6-pro
-          （mimo-v2.5-pro / mimo-v2.5 官方公告 2026-10-21 下线，禁用）
-        - 思考链：不传任何参数即返回 reasoning_content；额外传
-          thinking={"type":"enabled"} / enable_thinking / reasoning_effort
-          反而让输出退化（实测完成 token 从 36 掉到 5）→ 一律不下发
-        - 流式：delta 同时下发 reasoning_content（103 块）与 content（48 块）
-          → langchain_openai 会把前者收进 additional_kwargs，前端思考链零改动可用
-        - 工具调用：单轮/多轮 tool_calls 均正常；带 tool_calls 的 assistant 消息
-          回传后追问 HTTP 200
-        - 多轮回传：assistant 消息带 / 不带 reasoning_content 都是 200，
-          带的时候推理更充分 → 用 restore_reasoning_content 注入
+    职责：定义 MiMo 用哪几个模型类，并保活多轮思考链
+        - 走 OpenAI 兼容协议（api.xiaomimimo.com/v1），直接继承 ChatOpenAI
+        - 默认就返回 reasoning_content，不下发任何思考参数
+        - 多轮回传时注入上一轮思考链（LangChain 序列化会丢）
+        - pro 档最新为 mimo-v2.6-pro（v2.5 系列已下线）
 
     对外暴露：
-        - MIMO_BASE_URL                默认接口地址（配置未给 base_url 时用）
-        - MIMO_PRO_MODEL_ID            最新 pro 档（mimo-v2.6-pro）
-        - MIMO_FLASH_MODEL_ID          快档（mimo-v2.6-flash）
-        - MiMoProChatModel             Pro 档实现类（带思考链保活）
-        - MiMoFlashChatModel           Flash 档实现类
-        - is_mimo_pro_model            精确判断是不是 pro 档
-        - is_mimo_flash_model          精确判断是不是 flash 档
+        - MIMO_BASE_URL          默认接口地址（配置未给 base_url 时用）
+        - MIMO_PRO_MODEL_ID      最新 pro 档（mimo-v2.6-pro）
+        - MIMO_FLASH_MODEL_ID    快档（mimo-v2.6-flash）
+        - MiMoProChatModel       Pro 档实现类（带思考链保活）
+        - MiMoFlashChatModel     Flash 档实现类
+        - is_mimo_pro_model      精确判断是不是 pro 档
+        - is_mimo_flash_model    精确判断是不是 flash 档
 """
 
 logger = logging.getLogger(__name__)
@@ -115,7 +102,7 @@ def _ensure_text_blocks(
     返回：
         归一化后的请求体消息列表（原地复用）
     """
-    # 建立「文本 → 思考链」索引，只为带思考链的消息建键
+    # 1.建立「文本 → 思考链」索引，只为带思考链的消息建键
     with_reasoning: set[str] = set()
     for msg in original_messages:
         extra = getattr(msg, "additional_kwargs", None) or {}
@@ -124,7 +111,7 @@ def _ensure_text_blocks(
             continue
         with_reasoning.add(extract_message_text(msg.content))
 
-    # 命中索引的纯文本 assistant 消息 → 转成单元素文本块数组
+    # 2.命中索引的纯文本 assistant 消息 → 转成单元素文本块数组（好让思考链有地方挂）
     for pm in payload_messages:
         if pm.get("role") != "assistant":
             continue
@@ -182,10 +169,10 @@ class _MiMoChatModelBase(ChatOpenAI):
         返回：
             补好思考链的 ChatResult（解析失败时原样返回，不影响主流程）
         """
-        # 先让父类照常解析
+        # 1.先让父类照常解析
         result = super()._create_chat_result(response, generation_info)
 
-        # 再按 choice 顺序把思考链挂回去（拿不到原始 dict 就跳过，不抛错）
+        # 2.再按 choice 顺序把思考链挂回去（拿不到原始 dict 就跳过，不抛错）
         try:
             raw = (
                 response
@@ -228,14 +215,14 @@ class _MiMoChatModelBase(ChatOpenAI):
         返回：
             补好思考链的 ChatGenerationChunk（父类返回 None 时也返回 None）
         """
-        # 先让父类照常解析
+        # 1.先让父类照常解析
         generation = super()._convert_chunk_to_generation_chunk(
             chunk, default_chunk_class, base_generation_info
         )
         if generation is None or generation.message is None:
             return generation
 
-        # 从 delta 里取本块的思考增量
+        # 2.从 delta 里取本块的思考增量
         choices = chunk.get("choices") or []
         if not choices:
             return generation
@@ -244,7 +231,7 @@ class _MiMoChatModelBase(ChatOpenAI):
         if not reasoning:
             return generation
 
-        # 挂到增量块上，供运行层 extract_reasoning_content 逐块取用
+        # 3.挂到增量块上，供运行层 extract_reasoning_content 逐块取用
         message = generation.message
         message.additional_kwargs = {
             **dict(getattr(message, "additional_kwargs", {}) or {}),

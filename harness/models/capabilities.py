@@ -5,12 +5,14 @@ from harness.config.model_config import ModelConfig
 
 """模型能力探测
 
-    职责：只查配置里“这个模型支不支持某个能力”，不真正去造模型。
-    用途：比如 view_image 工具，只在模型能看图时才挂给 Agent。
+    职责：只查配置里模型声明的能力，不真正造模型
+        - 是否支持看图（view_image 工具据此决定挂不挂）
+        - 是否支持思考模式
+        - 按名 / 按激活模型查找配置
 
     对外暴露：
-        - supports_vision     查模型支不支持看图片
-        - supports_thinking   查模型支不支持思考模式
+        - supports_vision     查模型是否支持看图片
+        - supports_thinking   查模型是否支持思考模式
         - find_model          按名字（或当前激活）找模型配置，找不到返回 None
 """
 
@@ -28,15 +30,15 @@ def supports_vision(name: str | None = None, *, app_config: AppConfig | None = N
     返回：
         该模型 supports_vision 是否为 True（找不到模型返回 False）
     """
-    # 取配置并定位目标模型
+    # 1.取配置并定位目标模型
     config = app_config or get_app_config()
     model_config = find_model(config, name)
 
-    # 找不到模型按“不支持”处理
+    # 2.找不到模型按“不支持”处理
     if model_config is None:
         return False
 
-    # 返回视觉能力开关
+    # 3.返回视觉能力开关
     return bool(model_config.supports_vision)
 
 
@@ -50,15 +52,15 @@ def supports_thinking(name: str | None = None, *, app_config: AppConfig | None =
     返回：
         该模型 supports_thinking 是否为 True（找不到模型返回 False）
     """
-    # 取配置并定位目标模型
+    # 1.取配置并定位目标模型
     config = app_config or get_app_config()
     model_config = find_model(config, name)
 
-    # 找不到模型按“不支持”处理
+    # 2.找不到模型按“不支持”处理
     if model_config is None:
         return False
 
-    # 返回思考能力开关
+    # 3.返回思考能力开关
     return bool(model_config.supports_thinking)
 
 
@@ -72,11 +74,11 @@ def find_model(config: AppConfig, name: str | None) -> ModelConfig | None:
     返回：
         匹配的 ModelConfig；未找到或无激活模型时返回 None
     """
-    # 指定了名字则按名字精确查找
+    # 1.指定了名字则按名字精确查找
     if name is not None:
         return config.get_model_config(name)
 
-    # 否则取激活模型；无激活模型时按“找不到”处理
+    # 2.否则取激活模型；无激活模型时按“找不到”处理
     try:
         return config.active_model_config()
     except ValueError:

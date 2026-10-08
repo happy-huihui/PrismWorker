@@ -5,16 +5,11 @@ from typing import Literal
 
 from pydantic import BaseModel, ConfigDict, Field
 
-"""单个模型的配置（openai / deepseek / mimo 三 provider）
+"""单个模型的配置
 
-    职责：定义「一个模型条目长什么样」，供 config.yaml 的 models 段声明。
-         至于条目怎么造成实例（按 provider 分流）由 harness/models 的工厂负责。
-
-    字段分两类：
-        - 构造类：model / base_url / api_key / temperature / max_tokens
-          → 直接透传给对应的 LangChain 模型类
-        - 元数据类：name / provider / supports_vision / supports_thinking / context_window
-          → 只供工厂决策与前端展示，不进构造参数
+    职责：管理单个模型条目的连接参数与能力元数据
+        - 构造参数：model / base_url / api_key / temperature / max_tokens（透传给模型类）
+        - 元数据：name / provider / supports_vision / supports_thinking / context_window（供工厂决策与前端展示）
 
     对外暴露：
         - ModelProvider      provider 取值字面量
@@ -58,11 +53,11 @@ class ModelConfig(BaseModel):
         返回：
             可用的密钥字符串；都取不到时返回 None
         """
-        # 配置里显式写了就直接用
+        # 1.配置里显式写了就直接用（优先级最高）
         if self.api_key:
             return self.api_key
 
-        # 否则按 provider 选环境变量候选
+        # 2.否则按 provider 选环境变量候选名
         if self.provider == "deepseek":
             env_names = ("DEEPSEEK_API_KEY",)
         elif self.provider == "mimo":
@@ -70,9 +65,10 @@ class ModelConfig(BaseModel):
         else:
             env_names = ("OPENAI_API_KEY", "PRISM_WORKER_API_KEY")
 
-        # 取第一个有值的候选
+        # 3.取第一个有值的候选
         for env_name in env_names:
             value = os.getenv(env_name)
             if value:
                 return value
+        # 4.都没有 → None
         return None

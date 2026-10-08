@@ -1,9 +1,18 @@
-"""子代理配置：SubagentConfig 数据类 + 模型名解析。"""
-
 from __future__ import annotations
 
 from dataclasses import dataclass, field
 from typing import TYPE_CHECKING
+
+"""子代理配置
+
+    职责：定义子代理的静态配置，并解析实际使用的模型名
+        - 工具白名单 / 黑名单、轮次与超时上限
+        - 模型继承规则：显式指定 > 继承父级 > 全局默认
+
+    对外暴露：
+        - SubagentConfig               子代理静态配置
+        - resolve_subagent_model_name  解析执行时实际模型名
+"""
 
 if TYPE_CHECKING:
     from harness.config.app_config import AppConfig
@@ -55,10 +64,13 @@ def resolve_subagent_model_name(
     Returns:
         解析出的模型名。
     """
+    # 1.子代理显式指定了模型：直接用
     if config.model != "inherit":
         return config.model
+    # 2.未指定则继承父级模型
     if parent_model:
         return parent_model
+    # 3.父级也没有：落到全局激活模型
     if app_config is None:
         from harness.config.app_config import get_app_config
 

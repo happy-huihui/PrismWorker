@@ -1,27 +1,22 @@
-"""路由信号抽取与规则判定（rules）。
-
-职责划分：
-    - signals.py（本模块内的 build_signals）：把「这一轮的输入消息」翻译成
-      RoutingSignals（纯文本 / 有无图片 / 是否显式指定模型）。
-    - 本模块的规则函数：逐条判断信号，返回可选的 RoutingDecision。
-
-为什么把「抽信号」也放这儿而不是丢进 router.py：
-    抽信号是纯函数、可单测，且规则本身要靠它；两者放一起，改规则时
-    不用跨文件跳。router.py 只负责「读配置 → 按顺序试规则 → 兜底」。
-
-规则顺序即优先级，先命中先返回：
-    1. explicit  调用方显式指定 → 不干预
-    2. vision    含图片 且 配了 vision_model → 换视觉模型
-    3. keyword   命中升档关键词 且 达到最小长度 → 升推理模型
-    4. default   走默认档
-"""
-
 from __future__ import annotations
 
 from typing import Any
 
 from harness.config.routing_config import RoutingConfig
 from harness.models.routing.decision import RoutingDecision, RoutingSignals
+
+"""路由信号抽取与规则判定
+
+    职责：把本轮输入翻译成路由信号，并按优先级逐条判定用哪个模型
+        - build_signals  抽信号（纯函数、可单测）
+        - rule_*         四条规则，命中即返回
+
+    对外暴露：
+        - build_signals   从本轮输入消息抽取 RoutingSignals
+        - match_keyword   返回文本里第一个命中的升档关键词
+        - rule_explicit / rule_vision / rule_keyword / rule_default
+                          四条规则，由 router.py 按顺序调用（顺序即优先级）
+"""
 
 """图片内容块的类型标记（OpenAI / Anthropic 两套命名都收）。
 
@@ -48,6 +43,7 @@ def build_signals(
         RoutingSignals；文本取「最后一条含文本的消息」——多轮拼接时
         最后一条才是用户这次的诉求，用首条会把上一轮的意图带进来
     """
+    # 1.逐条扫描输入消息，收集文本片段与图片标记
     text_parts: list[str] = []
     has_images = False
     count = 0
@@ -59,6 +55,7 @@ def build_signals(
             if isinstance(message, dict)
             else getattr(message, "content", None)
         )
+        # 1.1 多模态块列表：区分图片块与文本块
         if isinstance(content, list):
             for block in content:
                 if not isinstance(block, dict):
@@ -66,24 +63,27 @@ def build_signals(
                         text_parts.append(block)
                     continue
                 block_type = block.get("type")
+                # 命中图片类型标记即置 has_images
                 if block_type in _IMAGE_BLOCK_TYPES:
                     has_images = True
                     continue
+                # 文本块：非空才收集
                 if block_type == "text":
                     value = block.get("text")
                     if isinstance(value, str) and value:
                         text_parts.append(value)
+        # 1.2 纯字符串内容：非空才收集
         elif isinstance(content, str) and content.strip():
             text_parts.append(content)
 
-    # 只取最后一段非空文本作为「本轮诉求」
+    # 2.只取最后一段非空文本作为「本轮诉求」（多轮拼接时首条是上一轮意图）
     text = ""
     for part in reversed(text_parts):
         if part.strip():
             text = part
             break
 
-    # 剥离防注入包裹标记，避免标记里的词（如 BEGIN）误命中关键词
+    # 3.剥离防注入包裹标记，避免标记里的词（如 BEGIN）误命中关键词
     from harness.runtime.serialization import strip_user_input_wrapper
 
     return RoutingSignals(
@@ -108,12 +108,16 @@ def match_keyword(text: str, keywords: list[str]) -> str | None:
     说明：按关键词长度降序试，保证「深度分析」先于「分析」命中，
         这样 reason/matched_keyword 展示的是更精确的那个词。
     """
+    # 1.空文本无关键词可命中
     if not text:
         return None
+    # 2.统一转小写做大小写不敏感匹配
     lowered = text.lower()
+    # 3.按关键词长度降序试，保证「深度分析」先于「分析」命中
     for keyword in sorted(keywords, key=len, reverse=True):
         if keyword and keyword.lower() in lowered:
             return keyword
+    # 4.无命中
     return None
 
 
@@ -155,14 +159,17 @@ def rule_keyword(
     config: RoutingConfig,
 ) -> RoutingDecision | None:
     """规则 3：命中升档关键词 → 升到推理模型（未配升级模型则不升）。"""
+    # 1.未配置升级模型 → 不升档
     if not config.escalate_model:
         return None
-    # 太短的输入不升档（防止「深度分析下」这种一句话把整轮拖慢）
+    # 2.太短的输入不升档（防止「深度分析下」这种一句话把整轮拖慢）
     if config.min_chars_for_escalation and len(signals.text) < config.min_chars_for_escalation:
         return None
+    # 3.找关键词命中
     hit = match_keyword(signals.text, config.escalate_keywords)
     if not hit:
         return None
+    # 4.命中即升档
     return RoutingDecision(
         model_name=config.escalate_model,
         source="keyword",

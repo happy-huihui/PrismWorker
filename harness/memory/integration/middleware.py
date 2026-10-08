@@ -14,16 +14,16 @@ if TYPE_CHECKING:
 
 logger = logging.getLogger(__name__)
 
-"""记忆中间件与摘要联动钩子（integration.middleware）
+"""记忆中间件与摘要联动
 
-    职责：把长期记忆接进 Agent 运行链——注入 + 每轮自动入队提取，并在摘要
-         压缩前做紧急冲刷。记忆永远 best-effort：异常只记日志，绝不阻断主链路。
-    两个入口：
-        - MemoryMiddleware  ① awrap_model_call 注入 <memory> 块；
-                            ② after_agent / aafter_agent 入队提取（auto_extract 控制）；
-        - memory_flush_hook 被 SummarizationMiddleware 在「压缩掉消息之前」调用，
-                            用 add_nowait 紧急冲刷，保证先入库再压缩。
-    模式：middleware 模式自动提取；tool 模式只注入、写入交给模型工具。
+    职责：把长期记忆接进 Agent 运行链（注入 + 自动入队 + 摘要前紧急冲刷）
+        - MemoryMiddleware：awrap_model_call 注入 <memory> 块；after_agent 入队提取
+        - memory_flush_hook：摘要压缩掉消息之前用 add_nowait 紧急冲刷
+        - 记忆永远 best-effort，异常只记日志，绝不阻断主链路
+
+    对外暴露：
+        - MemoryMiddleware
+        - memory_flush_hook
 """
 
 # 系统提示里已含该标记则视为已注入，避免重复包裹
@@ -46,6 +46,7 @@ class MemoryMiddleware(AgentMiddleware):
             auto_extract: 是否在每轮对话后自动入队提取（middleware 开 / tool 关）
         """
         super().__init__()
+        # 单 Agent 架构下 agent_name 只用于调用链语义；auto_extract 由 mode 决定
         self._agent_name = agent_name
         self._auto_extract = auto_extract
 
@@ -100,6 +101,7 @@ class MemoryMiddleware(AgentMiddleware):
         add_args = self._resolve_add_args(state, runtime)
         if add_args is None:
             return None
+        # 解析出 (线程, 消息, 用户)；缺任一就跳过，无法归属的记忆不入队
         thread_id, messages, user_id = add_args
         try:
             get_memory_manager().add(
@@ -119,6 +121,7 @@ class MemoryMiddleware(AgentMiddleware):
         add_args = self._resolve_add_args(state, runtime)
         if add_args is None:
             return None
+        # 异步路径：判断逻辑与 after_agent 完全一致
         thread_id, messages, user_id = add_args
         try:
             manager = get_memory_manager()

@@ -4,11 +4,13 @@ from typing import Literal
 
 from pydantic import BaseModel, Field, model_validator
 
-"""沙箱配置（Docker all-in-one-sandbox）
+"""沙箱配置
 
-    职责：描述沙箱镜像、端口、容器生命周期，以及各类输出的截断上限。
-    背景：沙箱跑在本机 Docker 里，镜像 all-in-one-sandbox 暴露一个 HTTP API，
-         项目通过 agent_sandbox SDK 与之通信。
+    职责：管理 Docker 沙箱（all-in-one-sandbox）的镜像、生命周期与输出截断
+        - 镜像与端口
+        - 容器生命周期（auto/manual）、空闲销毁、副本数
+        - 卷挂载（含只读技能目录）
+        - 命令执行超时与各类输出截断上限
 
     对外暴露：
         - SandboxLifecycle  auto=按需起停 / manual=外部已起好
@@ -38,18 +40,20 @@ class SandboxMount(BaseModel):
     @classmethod
     def _accept_aliases(cls, data: object) -> object:
         """兼容 source/src/host_path 与 target/dst/dest/container_path 别名。"""
-        # 非字典直接放行
+        # 1.非字典直接放行（不参与别名规范化）
         if not isinstance(data, dict):
             return data
         aliased: dict[str, object] = dict(data)
-        # 逐个规范字段：已写规范名的跳过，否则找别名顶上
+        # 2.逐个规范字段：已写规范名的跳过，否则从别名里取第一个命中顶上
         for canonical, names in (
             ("source", ("src", "host_path")),
             ("target", ("dst", "dest", "container_path")),
             ("read_only", ("readonly", "ro")),
         ):
+            # 2.1 规范名已存在 → 不动
             if canonical in aliased:
                 continue
+            # 2.2 依次找别名，命中即 pop 出来改写成规范名
             for name in names:
                 if name in aliased:
                     aliased[canonical] = aliased.pop(name)

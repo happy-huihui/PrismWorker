@@ -1,10 +1,3 @@
-"""上传文件管理（uploads）——app/core 文件操作之二。
-
-上传文件的磁盘落点：{base}/users/{uid}/threads/{tid}/user-data/uploads/
-（沙箱侧虚拟路径 /mnt/user-data/uploads/）。上传/列出都返回带虚拟路径的
-结构，前端与 agent 上下文（<current_uploads>）用的是同一套路径约定。
-"""
-
 from __future__ import annotations
 
 import asyncio
@@ -15,12 +8,23 @@ from typing import Any
 
 from harness.config.paths import get_paths
 
+"""上传文件管理
+
+    职责：上传文件的落盘与列举（{user}/threads/{tid}/user-data/uploads/）
+        - 文件名清洗：取 basename、拒空名与穿越路径
+        - 返回值统一带沙箱虚拟路径，与 <current_uploads> 同一套约定
+
+    对外暴露：
+        - save_upload / list_uploads
+"""
 
 def _safe_filename(filename: str | None) -> str:
     """清洗上传文件名：取 basename、去空白、拒绝空名与穿越路径。"""
+    # 1.统一分隔符后拒绝空名 / 绝对路径 / 含 .. 的路径
     name = (filename or "").strip().replace("\\", "/")
     if not name or name.startswith("/") or ".." in name.split("/"):
         raise ValueError("非法文件名")
+    # 2.只取 basename，杜绝借目录名越界
     base = Path(name).name
     if not base:
         raise ValueError("非法文件名")
@@ -40,13 +44,16 @@ def save_upload(
     uploads 目录不存在时自动创建（只建 uploads 目录，不动线程元数据与
     workspace/outputs）。paths 缺省用全局路径管理器（测试可注入）。
     """
+    # 1.先清洗文件名（非法直接抛 ValueError）
     fname = _safe_filename(filename)
     paths = paths or get_paths()
     udir = paths.sandbox_uploads_dir(thread_id, user_id=user_id)
+    # 2.只建 uploads 目录，不动线程元数据与 workspace/outputs
     udir.mkdir(parents=True, exist_ok=True)
     target = udir / fname
     target.write_bytes(data)
     size = len(data)
+    # 3.回带沙箱虚拟路径，与 <current_uploads> 同一套约定
     return {
         "filename": fname,
         "size": size,
@@ -66,10 +73,12 @@ def list_uploads(
     """
     paths = paths or get_paths()
     udir = paths.sandbox_uploads_dir(thread_id, user_id=user_id)
+    # 1.目录不存在 = 该线程没上传过
     if not udir.is_dir():
         return []
     items: list[dict[str, Any]] = []
     for p in udir.iterdir():
+        # 2.只收普通文件（跳过子目录等）
         if not p.is_file():
             continue
         items.append(
@@ -80,6 +89,7 @@ def list_uploads(
                 "modified_at": p.stat().st_mtime,
             }
         )
+    # 3.按修改时间倒序；排完再把内部排序键摘掉
     items.sort(key=lambda i: i["modified_at"], reverse=True)
     for i in items:
         i.pop("modified_at", None)

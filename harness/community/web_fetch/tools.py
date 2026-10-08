@@ -7,14 +7,15 @@ from langchain.tools import tool
 
 from harness.config import WebFetchConfig, get_app_config
 
-"""web_fetch 工具：抓取网页并转换为 Markdown。
+"""网页抓取工具
 
-按用户确认设计：
-    - 统一返回 Markdown（不保留 raw HTML 选项）；
-    - 实现为 httpx 抓取 + BeautifulSoup 解析 + markdownify 转 Markdown；
-    - 单个响应只保留纯文本大小上限 max_chars（默认 20000），
-      防止撑爆模型上下文；
-    - 超时 / 响应体上限可配（WebFetchConfig）。
+    职责：抓取网页并转成 Markdown 返回（httpx + BeautifulSoup + markdownify）
+        - 只接受 HTML；非 HTML / 超大响应直接拒绝
+        - 正文按 max_chars 截断，防撑爆模型上下文
+        - 超时与上限可配（WebFetchConfig）
+
+    对外暴露：
+        - web_fetch_tool / MAX_RESPONSE_BYTES
 """
 
 logger = logging.getLogger(__name__)
@@ -34,6 +35,7 @@ def _get_web_fetch_config() -> WebFetchConfig:
     """读取 web_fetch 配置，单例未初始化时回退默认值。"""
     try:
         return get_app_config().tools.web_fetch
+    # 配置单例未初始化时回退默认值，保证工具可用
     except Exception:
         return WebFetchConfig()
 
@@ -62,6 +64,7 @@ def web_fetch_tool(url: str) -> str:
     timeout = config.timeout_seconds
     max_chars = config.max_chars
 
+    # 1.抓取（跟随重定向 + 伪装 UA，部分站点会拦默认 UA）
     try:
         resp = httpx.get(
             url,
@@ -70,25 +73,30 @@ def web_fetch_tool(url: str) -> str:
             headers=_DEFAULT_HEADERS,
         )
         resp.raise_for_status()
+    # 2.网络层异常转成可读错误串
     except httpx.HTTPError as exc:
         logger.warning("web_fetch 请求失败 %s: %s", url, exc)
         return f"错误：抓取失败（{type(exc).__name__}: {exc}）"
 
+    # 3.超大响应直接拒，避免打爆内存与上下文
     if len(resp.content) > MAX_RESPONSE_BYTES:
         return f"错误：页面过大（>{MAX_RESPONSE_BYTES // 1024 // 1024}MB），已拒绝抓取。"
     content_type = resp.headers.get("content-type", "")
+    # 4.非 HTML（PDF / 图片）明确拒绝并给替代建议
     if "html" not in content_type.lower():
         return (
             f"错误：该 URL 返回的不是网页（Content-Type: {content_type or '未知'}）。"
             "如为 PDF/图片等文件，请改用其他方式处理。"
         )
 
+    # 5.解析失败也要给出可读错误
     try:
         md_text = _html_to_markdown(resp.text)
     except Exception as exc:
         logger.warning("web_fetch 解析失败 %s: %s", url, exc)
         return f"错误：页面解析失败（{type(exc).__name__}: {exc}）"
 
+    # 6.按 max_chars 截断并标注原始长度
     if len(md_text) > max_chars:
         md_text = md_text[:max_chars] + f"\n\n...[内容过长已截断，共 {len(md_text)} 字符]"
     return md_text
